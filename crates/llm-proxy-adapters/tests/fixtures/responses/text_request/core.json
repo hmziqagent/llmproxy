@@ -12,8 +12,9 @@
   "tools": [],
   "tool_choice": null,
   "sampling": {
-    "temperature": null,
-    "max_tokens": null,
+    "temperature": 0.5,
+    "top_p": 0.9,
+    "max_tokens": 256,
     "stop": null
   },
   "stream": false

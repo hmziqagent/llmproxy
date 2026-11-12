@@ -1,5 +1,10 @@
 {
   "model": "gpt-4o",
-  "input": "Hello",
-  "stream": false
+  "input": [
+    { "role": "user", "content": "Hello" }
+  ],
+  "stream": false,
+  "temperature": 0.5,
+  "top_p": 0.9,
+  "max_output_tokens": 256
 }

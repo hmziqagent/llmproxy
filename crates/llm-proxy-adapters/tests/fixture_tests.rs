@@ -574,6 +574,22 @@ mod tests {
             }
         }
 
+        if let Some(expected_input) = output_json.get("input") {
+            assert_eq!(
+                actual.get("input"),
+                Some(expected_input),
+                "{adapter_name}/{case}: input mismatch"
+            );
+        }
+
+        if let Some(expected_reasoning) = output_json.get("reasoning") {
+            assert_eq!(
+                actual.get("reasoning"),
+                Some(expected_reasoning),
+                "{adapter_name}/{case}: reasoning mismatch"
+            );
+        }
+
         if let Some(expected_sys) = output_json.get("system") {
             assert_eq!(
                 actual.get("system"),
@@ -622,7 +638,7 @@ mod tests {
             }
         }
 
-        for field in &["temperature", "top_p", "max_tokens"] {
+        for field in &["temperature", "top_p", "max_tokens", "max_output_tokens"] {
             if let Some(expected_val) = output_json.get(*field) {
                 let actual_val = actual.get(*field);
                 if expected_val.is_null() {

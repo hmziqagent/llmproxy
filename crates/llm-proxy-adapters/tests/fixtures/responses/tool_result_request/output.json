@@ -1,17 +1,17 @@
 {
   "model": "gpt-4o",
   "input": [
+    { "role": "user", "content": "What is the weather in SF?" },
     {
-      "role": "user",
-      "content": "What is the weather in SF?"
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"SF\"}"
     },
     {
-      "role": "assistant",
-      "content": { "type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"SF\"}" }
-    },
-    {
-      "role": "user",
-      "content": { "type": "function_call_output", "call_id": "call_1", "output": "Sunny, 72F" }
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "Sunny, 72F"
     }
   ],
   "stream": false
