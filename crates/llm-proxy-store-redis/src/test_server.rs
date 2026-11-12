@@ -10,11 +10,15 @@
 //! tests and for downstream integration tests (the app's replica-arm
 //! runtime tests).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// One snapshot of the live string keyspace, taken after a mutating
+/// command while tracing is on.
+pub type KeySnapshot = BTreeMap<String, String>;
 
 /// Handle to the running test server.
 pub struct TestRedis {
@@ -31,6 +35,7 @@ struct Db {
     sets: Mutex<HashMap<String, Vec<String>>>,
     streams: Mutex<HashMap<String, Vec<String>>>,
     stream_seq: Mutex<u64>,
+    trace: Mutex<Option<Vec<KeySnapshot>>>,
 }
 
 fn now_ms() -> u64 {
@@ -63,6 +68,7 @@ impl TestRedis {
             sets: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             stream_seq: Mutex::new(0),
+            trace: Mutex::new(None),
         });
         let mut threads = Vec::new();
         // A bounded pool of connection threads is plenty for tests.
@@ -116,6 +122,29 @@ impl TestRedis {
             .and_then(|(value, expiry)| {
                 (expiry.is_none_or(|at| now_ms() < at)).then(|| value.clone())
             })
+    }
+
+    /// Begin recording a snapshot of the live string keyspace after every
+    /// mutating command (`SET SETEX DEL EXPIRE INCR DECR INCRBY DECRBY`,
+    /// and `EVAL ZADD ZREM` once those commands exist): every state a
+    /// concurrent reader of the store could observe.
+    pub fn start_trace(&self) {
+        *self
+            .db
+            .trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Vec::new());
+    }
+
+    /// Take the recorded snapshots and stop tracing.
+    #[must_use]
+    pub fn take_trace(&self) -> Vec<KeySnapshot> {
+        self.db
+            .trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_default()
     }
 }
 
@@ -263,7 +292,7 @@ fn handle(args: &[String], db: &Arc<Db>) -> String {
         return error("empty command");
     };
     let rest = args.get(1..).unwrap_or(&[]);
-    match command.as_str() {
+    let reply = match command.as_str() {
         "PING" => simple("PONG"),
         "AUTH" | "SELECT" | "CLIENT" | "COMMAND" => simple("OK"),
         "HELLO" => error("unknown command 'HELLO'"),
@@ -400,5 +429,58 @@ fn handle(args: &[String], db: &Arc<Db>) -> String {
             simple(&format!("0-{seq}"))
         }
         other => error(&format!("unknown command '{other}'")),
+    };
+    if is_traced_mutation(&command) && !reply.starts_with('-') {
+        trace_snapshot(db);
+    }
+    reply
+}
+
+/// The mutating commands whose application is recorded by `start_trace`.
+fn is_traced_mutation(command: &str) -> bool {
+    matches!(
+        command,
+        "SET"
+            | "SETEX"
+            | "DEL"
+            | "EXPIRE"
+            | "INCR"
+            | "DECR"
+            | "INCRBY"
+            | "DECRBY"
+            | "EVAL"
+            | "ZADD"
+            | "ZREM"
+    )
+}
+
+/// Records one snapshot of the live string keyspace, when tracing is on.
+fn trace_snapshot(db: &Arc<Db>) {
+    let tracing_on = db
+        .trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    if !tracing_on {
+        return;
+    }
+    let snapshot: KeySnapshot = {
+        let strings = db
+            .strings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        strings
+            .iter()
+            .filter(|(_, (_, expiry))| expiry.is_none_or(|at| now_ms() < at))
+            .map(|(key, (value, _))| (key.clone(), value.clone()))
+            .collect()
+    };
+    if let Some(trace) = db
+        .trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+    {
+        trace.push(snapshot);
     }
 }

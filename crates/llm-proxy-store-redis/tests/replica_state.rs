@@ -9,14 +9,18 @@
 
 mod support;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use llm_proxy_core::{KeyBudgetConfig, KeyWindowLimits, ModelPricing, UnestimatableCostPolicy};
-use llm_proxy_engine::{Admission, AdmissionClaim, AdmissionOutcome, Cooldowns, KeyPolicy};
+use llm_proxy_engine::{
+    Admission, AdmissionClaim, AdmissionOutcome, Cooldowns, KeyPolicy, Settlement,
+};
 use llm_proxy_storage::{EventBus, ProxyEvent};
-use llm_proxy_store_redis::{RedisCooldowns, RedisEventBus, RedisStore, replica_admission};
+use llm_proxy_store_redis::{
+    RedisAdmissionBackend, RedisCooldowns, RedisEventBus, RedisStore, replica_admission,
+};
 use support::TestRedis;
 use time::OffsetDateTime;
 
@@ -72,6 +76,46 @@ fn windowed(rpm: u32, tpm: u64) -> HashMap<String, KeyPolicy> {
 
 fn caps(total: u32) -> HashMap<String, (Option<u32>, HashMap<String, u32>)> {
     HashMap::from([("p".to_owned(), (Some(total), HashMap::new()))])
+}
+
+fn budgeted_with_tpm(usd: &str, tpm: u64) -> HashMap<String, KeyPolicy> {
+    HashMap::from([(
+        "key".to_owned(),
+        KeyPolicy {
+            limits: KeyWindowLimits {
+                rpm: None,
+                tpm: Some(tpm),
+                rpd: None,
+            },
+            budget: Some(KeyBudgetConfig {
+                usd_per_day: usd.parse().expect("decimal"),
+                unestimatable: UnestimatableCostPolicy::Reject,
+                assumed_max_output_tokens: 100,
+            }),
+            ..KeyPolicy::default()
+        },
+    )])
+}
+
+fn day_stamp(now: OffsetDateTime) -> String {
+    format!(
+        "{:04}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
+}
+
+/// Sum of the named counters in one traced snapshot; a missing key counts 0.
+fn exposure(snapshot: &BTreeMap<String, String>, keys: &[&str]) -> i64 {
+    keys.iter()
+        .map(|key| {
+            snapshot
+                .get(*key)
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 /// The done-when of plan 09 step 1: two replica admissions over one
@@ -498,4 +542,156 @@ async fn settlement_charges_shared_spend_in_micro_usd() {
     tokio::time::timeout(Duration::from_secs(5), charge_lands)
         .await
         .expect("0.1 USD lands as 100000 micro-USD on the shared counter");
+}
+
+/// The settle-ordering invariant: a settle running against admissions on
+/// the same store must never expose a combined `spent + reserved` below
+/// the settled state to a concurrent admission (which reads `reserved`
+/// strictly before `spent`). Traced against the real RESP server, for a
+/// billed amount above and below the reserved estimate, with the token
+/// window checked for the same no-dip property.
+#[tokio::test]
+async fn settlement_never_lets_a_concurrent_admission_see_less_exposure_than_the_final_state() {
+    // 500 in + 500 max output at 0.001 per token reserves 1 USD; usage
+    // replaces the 1000 reserved tokens with 500 at settle.
+    for (charged, direction) in [
+        (1_200_000_i64, "billed above the estimate"),
+        (500_000, "billed below the estimate"),
+    ] {
+        let server = TestRedis::start().expect("bind the in-process test Redis");
+        let store = RedisStore::connect(&server.url(), "p1")
+            .await
+            .expect("connect");
+        let admission = replica_admission(
+            budgeted_with_tpm("2.5", 100_000),
+            pricing(),
+            HashMap::new(),
+            store.clone(),
+        );
+        let reserved_at = OffsetDateTime::now_utc();
+        let ticket = admission
+            .reserve(&claim("key", "p", "m"))
+            .await
+            .expect("reserves 1 USD of a 2.5 USD budget");
+        let lease = ticket
+            .lease
+            .as_ref()
+            .expect("the redis backend issues a lease");
+
+        let day = day_stamp(reserved_at);
+        let minute = reserved_at.unix_timestamp().div_euclid(60);
+        let spent_key = format!("p1:ad:spent:key:{day}");
+        let resv_key = format!("p1:ad:resv:key:{day}");
+        let tok_key = format!("p1:ad:tok:key:{minute}");
+
+        server.start_trace();
+        RedisAdmissionBackend::new(store)
+            .settle_async(
+                lease,
+                &Settlement {
+                    now: OffsetDateTime::now_utc(),
+                    succeeded: true,
+                    usage_tokens: Some(500),
+                    charged_usd: Some(charged),
+                },
+            )
+            .await
+            .expect("settle");
+
+        let trace = server.take_trace();
+        let final_snapshot = trace
+            .last()
+            .expect("the settle must have left at least one traced snapshot");
+        let final_exposure = exposure(final_snapshot, &[&spent_key, &resv_key]);
+
+        // The first snapshot is the state between the exclusive lease
+        // claim and the first counter move; an admission there still
+        // counts this lease's own reservation plus its estimate, so the
+        // raw snapshot (without a reader's own estimate) is pessimistic.
+        // The release-order property lives in every later snapshot: once
+        // the charge has landed, no observation may show less exposure
+        // than the settled state.
+        for (index, snapshot) in trace.iter().enumerate().skip(1) {
+            let seen = exposure(snapshot, &[&spent_key, &resv_key]);
+            assert!(
+                seen >= final_exposure,
+                "{direction}: snapshot {index} exposed {seen}, below the final \
+                 {final_exposure} ({snapshot:?})"
+            );
+        }
+        assert_eq!(
+            final_exposure, charged,
+            "{direction}: the settle charges exactly the billed amount and releases the whole \
+             reservation"
+        );
+
+        // Same property on the token window: the minute window holds the
+        // 1000 reserved tokens until usage replaces them, and no snapshot
+        // ever shows fewer tokens than the settled 500.
+        let final_tokens = final_snapshot
+            .get(&tok_key)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        for snapshot in &trace {
+            let tokens = snapshot
+                .get(&tok_key)
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            assert!(
+                tokens >= final_tokens,
+                "{direction}: a snapshot showed {tokens} tokens, below the final \
+                 {final_tokens} ({snapshot:?})"
+            );
+        }
+        assert_eq!(
+            final_tokens, 500,
+            "{direction}: usage replaces the reservation exactly once"
+        );
+    }
+}
+
+/// Two concurrent settles of one lease must release its counters once:
+/// the lease is claimed by the DEL reply count, so the loser of the race
+/// returns before touching any counter.
+#[tokio::test]
+async fn a_lease_settled_twice_releases_its_counters_once() {
+    let server = TestRedis::start().expect("bind the in-process test Redis");
+    let store = RedisStore::connect(&server.url(), "p2")
+        .await
+        .expect("connect");
+    let admission = replica_admission(budgeted("1"), pricing(), caps(1), store.clone());
+    let ticket = admission
+        .reserve(&claim("key", "p", "m"))
+        .await
+        .expect("takes the only slot and reserves 1 USD");
+    let lease = ticket
+        .lease
+        .as_ref()
+        .expect("the redis backend issues a lease");
+
+    let settlement = Settlement {
+        now: OffsetDateTime::now_utc(),
+        succeeded: false,
+        usage_tokens: None,
+        charged_usd: None,
+    };
+    let backend = RedisAdmissionBackend::new(store);
+    let (first, second) = tokio::join!(
+        backend.settle_async(lease, &settlement),
+        backend.settle_async(lease, &settlement),
+    );
+    first.expect("first settle");
+    second.expect("second settle");
+
+    let resv_key = format!("p2:ad:resv:key:{}", day_stamp(OffsetDateTime::now_utc()));
+    assert_eq!(
+        server.get(&resv_key).as_deref(),
+        Some("0"),
+        "the reservation is released once, not twice"
+    );
+    assert_eq!(
+        server.get("p2:ad:infl:m:p").as_deref(),
+        Some("0"),
+        "the in-flight slot is released once, not twice"
+    );
 }

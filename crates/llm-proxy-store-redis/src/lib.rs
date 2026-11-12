@@ -26,6 +26,21 @@
 //! crashed replica) expire on a TTL, so the budget they held is released
 //! without operator action.
 //!
+//! Settlement is ordered, not transactional. An admission reads the
+//! reserved counter (the `INCR` reply) strictly before it reads `spent`,
+//! so a settle charges spend first and releases the reservation second:
+//! no interleaving of a settle and an admission can observe the
+//! reservation released while the charge is still missing — the one
+//! state that would let an admission under-count a request that is
+//! about to be billed. The other direction, a brief double count of
+//! `spent + reserved`, only makes the budget briefly stricter for the
+//! settle window, which is fail-closed. The token window makes its
+//! release and charge in one net `INCRBY`, so no dipped value exists at
+//! all. Settle-vs-admit is covered by this ordering, not by a
+//! transaction. A settle claims its lease by the `DEL` reply count, so
+//! two concurrent settles of one lease release its counters exactly
+//! once.
+//!
 //! Money moves as integer micro-USD (`INCRBY`), never a float, matching
 //! the engine's money rule.
 
@@ -235,32 +250,52 @@ impl RedisAdmissionBackend {
             return Ok(());
         };
         let record: LeaseRecord = serde_json::from_str(&raw)?;
-        let _: () = conn.del(&record_key).await?;
-
-        // Token window: release the estimate and charge the reported total
-        // into the minute the reservation was made in. The key may have
-        // expired with the minute; releasing a gone window is a no-op.
-        let token_key = self.token_key(&record.caller, record.minute);
-        if record.reserved_tokens > 0 && conn.exists(&token_key).await? {
-            let _: i64 = conn.decr(&token_key, record.reserved_tokens as i64).await?;
-        }
-        if let Some(tokens) = settlement.usage_tokens {
-            let _: i64 = conn.incr(&token_key, tokens as i64).await?;
-            let _: bool = conn.expire(&token_key, MINUTE_TTL.as_secs() as i64).await?;
+        // Claim the lease by the delete count: exactly one concurrent
+        // settle of this lease gets past this line, so its counters are
+        // released once, never twice.
+        let removed: i64 = conn.del(&record_key).await?;
+        if removed == 0 {
+            return Ok(());
         }
 
-        // Money: release from the day it was reserved on, charge to today
-        // (spend is never dropped at a midnight boundary).
+        // Money: charge to today first, release from the day it was
+        // reserved on second (spend is never dropped at a midnight
+        // boundary). Spent is charged before the reservation is released
+        // so a concurrent admission — which reads `reserved` strictly
+        // before `spent` — can only over-count the exposure, never see
+        // the reservation gone while the charge is missing (see the
+        // atomicity model above).
+        if let Some(charged) = settlement.charged_usd {
+            let today = self.spent_key(&record.caller, &day_stamp(settlement.now));
+            let _: i64 = conn.incr(&today, charged).await?;
+            let _: bool = conn.expire(&today, DAY_TTL.as_secs() as i64).await?;
+        }
         if record.reserved_usd != 0 {
             let key = self.reserved_key(&record.caller, &record.day);
             if conn.exists(&key).await? {
                 let _: i64 = conn.decr(&key, record.reserved_usd).await?;
             }
         }
-        if let Some(charged) = settlement.charged_usd {
-            let today = self.spent_key(&record.caller, &day_stamp(settlement.now));
-            let _: i64 = conn.incr(&today, charged).await?;
-            let _: bool = conn.expire(&today, DAY_TTL.as_secs() as i64).await?;
+
+        // Token window: release the estimate and charge the reported
+        // total as one net `INCRBY` into the minute the reservation was
+        // made in, so a concurrent admission never observes a dipped
+        // window between the release and the charge. The key may have
+        // expired with the minute; a nonzero net move recreates it, and
+        // charging into a gone window is how the usage lands.
+        let token_key = self.token_key(&record.caller, record.minute);
+        let key_existed = record.reserved_tokens > 0 && conn.exists(&token_key).await?;
+        let delta = settlement.usage_tokens.map_or(0, |tokens| tokens as i64)
+            - if key_existed {
+                record.reserved_tokens as i64
+            } else {
+                0
+            };
+        if delta != 0 || key_existed {
+            let _: i64 = conn.incr(&token_key, delta).await?;
+        }
+        if settlement.usage_tokens.is_some() {
+            let _: bool = conn.expire(&token_key, MINUTE_TTL.as_secs() as i64).await?;
         }
 
         self.release_slots(&mut conn, &record).await?;

@@ -53,6 +53,9 @@ unless real use says otherwise.
   `INCR`, refusals roll back, unsettled leases expire on a TTL; two
   instances over one store enforce one budget between them,
   concurrently, and a refund on one releases budget for the other.
+  Settlement charges spend before releasing the reservation (settle-vs-
+  admit is ordering, not a transaction), and one lease settles its
+  counters exactly once.
   Postgres: one transaction per admission (windows, caps and the lease
   commit together or not at all), deadpool-managed pool, a purge timer;
   the same done-when holds. Both suites also ran against the real
