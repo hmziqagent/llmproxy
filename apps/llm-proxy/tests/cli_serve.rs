@@ -82,7 +82,7 @@ path = "{storage}"
 
     impl RunningServer {
         /// Starts the binary with a one-second drain deadline and returns once
-        /// it accepts connections.
+        /// it answers `/health` with its own 200.
         fn start(upstream: SocketAddr) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let addr = TcpListener::bind("127.0.0.1:0")
@@ -111,12 +111,45 @@ path = "{storage}"
 
         fn wait_until_listening(&mut self) {
             let started = Instant::now();
-            while TcpStream::connect(self.addr).is_err() {
+            loop {
+                // The port above was reserved by binding and dropping a
+                // listener, so until this server binds it, the kernel can
+                // hand the address to another concurrent socket, and a bare
+                // TCP connect would greet that squatter. Only a served 200
+                // from /health — which only this server can answer — counts
+                // as "listening".
+                if self.serves_health() {
+                    return;
+                }
                 let exited = self.child.try_wait().unwrap();
                 assert!(exited.is_none(), "server exited during startup: {exited:?}");
                 assert!(started.elapsed() < WAIT_LIMIT, "server never started");
                 std::thread::sleep(Duration::from_millis(20));
             }
+        }
+
+        /// One `/health` attempt against the bound address: true only when
+        /// the peer answers this server's own `HTTP/1.1 200`. Anything else —
+        /// refused connect, reset, silence, or a squatter's response — is
+        /// "not ready yet".
+        fn serves_health(&self) -> bool {
+            let Ok(mut stream) = TcpStream::connect(self.addr) else {
+                return false;
+            };
+            if stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .is_err()
+            {
+                return false;
+            }
+            if stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .is_err()
+            {
+                return false;
+            }
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).is_ok() && reply.starts_with("HTTP/1.1 200")
         }
 
         fn send_sigterm(&self) {
