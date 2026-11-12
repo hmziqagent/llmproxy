@@ -1007,6 +1007,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_thought_signature_survives_the_client_round_trip_across_turns() {
+        // Full loop (plan 02, step 6): the Gemini upstream returns a
+        // functionCall part carrying a thought signature, the
+        // Anthropic-dialect client sees it on its tool_use block, and the
+        // next turn's tool_use + tool_result replay reaches the second
+        // upstream request with the signature on both the functionCall and
+        // the functionResponse parts.
+        let gemini_body = serde_json::to_vec(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "SF"}},
+                        "thoughtSignature": "sig-1"
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 25,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 32
+            }
+        }))
+        .expect("serialize gemini function-call response");
+        let upstream = spawn_fake_upstream_dialect(false, false, false, gemini_body).await;
+        let state = state_with_provider(&upstream, "gemini_generate_content", "messages", false);
+        let app = build_router(state);
+
+        let tools = serde_json::json!([{
+            "name": "get_weather",
+            "description": "look up the weather",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }]);
+        let turn_one = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Weather in SF?"}],
+            "tools": tools,
+        });
+        let resp = app
+            .clone()
+            .oneshot(post_messages(&turn_one))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let client_resp: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("client response json");
+        let tool_use = client_resp["content"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool_use block")
+            .clone();
+        assert_eq!(
+            tool_use["signature"], "sig-1",
+            "the client-facing tool_use block must carry the captured thought signature: {client_resp}"
+        );
+
+        let turn_two = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Weather in SF?"},
+                {"role": "assistant", "content": [tool_use.clone()]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": (tool_use["id"].clone()), "content": "72F"}
+                ]},
+            ],
+            "tools": tools,
+        });
+        let resp = app
+            .oneshot(post_messages(&turn_two))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The capture slot holds the latest request: the second upstream one.
+        let (_, upstream_body) = captured(&upstream).await;
+        let assistant_parts = upstream_body["contents"][1]["parts"]
+            .as_array()
+            .expect("model parts");
+        assert_eq!(
+            assistant_parts[0]["functionCall"]["name"], "get_weather",
+            "the assistant turn must replay the function call: {upstream_body}"
+        );
+        assert_eq!(
+            assistant_parts[0]["thoughtSignature"], "sig-1",
+            "the replayed functionCall part must carry the thought signature: {upstream_body}"
+        );
+        let result_parts = upstream_body["contents"][2]["parts"]
+            .as_array()
+            .expect("tool-result parts");
+        assert_eq!(
+            result_parts[0]["functionResponse"]["name"], "get_weather",
+            "the tool turn must carry the function response: {upstream_body}"
+        );
+        assert_eq!(
+            result_parts[0]["thoughtSignature"], "sig-1",
+            "the functionResponse part must echo the thought signature: {upstream_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn captured_claude_code_session_replays_with_only_the_model_edit() {
         // Live-captured session (Claude Code CLI 2.1.251, 2026-11-05): a
         // streaming request whose thinking object carries the auxiliary

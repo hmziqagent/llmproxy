@@ -1525,6 +1525,43 @@ mod tests {
     }
 
     #[test]
+    fn decode_response_captures_thought_signature_on_function_call() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "SF"}},
+                        "thoughtSignature": "sig-1"
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 200,
+                "candidatesTokenCount": 80,
+                "totalTokenCount": 280
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = GeminiAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert!(
+            core_resp.content.iter().any(|c| matches!(
+                c,
+                CoreContent::ToolUse {
+                    signature: Some(signature),
+                    ..
+                } if signature == "sig-1"
+            )),
+            "the decoded ToolUse must carry the thought signature: {:?}",
+            core_resp.content
+        );
+    }
+
+    #[test]
     fn decode_no_candidates_error() {
         let target = make_target();
         let resp_json = serde_json::json!({
