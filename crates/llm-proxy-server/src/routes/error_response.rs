@@ -184,7 +184,7 @@ pub(super) fn route_error_response(protocol: ClientProtocol, error: &RouteError)
         _ => llm_proxy_engine::policy_for(status.as_u16()).is_some_and(|row| row.should_retry),
     };
     response.headers_mut().insert(
-        "x-should-retry",
+        X_SHOULD_RETRY,
         HeaderValue::from_static(if should_retry { "true" } else { "false" }),
     );
     if let Some(secs) = error.retry_after_secs() {
@@ -198,6 +198,40 @@ pub(crate) const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
 pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
 pub(crate) const UPSTREAM_PASSTHROUGH_CLIENT_MESSAGE: &str = "upstream rejected the request";
 pub(crate) const UPSTREAM_COLLAPSE_CLIENT_MESSAGE: &str = "upstream service error";
+
+/// The `x-should-retry` header name, shared by [`route_error_response`] and
+/// [`stamp_retry_policy`].
+const X_SHOULD_RETRY: &str = "x-should-retry";
+
+/// Stamps `x-should-retry` on an error response that was not built through
+/// [`route_error_response`] — the loop guard's 508, the host guard's 403, a
+/// `CatchPanicLayer` 500 — so the one policy table governs every error the
+/// router emits (plan 05 step 1). An existing header is never overwritten
+/// (`RetryExhausted` relies on its own `false`), and non-error responses are
+/// left alone.
+pub(crate) fn stamp_retry_policy(response: &mut Response) {
+    let status = response.status();
+    if status.as_u16() < 400 {
+        return;
+    }
+    if response.headers().contains_key(X_SHOULD_RETRY) {
+        return;
+    }
+    let should_retry = match llm_proxy_engine::policy_for(status.as_u16()) {
+        Some(row) => row.should_retry,
+        None => {
+            tracing::error!(
+                status = status.as_u16(),
+                "response status has no policy row"
+            );
+            false
+        }
+    };
+    response.headers_mut().insert(
+        X_SHOULD_RETRY,
+        HeaderValue::from_static(if should_retry { "true" } else { "false" }),
+    );
+}
 fn anthropic_error_response(error: &RouteError) -> Response<Body> {
     let (status, error_type, message) = extract_error_fields(error);
 

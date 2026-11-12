@@ -164,6 +164,27 @@ mod tests {
         );
     }
 
+    /// The host guard's inline 403 body is rendered before any route handler,
+    /// so it must still carry the policy table's `x-should-retry` row (plan 05
+    /// step 1): the proxy does not want the same foreign-host request retried.
+    #[tokio::test]
+    async fn a_foreign_host_refusal_carries_the_retry_policy() {
+        let app = build_router(state(None, AuthConfig::default()));
+        let response = app
+            .oneshot(post_messages(&[("host", "evil.example")]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            Some("false"),
+            "the 403 foreign-host refusal must carry the table's x-should-retry"
+        );
+    }
+
     #[tokio::test]
     async fn a_browser_request_with_a_foreign_origin_is_refused() {
         let app = build_router(state(None, AuthConfig::default()));
@@ -437,6 +458,17 @@ mod loop_guard_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+        // The policy table's row governs the header on every error response,
+        // including this guard's inline body (plan 05 step 1): a retry loops
+        // again, so the table must say false.
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            Some("false"),
+            "the 508 loop refusal must carry the table's x-should-retry"
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();

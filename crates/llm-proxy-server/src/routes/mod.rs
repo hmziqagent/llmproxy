@@ -110,10 +110,16 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(CatchPanicLayer::new())
         .with_state(state);
-    match usage_on_main {
+    let router = match usage_on_main {
         Some(usage) => router.merge(usage),
         None => router,
-    }
+    };
+    // The outermost layer (plan 05 step 1): every error the router emits —
+    // including the loop guard's 508 and the host guard's 403, whose inline
+    // bodies never reach `normalize_error_responses`, and the 404/405
+    // fallbacks and a merged admin router — leaves carrying the one policy
+    // table's `x-should-retry` row.
+    router.layer(axum::middleware::from_fn(stamp_error_policy))
 }
 
 /// The provider-scoped API surface: every client dialect's route, each under
@@ -437,6 +443,15 @@ fn make_request_span(req: &Request) -> tracing::Span {
         method = %req.method(),
         path = %req.uri().path(),
     )
+}
+/// Stamps the policy table's `x-should-retry` row onto every error response
+/// that bubbles out of the inner layers without one (plan 05 step 1): the
+/// guards' inline bodies, the 404/405 fallbacks, panic 500s, and a merged
+/// admin router. See [`error_response::stamp_retry_policy`].
+async fn stamp_error_policy(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    error_response::stamp_retry_policy(&mut response);
+    response
 }
 async fn normalize_error_responses(
     State(event_bus): State<Arc<dyn EventBus>>,

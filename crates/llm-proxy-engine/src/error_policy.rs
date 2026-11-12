@@ -27,6 +27,8 @@
 //!   ladder already retried them, in which case
 //!   [`EngineError::RetryExhausted`] overrides the row and says `false`
 //!   (plan 04 step 12).
+//! - The self-loop refusal (508) says `false`: the request is looping, and a
+//!   retry loops again until the operator fixes the upstream config.
 //! - The proxy's own bugs (500) say `false`: a retry re-runs the same bug
 //!   and multiplies load without evidence it helps.
 
@@ -118,6 +120,12 @@ pub const STATUS_POLICY: &[StatusCodePolicy] = &[
         code: 504,
         should_retry: true,
         note: "upstream timeout; a retry may fit the window",
+    },
+    StatusCodePolicy {
+        code: 508,
+        should_retry: false,
+        note: "the upstream config loops back to this proxy; a retry loops again \
+               until the operator fixes the config",
     },
 ];
 
