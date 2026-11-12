@@ -1161,6 +1161,50 @@ mod tests {
         }
     }
 
+    /// Encodes a user message carrying one image and returns its first wire
+    /// part as raw JSON, so the serialized `inlineData`/`fileData` key
+    /// spellings are asserted directly.
+    fn encode_first_part_of_user_image(source: serde_json::Value) -> serde_json::Value {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Image { source }],
+        }]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        body["contents"][0]["parts"][0].clone()
+    }
+
+    #[test]
+    fn base64_image_encodes_as_inline_data() {
+        let part = encode_first_part_of_user_image(serde_json::json!({
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "AAAA"
+        }));
+        assert_eq!(
+            part,
+            serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "AAAA"}}),
+            "a base64 image source must encode as an inlineData part: {part}"
+        );
+    }
+
+    #[test]
+    fn url_image_encodes_as_file_data() {
+        let part = encode_first_part_of_user_image(serde_json::json!({
+            "type": "url",
+            "url": "https://x/y.png"
+        }));
+        assert_eq!(
+            part,
+            serde_json::json!({"fileData": {"mimeType": "image/png", "fileUri": "https://x/y.png"}}),
+            "a url image source without media_type must default to image/png and encode as a fileData part: {part}"
+        );
+    }
+
     #[test]
     fn encode_tool_declarations() {
         let mut core = make_core_request(vec![CoreMessage {

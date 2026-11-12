@@ -1049,6 +1049,55 @@ mod tests {
         );
     }
 
+    /// Encodes a user message carrying one image and returns its wire
+    /// content array, so the serialized `image_url` part shape is asserted.
+    fn encode_user_image_content(source: serde_json::Value) -> serde_json::Value {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Image { source }],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        body["messages"][0]["content"].clone()
+    }
+
+    #[test]
+    fn base64_image_encodes_as_data_url_image_part() {
+        let content = encode_user_image_content(serde_json::json!({
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "AAAA"
+        }));
+        assert_eq!(
+            content,
+            serde_json::json!([{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"}
+            }]),
+            "a base64 image source must encode as a data:-URI image_url part: {content}"
+        );
+    }
+
+    #[test]
+    fn url_image_encodes_as_image_url_part() {
+        let content = encode_user_image_content(serde_json::json!({
+            "type": "url",
+            "url": "https://x/y.png"
+        }));
+        assert_eq!(
+            content,
+            serde_json::json!([{
+                "type": "image_url",
+                "image_url": {"url": "https://x/y.png"}
+            }]),
+            "a url image source must encode as an image_url part: {content}"
+        );
+    }
+
     #[test]
     fn encode_tool_declarations() {
         let mut core = make_core_request(vec![CoreMessage {
