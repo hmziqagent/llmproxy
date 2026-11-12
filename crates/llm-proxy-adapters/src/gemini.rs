@@ -2267,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_reasoning_effort_omitted() {
+    fn reasoning_effort_is_not_encoded_as_temperature() {
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
             content: vec![CoreContent::Text {
@@ -2285,6 +2285,77 @@ mod tests {
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let config = body.generation_config.unwrap();
         assert_eq!(config.temperature, None);
+    }
+
+    #[test]
+    fn reasoning_effort_becomes_clamped_thinking_budget_on_the_wire() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.reasoning_effort = Some("high".into());
+        let target = make_target();
+        let proxy_req = GeminiAdapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let budget = &wire["generation_config"]["thinkingConfig"]["thinkingBudget"];
+        assert_eq!(
+            budget,
+            &serde_json::json!(16_384),
+            "the documented `high` budget (16_384, inside gemini-2.5-pro's 128..=32_768) \
+             must reach generation_config.thinkingConfig.thinkingBudget: {wire}"
+        );
+        assert!(
+            budget.is_i64(),
+            "thinkingBudget must serialize as an integer, got: {budget}"
+        );
+    }
+
+    #[test]
+    fn thinking_budget_from_anthropic_thinking_object() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.thinking =
+            Some(serde_json::json!({"type": "enabled", "budget_tokens": 100_000}));
+        let target = make_target();
+        let proxy_req = GeminiAdapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            wire["generation_config"]["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(32_768),
+            "a 100_000-token Anthropic budget must clamp to gemini-2.5-pro's 32_768 max: {wire}"
+        );
+    }
+
+    #[test]
+    fn no_reasoning_means_no_thinking_config() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let target = make_target();
+        let proxy_req = GeminiAdapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(
+            wire["generation_config"].get("thinkingConfig").is_none(),
+            "a request with no reasoning intent must not carry thinkingConfig: {wire}"
+        );
     }
 
     #[test]
