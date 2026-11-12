@@ -1194,6 +1194,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assistant_thinking_is_replayed_as_reasoning_content() {
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::Text {
+                    text: "q".into(),
+                    cache: None,
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![
+                    CoreContent::Thinking {
+                        text: "plan".into(),
+                        signature: None,
+                    },
+                    CoreContent::Text {
+                        text: "a".into(),
+                        cache: None,
+                    },
+                ],
+            },
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::Text {
+                    text: "next".into(),
+                    cache: None,
+                }],
+            },
+        ]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.messages.len(), 3);
+        assert_eq!(body.messages[1].role, "assistant");
+        assert_eq!(
+            body.messages[1].reasoning_content,
+            Some("plan".to_owned()),
+            "assistant thinking text must replay as reasoning_content"
+        );
+        assert_eq!(
+            body.messages[1].content,
+            serde_json::Value::String("a".into()),
+            "the assistant text block must not be absorbed into reasoning_content"
+        );
+    }
+
+    #[test]
+    fn empty_thinking_block_is_replayed_as_empty_reasoning_content() {
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::Text {
+                    text: "q".into(),
+                    cache: None,
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![CoreContent::Thinking {
+                    text: String::new(),
+                    signature: None,
+                }],
+            },
+        ]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            serde_json::json!(""),
+            "an explicitly empty reasoning_content must serialize as a present \
+             empty string, not be omitted: {body}"
+        );
+        let typed: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            typed.messages[1].reasoning_content,
+            Some(String::new()),
+            "an empty thinking block must decode as Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn multiple_thinking_blocks_concatenate() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![
+                CoreContent::Thinking {
+                    text: "one".into(),
+                    signature: None,
+                },
+                CoreContent::Thinking {
+                    text: "two".into(),
+                    signature: None,
+                },
+            ],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(
+            body.messages[0].reasoning_content,
+            Some("onetwo".to_owned()),
+            "consecutive thinking blocks must concatenate into one \
+             reasoning_content"
+        );
+    }
+
     /// Encodes the tool replay turn an Anthropic-dialect client sends after a
     /// tool ran: the assistant's `tool_use`, then a user turn carrying its
     /// `tool_result`. Returns the encoded wire body.
