@@ -1458,6 +1458,57 @@ mod tests {
     }
 
     #[test]
+    fn encode_sampling_fields_are_carried() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.temperature = Some(0.3);
+        core.sampling.top_p = Some(0.8);
+        core.sampling.max_tokens = Some(256);
+        let adapter = ResponsesAdapter;
+        let proxy_req = adapter
+            .encode_request(&core, &make_target(), &client_wire(&core))
+            .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["temperature"], 0.3, "temperature must be forwarded");
+        assert_eq!(body["top_p"], 0.8, "top_p must be forwarded");
+        assert_eq!(
+            body["max_output_tokens"], 256,
+            "core max_tokens must map to the Responses `max_output_tokens` name"
+        );
+        assert!(
+            body.get("max_tokens").is_none(),
+            "the OpenAI Chat name `max_tokens` must not appear on the Responses wire"
+        );
+
+        let plain = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let proxy_req = adapter
+            .encode_request(&plain, &make_target(), &client_wire(&plain))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "unset temperature must be absent"
+        );
+        assert!(body.get("top_p").is_none(), "unset top_p must be absent");
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "unset max_output_tokens must be absent"
+        );
+    }
+
+    #[test]
     fn encode_tool_use_as_function_call() {
         let core = make_core_request(vec![CoreMessage {
             role: CoreRole::Assistant,
