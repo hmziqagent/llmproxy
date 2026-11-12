@@ -48,6 +48,10 @@ mod tests {
         GeminiNonStream,
         /// Gemini SSE stream.
         GeminiStream,
+        /// Anthropic SSE stream whose `event: error` arrives only after the
+        /// committed prefix, so the proxy has already answered 200 when it
+        /// decodes: the error must surface in-band, not as an HTTP status.
+        AnthropicStreamThenError,
         /// HTTP 400 with an Anthropic-shaped error body.
         Error400,
     }
@@ -167,6 +171,37 @@ mod tests {
         Body::from_stream(stream)
     }
 
+    /// Like [`sse_body`], but the last event is withheld for `gap`: the
+    /// earlier events are decoded (and the proxy commits its first bytes)
+    /// before the trailing event is even written, so a trailing error cannot
+    /// fold into the same transport read as the committed prefix and read as
+    /// a leading error.
+    fn sse_body_with_trailing_gap(events: Vec<&'static str>, gap: Duration) -> Body {
+        use futures::StreamExt as _;
+        let mut events = events;
+        let last = events.pop().expect("at least one event").to_owned();
+        let prefix = futures::stream::iter(events.into_iter().map(|chunk| {
+            Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(chunk.to_owned()))
+        }));
+        let tail = futures::stream::once(async move {
+            tokio::time::sleep(gap).await;
+            Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(last))
+        });
+        Body::from_stream(prefix.chain(tail))
+    }
+
+    /// The committed prefix of the text stream followed by a mid-stream
+    /// `event: error`: `message_start`, a text `content_block_start`, one
+    /// `text_delta`, then the overloaded error.
+    fn anthropic_stream_then_error_events() -> Vec<&'static str> {
+        let mut events: Vec<&'static str> =
+            anthropic_stream_events(false).into_iter().take(3).collect();
+        events.push(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        events
+    }
+
     /// The canned response for one behavior.
     fn respond(behavior: Behavior) -> axum::response::Response {
         match behavior {
@@ -204,6 +239,15 @@ mod tests {
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/event-stream")],
                 sse_body(gemini_stream_events()),
+            )
+                .into_response(),
+            Behavior::AnthropicStreamThenError => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse_body_with_trailing_gap(
+                    anthropic_stream_then_error_events(),
+                    Duration::from_millis(50),
+                ),
             )
                 .into_response(),
             Behavior::Error400 => (
@@ -1080,6 +1124,249 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let value: Value = serde_json::from_str(&body_text(response).await).expect("json error");
         assert!(value["error"].is_string(), "{value}");
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming x error: a request that asks for a stream but fails before
+    // any stream bytes are committed keeps the dialect's HTTP error shape
+    // (never a half-open stream), and an error after bytes were committed
+    // surfaces in-band, in the dialect's own stream framing, with no
+    // success terminal.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn streaming_http_errors_use_the_dialect_error_shape() {
+        // Responses: the OpenAI error object. The failure happens before the
+        // stream is committed, so the answer is JSON, never
+        // text/event-stream.
+        let upstream = spawn_fake_upstream(Behavior::Error400).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1/responses",
+                &responses_request(true),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(content_type, "application/json");
+        let value: Value = serde_json::from_str(&body_text(response).await).expect("json error");
+        assert!(value["error"]["message"].is_string(), "{value}");
+        assert!(value["error"]["type"].is_string(), "{value}");
+
+        // Gemini: the google error object.
+        let upstream = spawn_fake_upstream(Behavior::Error400).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::GenerateContent,
+            false,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                &gemini_request(),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_str(&body_text(response).await).expect("json error");
+        assert_eq!(value["error"]["code"], 400, "{value}");
+        assert_eq!(value["error"]["status"], "INVALID_ARGUMENT");
+
+        // Ollama: the bare error string, and not an NDJSON stream of done
+        // objects.
+        let upstream = spawn_fake_upstream(Behavior::Error400).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/api/chat",
+                &ollama_chat_request(true),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert_ne!(
+            content_type, "application/x-ndjson",
+            "an uncommitted failure is an HTTP error, not a stream"
+        );
+        let value: Value = serde_json::from_str(&body_text(response).await).expect("json error");
+        assert!(value["error"].is_string(), "{value}");
+    }
+
+    // The upstream errors after the proxy committed its first bytes: the
+    // client already holds a 200 and an open stream, so the error surfaces
+    // in-band as the dialect's failure terminal and no success terminal is
+    // ever emitted.
+    #[tokio::test]
+    async fn responses_stream_error_renders_response_failed() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicStreamThenError).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1/responses",
+                &responses_request(true),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("event: response.failed"),
+            "the failure terminal is missing: {text}"
+        );
+        assert!(
+            !text.contains("response.completed"),
+            "a failed stream must not carry the success terminal: {text}"
+        );
+        let failed = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).expect("valid json"))
+            .find(|value| value["type"] == "response.failed")
+            .expect("response.failed event");
+        let message = failed["response"]["error"]["message"]
+            .as_str()
+            .expect("error message string");
+        assert!(
+            message.contains("Overloaded"),
+            "the upstream message must reach the client: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_error_renders_an_error_chunk() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicStreamThenError).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::GenerateContent,
+            false,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                &gemini_request(),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        let chunks: Vec<Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).expect("valid json"))
+            .collect();
+        let errored = chunks
+            .iter()
+            .filter_map(|chunk| chunk["error"]["message"].as_str())
+            .any(|message| message.contains("Overloaded"));
+        assert!(errored, "no chunk carries the error message: {text}");
+        assert!(
+            chunks.iter().all(|chunk| chunk
+                .get("candidates")
+                .and_then(|candidates| candidates.get(0))
+                .and_then(|candidate| candidate.get("finishReason"))
+                .is_none()),
+            "a failed stream must not carry a finishReason: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_stream_error_renders_an_error_line() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicStreamThenError).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/api/chat",
+                &ollama_chat_request(true),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("ndjson line"))
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .all(|line| line["done"].as_bool() != Some(true)),
+            "a failed stream must not carry a done object: {text}"
+        );
+        let last = lines.last().expect("terminal line");
+        let message = last["error"]
+            .as_str()
+            .expect("terminal line carries the error string");
+        assert!(
+            message.contains("Overloaded"),
+            "the upstream message must reach the client: {message}"
+        );
+    }
+
+    // Without `alt=sse` the stream is a JSON array, and the array framing
+    // must still close as valid JSON after an in-band error: its last
+    // element carries the error.
+    #[tokio::test]
+    async fn gemini_stream_without_alt_error_closes_the_json_array() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicStreamThenError).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::GenerateContent,
+            false,
+        );
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+                &gemini_request(),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let array: Vec<Value> =
+            serde_json::from_str(&body_text(response).await).expect("a JSON array of chunks");
+        let last = array.last().expect("terminal element");
+        let message = last["error"]["message"]
+            .as_str()
+            .expect("error message string");
+        assert!(
+            message.contains("Overloaded"),
+            "the upstream message must reach the client: {message}"
+        );
     }
 
     #[tokio::test]

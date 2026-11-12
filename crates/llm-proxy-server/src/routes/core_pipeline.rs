@@ -834,11 +834,34 @@ fn encode_one(
         return events;
     }
     let mut events = Vec::new();
+    // The encoder first: with an in-band error, Anthropic and Responses
+    // render it through their own event shapes, while Gemini and Ollama
+    // self-finish and render nothing — so their dialect error chunk follows
+    // here, the same framing `encode_terminal_error` adds when the error
+    // ends the stream. Without it the error would vanish whenever the stream
+    // carries any event past the error (the decoder's end-of-stream stop).
+    let in_band_error = if let CoreEvent::Error { error } = &core_event {
+        Some(error.clone())
+    } else {
+        None
+    };
     match encoder.encode_event(core_event) {
         Ok(mut encoded) => events.append(&mut encoded),
         Err(e) => {
-            warn!(error = %e, "failed to encode stream event; dropping");
+            if in_band_error.is_some() {
+                tracing::trace!(
+                    error = %e,
+                    "codec refused the in-band error event; error framing follows"
+                );
+            } else {
+                warn!(error = %e, "failed to encode stream event; dropping");
+            }
         }
+    }
+    if let Some(error) = in_band_error.as_ref()
+        && let Some(chunk) = dialect_error_chunk(protocol, error)
+    {
+        events.push(chunk);
     }
     events
 }
