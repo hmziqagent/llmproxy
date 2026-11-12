@@ -82,7 +82,7 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
 - **Cross-format field policy (step 3).** One disposition table per provider
   protocol (`adapter/client_wire.rs`): each leftover client field is **carried**
   verbatim (e.g. `service_tier`, `top_k` to Anthropic; `store`,
-  `prompt_cache_key`, `parallel_tool_calls` to Responses), **mapped**
+  `prompt_cache_key`, `parallel_tool_calls` to Responses and Chat), **mapped**
   (`parallel_tool_calls` → `tool_choice.disable_parallel_tool_use`;
   `output_config.effort` → reasoning; images between neutral, OpenAI and
   Anthropic shapes), or **rejected with a 400 naming every field**. The

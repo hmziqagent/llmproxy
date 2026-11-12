@@ -2114,6 +2114,39 @@ mod tests {
     }
 
     #[test]
+    fn responses_client_extras_reach_chat_upstream() {
+        // The Chat Completions API accepts `parallel_tool_calls`, `store` and
+        // `prompt_cache_key` with the same names and shapes the Responses API
+        // uses, so a Responses-dialect client's fields ride verbatim instead
+        // of being rejected by name.
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model": core.model.requested,
+                "input": [],
+                "parallel_tool_calls": false,
+                "store": true,
+                "prompt_cache_key": "k",
+            }),
+        );
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target, &client).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["parallel_tool_calls"], serde_json::json!(false));
+        assert_eq!(body["store"], serde_json::json!(true));
+        assert_eq!(body["prompt_cache_key"], serde_json::json!("k"));
+    }
+
+    #[test]
     fn encode_tool_choice_none_omitted() {
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,

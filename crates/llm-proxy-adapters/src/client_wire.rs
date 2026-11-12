@@ -249,7 +249,9 @@ pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDispositi
         },
         protocols::OPENAI_CHAT_COMPLETIONS => match field {
             // The Chat Completions API accepts these with the same shape.
-            "service_tier" => FieldDisposition::Carried,
+            "service_tier" | "parallel_tool_calls" | "store" | "prompt_cache_key" => {
+                FieldDisposition::Carried
+            }
             // Mapped by the chat adapter from the raw client body.
             "output_config" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
@@ -718,6 +720,29 @@ mod tests {
         )
         .expect("service_tier is carried");
         assert_eq!(carried.get("service_tier"), Some(&json!("flex")));
+
+        // A Responses-dialect client's `parallel_tool_calls`, `store` and
+        // `prompt_cache_key` ride verbatim to the Chat Completions provider:
+        // same names, same shapes.
+        let client = wire(
+            ClientWireFormat::OpenAiResponses,
+            json!({
+                "model": "m",
+                "input": [],
+                "parallel_tool_calls": false,
+                "store": true,
+                "prompt_cache_key": "k"
+            }),
+        );
+        let carried = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .expect("the three Responses extras are carried to Chat");
+        assert_eq!(carried.get("parallel_tool_calls"), Some(&json!(false)));
+        assert_eq!(carried.get("store"), Some(&json!(true)));
+        assert_eq!(carried.get("prompt_cache_key"), Some(&json!("k")));
     }
 
     #[test]
