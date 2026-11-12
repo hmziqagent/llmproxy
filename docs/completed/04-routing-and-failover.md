@@ -91,9 +91,10 @@ Add pools, retries and failover on top of the routing decision in the
   `a_stream_that_fails_after_commit_ends_with_an_in_band_error…`,
   `the_hold_budget_commits_a_silent_stream_and_covers_the_gap`).
 - Connect/first-byte/idle/total timeouts come from
-  `server.upstream_timeouts` (per-family overrides in
-  `server.endpoint_families`), validated at config load
-  (`validate_upstream_timeouts`).
+  `server.upstream_timeouts`, validated at config load
+  (`validate_upstream_timeouts`);
+  `server.endpoint_families.<name>.request_timeout` bounds the whole
+  request per family.
 - Sticky pools pin a session (the `x-claude-code-session-id` header) to the
   member that served it, reordering the next ladder; the pin never applies
   to a direct route or a non-sticky pool, and the refuse policy holds the
