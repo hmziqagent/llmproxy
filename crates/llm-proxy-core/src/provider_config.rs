@@ -2718,7 +2718,8 @@ fn validate_prompt_cache(
         let invalid = pointer.is_empty()
             || !pointer.starts_with('/')
             || pointer.ends_with('/')
-            || pointer.contains("//");
+            || pointer.contains("//")
+            || has_invalid_escape(pointer);
         if invalid {
             return Err(ConfigValidationError::InvalidStripPointer {
                 provider: name.to_owned(),
@@ -2727,6 +2728,19 @@ fn validate_prompt_cache(
         }
     }
     Ok(())
+}
+
+/// RFC 6901: within a reference token, `~` must be followed by `0` (a
+/// literal `~`) or `1` (a literal `/`); any other follower, or a dangling
+/// `~` at the end of a token, is an invalid escape.
+fn has_invalid_escape(pointer: &str) -> bool {
+    let mut chars = pointer.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current == '~' && !matches!(chars.peek(), Some(&'0') | Some(&'1')) {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_headers(
@@ -3761,7 +3775,19 @@ chat_completions = "chat"
         });
         validate_provider_config(&provider, None).expect("well-formed pointers validate");
 
-        for malformed in ["metadata/user_id", "/metadata//user_id", "/metadata/", ""] {
+        for malformed in [
+            "metadata/user_id",
+            "/metadata//user_id",
+            "/metadata/",
+            "",
+            // RFC 6901: a `~` in a reference token must be followed by `0`
+            // or `1`; anything else would survive the split as a literal.
+            "/a~2",
+            "/a~",
+            "/~",
+            "/a~x/b",
+            "/a/b~",
+        ] {
             let mut provider = make_minimal_provider("hygienic");
             provider.prompt_cache = Some(PromptCacheConfig {
                 strip_volatile: vec![malformed.to_owned()],
@@ -3774,6 +3800,16 @@ chat_completions = "chat"
                 "the error must say what a pointer is: {error}"
             );
         }
+
+        let mut provider = make_minimal_provider("hygienic");
+        provider.prompt_cache = Some(PromptCacheConfig {
+            strip_volatile: vec!["/a~0b".to_owned(), "/a~1b/c".to_owned()],
+            inject_markers: false,
+        });
+        assert!(
+            validate_provider_config(&provider, None).is_ok(),
+            "escaped `~0` and `~1` are well-formed RFC 6901 pointers"
+        );
     }
 
     #[test]

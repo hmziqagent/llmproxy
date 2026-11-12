@@ -77,7 +77,9 @@ messages = "anthropic"
 #
 # strip_volatile: RFC 6901 JSON pointers removed from the encoded request
 # before egress — volatile per-request bytes (client correlation tokens)
-# that would bust the provider's prompt cache on every turn.
+# that would bust the provider's prompt cache on every turn. A literal
+# `~` in a key is escaped `~0` (and `/` as `~1`); pointers with invalid
+# escapes are refused at load.
 # inject_markers: cache-control breakpoints on the stable prefix
 # (Anthropic Messages only, within the provider's 4-breakpoint budget;
 # the newest message is never marked; markers the client set are kept).

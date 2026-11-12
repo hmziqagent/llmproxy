@@ -70,18 +70,34 @@ pub(crate) fn strip_pointer(request: &mut Value, pointer: &str) {
 
 /// Splits `/a/b/3` into the parent pointer `/a/b` and the unescaped leaf
 /// token `3`; `/user` splits into the root pointer and `user`. A pointer
-/// without a leading slash or with an empty leaf is unusable.
+/// without a leading slash, with an empty leaf, or with an invalid `~`
+/// escape (RFC 6901: `~` must be followed by `0` or `1`) in the leaf or in
+/// any parent segment is unusable — such a pointer never names a document
+/// location, so stripping it must not fall back to a literal-key match.
 fn split_pointer(pointer: &str) -> Option<(String, String)> {
     let trimmed = pointer.strip_prefix('/')?;
     let (parent, leaf) = match trimmed.rsplit_once('/') {
         Some((parent, leaf)) => (format!("/{parent}"), leaf),
         None => (String::new(), trimmed),
     };
-    if leaf.is_empty() {
+    if leaf.is_empty() || has_invalid_escape(leaf) || has_invalid_escape(&parent) {
         return None;
     }
     // `~1` is `/` and `~0` is `~` in an RFC 6901 reference token.
     Some((parent, leaf.replace("~1", "/").replace("~0", "~")))
+}
+
+/// RFC 6901: within a reference token, `~` must be followed by `0` (a
+/// literal `~`) or `1` (a literal `/`); any other follower, or a dangling
+/// `~` at the end of a token, is an invalid escape.
+fn has_invalid_escape(token: &str) -> bool {
+    let mut chars = token.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current == '~' && !matches!(chars.peek(), Some(&'0') | Some(&'1')) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Phase 3, markers (Anthropic Messages): place `cache_control` breakpoints
@@ -193,6 +209,19 @@ mod tests {
                 "metadata": {},
                 "messages": [{"role": "user", "content": "hello"}]
             })
+        );
+    }
+
+    #[test]
+    fn strip_ignores_a_pointer_with_a_bad_escape() {
+        // RFC 6901: `~` must be followed by `0` or `1`, so `/a~2` never
+        // names a key — it must not strip a key that is literally `a~2`.
+        let mut request = json!({"a~2": 1, "b": 2});
+        strip_pointer(&mut request, "/a~2");
+        assert_eq!(
+            request,
+            json!({"a~2": 1, "b": 2}),
+            "a bad escape never matches a literal key"
         );
     }
 
