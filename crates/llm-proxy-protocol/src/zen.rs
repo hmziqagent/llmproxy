@@ -417,6 +417,10 @@ pub struct GeminiGenerationConfig {
     /// Top-K sampling (`topK` on the wire).
     #[serde(rename = "topK", default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
+    /// Deterministic sampling seed (`seed` on the wire), carried from a client
+    /// Chat `seed` on cross-format requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
     /// Maximum number of tokens in the completion.
     pub max_output_tokens: Option<i32>,
     /// Stop sequences that cause generation to stop.
@@ -643,6 +647,7 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: None,
                 top_k: None,
+                seed: None,
                 max_output_tokens: Some(1024),
                 stop_sequences: None,
                 thinking_config: None,

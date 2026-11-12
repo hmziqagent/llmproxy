@@ -104,7 +104,9 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   Cross-format, `response_format` maps onto Responses `text.format` and Gemini
   `generationConfig.responseMimeType` (+ `responseJsonSchema` for a schema);
   unknown types are rejected naming `response_format.type`, and Anthropic
-  keeps rejecting the field by name.
+  keeps rejecting the field by name. Cross-format, `seed` maps onto Gemini
+  `generationConfig.seed` (a non-integer seed is rejected naming the field,
+  dropped under lossy); Responses and Anthropic keep rejecting it by name.
 - **Reasoning translation (step 5, BUG-20, backlog 13).**
   `adapter/reasoning.rs` converts between `reasoning_effort`,
   `thinking.budget_tokens` and Gemini's `thinkingConfig.thinkingBudget` with a

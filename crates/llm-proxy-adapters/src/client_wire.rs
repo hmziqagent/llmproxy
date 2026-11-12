@@ -272,6 +272,8 @@ pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDispositi
             // `response_format` becomes generationConfig.responseMimeType
             // (plus responseJsonSchema for a schema).
             "response_format" => FieldDisposition::Mapped,
+            // Mapped by the Gemini adapter into generationConfig.seed.
+            "seed" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
         _ => FieldDisposition::Rejected,
@@ -724,15 +726,15 @@ mod tests {
             ClientWireFormat::OpenAiChatCompletions,
             json!({"model": "m", "messages": [], "seed": 7, "logprobs": true}),
         );
-        let err = apply_field_policy(
-            &client,
-            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
-            false,
-        )
-        .expect_err("seed and logprobs must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("seed"), "error must name seed: {msg}");
-        assert!(msg.contains("logprobs"), "error must name logprobs: {msg}");
+        // `seed` is mapped only for Gemini; Responses and Anthropic keep
+        // rejecting it, as they do `logprobs`.
+        for provider in [protocols::ANTHROPIC_MESSAGES, protocols::OPENAI_RESPONSES] {
+            let err = apply_field_policy(&client, &ProtocolName::new(provider), false)
+                .expect_err("seed and logprobs must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("seed"), "error must name seed: {msg}");
+            assert!(msg.contains("logprobs"), "error must name logprobs: {msg}");
+        }
     }
 
     #[test]

@@ -629,6 +629,33 @@ impl GeminiAdapter {
                 .and_then(|v| i32::try_from(v).ok())
         });
 
+        // `seed` is an OpenAI Chat extra; Gemini carries it verbatim as
+        // generationConfig.seed. A present non-integer value has no mapping:
+        // it is rejected naming the field (dropped with a warning under the
+        // per-route `lossy` opt-in) instead of silently vanishing.
+        let seed = match client.body.as_object().and_then(|obj| obj.get("seed")) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => match value.as_i64() {
+                Some(seed) => Some(seed),
+                None => {
+                    if target.lossy {
+                        tracing::warn!(
+                            field = "seed",
+                            provider = protocols::GEMINI_GENERATE_CONTENT,
+                            "lossy route: dropping non-integer seed with no Gemini equivalent"
+                        );
+                        None
+                    } else {
+                        return Err(ProviderError::InvalidRequest(
+                            "seed must be an integer to map onto generationConfig.seed; \
+                             remove it or enable the route's lossy mode"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            },
+        };
+
         // `response_format` maps onto generationConfig.responseMimeType
         // (plus responseJsonSchema for a schema) — structured output is a
         // native Gemini capability (plan step 4); `{"type": "text"}` maps to
@@ -655,6 +682,7 @@ impl GeminiAdapter {
             temperature: core.sampling.temperature,
             top_p: core.sampling.top_p,
             top_k,
+            seed,
             max_output_tokens: core.sampling.max_tokens,
             stop_sequences: core
                 .sampling
@@ -1223,6 +1251,75 @@ mod tests {
         assert!(
             body.get("response_format").is_none(),
             "the client field must not ride the wire verbatim: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_seed_maps_to_generation_config_seed() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": "gemini-2.5-pro",
+                "messages": [],
+                "seed": 7,
+            }),
+        );
+        let adapter = GeminiAdapter;
+        let proxy_req = adapter
+            .encode_request(&core, &make_target(), &client)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["generation_config"]["seed"], 7,
+            "the Chat seed must map onto generationConfig.seed: {body}"
+        );
+        assert!(
+            body.get("seed").is_none(),
+            "the client field must not ride the wire verbatim: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_non_integer_seed_is_rejected_naming_seed_and_dropped_on_lossy() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": "gemini-2.5-pro",
+                "messages": [],
+                "seed": "seven",
+            }),
+        );
+        let err = GeminiAdapter
+            .encode_request(&core, &make_target(), &client)
+            .expect_err("a non-integer seed cannot map onto generationConfig.seed");
+        assert!(
+            err.to_string().contains("seed"),
+            "the error must name seed: {err}"
+        );
+
+        let mut lossy_target = make_target();
+        lossy_target.lossy = true;
+        let proxy_req = GeminiAdapter
+            .encode_request(&core, &lossy_target, &client)
+            .expect("a lossy route drops the unmappable seed instead of failing");
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(
+            body["generation_config"].get("seed").is_none(),
+            "a lossy route must not send the unmappable seed: {body}"
         );
     }
 
