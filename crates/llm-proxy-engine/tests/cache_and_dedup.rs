@@ -16,15 +16,16 @@ use axum::response::IntoResponse;
 use futures::StreamExt;
 use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
 use llm_proxy_core::{
-    AppConfig, AuthStyle, IdempotencyConfig, ModelId, ModelPricing, ProviderAdapterConfig,
-    ProviderConfig, ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+    AppConfig, AuthStyle, IdempotencyConfig, ModelId, ModelPricing, PoolConfig,
+    ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ProviderRouteKind,
+    ProviderRoutesConfig, RetryConfig, ServerConfig,
 };
 use llm_proxy_engine::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, ClientDialect, Engine,
     EngineBuilder, EngineError, EngineRequest, EngineStream, InboundRequest, MemoryCache,
 };
 use llm_proxy_protocol::core::{
-    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
+    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, Cost, ModelRef, SamplingOptions,
 };
 use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
 use rust_decimal::Decimal;
@@ -913,11 +914,15 @@ fn delayed_400_upstream(calls: Arc<AtomicUsize>, delay: Duration) -> Router {
     )
 }
 
-/// An admission step that records the usage each settlement was charged
-/// with, so a test can assert what reached the budget counters.
+/// An admission step that records the usage and billed cost each settlement
+/// was charged with, so a test can assert what reached the budget counters.
+/// When `refuse_rekey_for` names a member, moving the reservation to that
+/// member fails, which drives the streaming ladder through `stop_with`.
 #[derive(Debug, Default)]
 struct UsageRecordingAdmission {
     settled_usage: std::sync::Mutex<Vec<Option<u64>>>,
+    settled_costs: std::sync::Mutex<Vec<Option<Cost>>>,
+    refuse_rekey_for: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -931,6 +936,24 @@ impl Admission for UsageRecordingAdmission {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(outcome.usage.map(total_usage_tokens));
+        self.settled_costs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(outcome.cost.cloned());
+    }
+
+    async fn rekey(
+        &self,
+        _ticket: &AdmissionTicket,
+        member: &str,
+        _model: &str,
+    ) -> Result<(), EngineError> {
+        match self.refuse_rekey_for.as_deref() {
+            Some(refused) if refused == member => Err(EngineError::Internal(format!(
+                "test admission refuses to rekey to {member}"
+            ))),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1023,6 +1046,348 @@ async fn a_pre_commit_failure_charges_the_usage_its_prefix_already_reported() {
         "settlement must charge the prefix's reported usage (7 in + 5 out), got {recorded:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// One SSE chunk: a `message_delta` that reports 7 input + 5 output tokens,
+/// then a leading in-band error — the whole prefix decodes before the
+/// failure is visible, so the pre-commit funnel stashes its usage.
+const PREFIX_USAGE_AND_ERROR_CHUNK: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":7,\"output_tokens\":5}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"dying before the first byte\"}}\n\n";
+
+/// How the upstream fails the call after the one that reported prefix
+/// usage: a terminal 400, a transient 500, or a 200 whose bytes the SSE
+/// framer rejects.
+#[derive(Clone, Copy)]
+enum NextCallFailure {
+    TerminalBadRequest,
+    TransientServerError,
+    FramingGarbage,
+}
+
+/// The response for one upstream call: call 0 streams the prefix that
+/// reports provider usage and then dies with a leading in-band error; every
+/// later call fails the way `failure` says.
+async fn prefix_failure_response(
+    call: usize,
+    failure: NextCallFailure,
+) -> axum::response::Response {
+    if call == 0 {
+        let body = futures::stream::iter(vec![Ok::<_, std::convert::Infallible>(
+            bytes::Bytes::from_static(PREFIX_USAGE_AND_ERROR_CHUNK),
+        )]);
+        return (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            )],
+            Body::from_stream(body),
+        )
+            .into_response();
+    }
+    match failure {
+        NextCallFailure::TerminalBadRequest => {
+            (StatusCode::BAD_REQUEST, "model is not available").into_response()
+        }
+        NextCallFailure::TransientServerError => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "upstream broke").into_response()
+        }
+        NextCallFailure::FramingGarbage => {
+            let body = futures::stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                bytes::Bytes::copy_from_slice(&[0xFF, 0xFE, b'\n']),
+            )]);
+            (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                )],
+                Body::from_stream(body),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// A streaming upstream whose first call streams a prefix that reports
+/// provider usage and then dies with a leading in-band error; every later
+/// call fails the way `failure` says. Returns the router and its call
+/// counter.
+fn prefix_usage_then_failure_upstream(failure: NextCallFailure) -> (Router, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&counted);
+            async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                prefix_failure_response(call, failure).await
+            }
+        }),
+    );
+    (app, calls)
+}
+
+/// The provider pricing the prefix's cost is billed at: $0.000002 per input
+/// token and $0.000005 per output token.
+fn prefix_pricing() -> ModelPricing {
+    ModelPricing {
+        input: Decimal::new(2, 6),
+        output: Decimal::new(5, 6),
+        ..Default::default()
+    }
+}
+
+/// A provider config with [`prefix_pricing()`] on the test model and a
+/// two-attempt ladder, so the call that fails after the prefix is a real
+/// second attempt.
+fn priced_provider(name: &str, endpoint: String, pricing: ModelPricing) -> ProviderConfig {
+    let mut provider = provider_named(name, endpoint);
+    provider
+        .pricing
+        .insert(ModelId::new("claude-sonnet-4-6"), pricing);
+    provider.retry = Some(RetryConfig {
+        max_attempts: 2,
+        backoff: Duration::from_millis(10),
+        cooldown: Duration::from_millis(50),
+        total_timeout: Duration::ZERO,
+        hold: Duration::ZERO,
+    });
+    provider
+}
+
+/// The prefix's 7 input + 5 output tokens priced at [`prefix_pricing()`]:
+/// 7 × $0.000002 + 5 × $0.000005 = $0.000039.
+fn prefix_billed_cost() -> Cost {
+    Cost {
+        input: Decimal::new(14, 6),
+        output: Decimal::new(25, 6),
+        cache_creation: Decimal::ZERO,
+        cache_read: Decimal::ZERO,
+        reasoning: Decimal::ZERO,
+        total: Decimal::new(39, 6),
+    }
+}
+
+/// Waits until the failed stream has settled, then snapshots everything
+/// settled so far: one (usage-tokens, cost) pair per settle call.
+async fn settled_billed(admission: &UsageRecordingAdmission) -> Vec<(Option<u64>, Option<Cost>)> {
+    let wait = async {
+        loop {
+            let empty = admission
+                .settled_usage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty();
+            if !empty {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the failed stream settles its reservation");
+    let usage = admission
+        .settled_usage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let costs = admission
+        .settled_costs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    usage.into_iter().zip(costs).collect()
+}
+
+#[tokio::test]
+async fn a_terminal_pre_commit_failure_charges_the_prefix_billed_cost() {
+    // The prefix reported usage, the ladder retried, and the retry died with
+    // a terminal 400: the terminal settle must charge both the stashed
+    // tokens and the cost the provider bills for them — not just the tokens.
+    let (app, calls) = prefix_usage_then_failure_upstream(NextCallFailure::TerminalBadRequest);
+    let endpoint = spawn_upstream(app).await;
+    let admission = Arc::new(UsageRecordingAdmission::default());
+    let engine = engine_with(
+        vec![priced_provider("fake", endpoint, prefix_pricing())],
+        test_config(),
+        Arc::new(RecordingBus::new()),
+        Some(Arc::clone(&admission) as Arc<dyn Admission>),
+        None,
+    );
+
+    let failed = engine
+        .execute_stream(engine_request(true, "billed terminal", "caller-a", None))
+        .await;
+    assert!(failed.is_err(), "the stream never commits: {failed:?}");
+
+    let settled = settled_billed(&admission).await;
+    assert_eq!(
+        settled,
+        vec![(Some(12), Some(prefix_billed_cost()))],
+        "the terminal settle must charge the prefix's usage (7 in + 5 out) and its \
+         billed cost, got {settled:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one prefix attempt, then the terminal 400"
+    );
+}
+
+#[tokio::test]
+async fn an_exhausted_ladder_charges_the_last_reported_prefix_billed_cost() {
+    // The prefix reported usage on the first attempt; the retry fails with a
+    // transient 500 and no usage of its own, exhausting the ladder: the
+    // exhausted settle must keep the stashed report (a report-less attempt
+    // never erases one) and charge its billed cost.
+    let (app, calls) = prefix_usage_then_failure_upstream(NextCallFailure::TransientServerError);
+    let endpoint = spawn_upstream(app).await;
+    let admission = Arc::new(UsageRecordingAdmission::default());
+    let engine = engine_with(
+        vec![priced_provider("fake", endpoint, prefix_pricing())],
+        test_config(),
+        Arc::new(RecordingBus::new()),
+        Some(Arc::clone(&admission) as Arc<dyn Admission>),
+        None,
+    );
+
+    let failed = engine
+        .execute_stream(engine_request(true, "billed exhaustion", "caller-a", None))
+        .await;
+    assert!(failed.is_err(), "the stream never commits: {failed:?}");
+
+    let settled = settled_billed(&admission).await;
+    assert_eq!(
+        settled,
+        vec![(Some(12), Some(prefix_billed_cost()))],
+        "the exhausted settle must charge the stashed prefix usage and its billed \
+         cost, got {settled:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one prefix attempt, then the transient 500"
+    );
+}
+
+#[tokio::test]
+async fn a_decode_garbage_after_a_usage_frame_charges_the_prefix_billed_cost() {
+    // The prefix reported usage on the first attempt; the retry answers 200
+    // but its bytes cannot be framed, so the attempt dies with a decode
+    // error and no usage of its own: the exhausted settle must still charge
+    // the earlier prefix's usage and billed cost.
+    let (app, calls) = prefix_usage_then_failure_upstream(NextCallFailure::FramingGarbage);
+    let endpoint = spawn_upstream(app).await;
+    let admission = Arc::new(UsageRecordingAdmission::default());
+    let engine = engine_with(
+        vec![priced_provider("fake", endpoint, prefix_pricing())],
+        test_config(),
+        Arc::new(RecordingBus::new()),
+        Some(Arc::clone(&admission) as Arc<dyn Admission>),
+        None,
+    );
+
+    let failed = engine
+        .execute_stream(engine_request(true, "billed garbage", "caller-a", None))
+        .await;
+    assert!(failed.is_err(), "the stream never commits: {failed:?}");
+
+    let settled = settled_billed(&admission).await;
+    assert_eq!(
+        settled,
+        vec![(Some(12), Some(prefix_billed_cost()))],
+        "the decode-failure settle must charge the earlier prefix's usage and its \
+         billed cost, got {settled:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one prefix attempt, then the unframable 200"
+    );
+}
+
+#[tokio::test]
+async fn stop_with_charges_the_cost_of_the_member_that_reported_the_prefix() {
+    // A pool whose first member reports prefix usage and then exhausts its
+    // attempts; the second member is refused at rekey, so the reservation
+    // settles in `stop_with` after the ladder ends. The charged cost must be
+    // priced at the member that produced the usage — not whichever member
+    // the ladder was last on.
+    let (first_app, first_calls) =
+        prefix_usage_then_failure_upstream(NextCallFailure::TransientServerError);
+    let (second_app, second_calls) =
+        prefix_usage_then_failure_upstream(NextCallFailure::TerminalBadRequest);
+    let first_endpoint = spawn_upstream(first_app).await;
+    let second_endpoint = spawn_upstream(second_app).await;
+    let admission = Arc::new(UsageRecordingAdmission {
+        refuse_rekey_for: Some("second".to_owned()),
+        ..Default::default()
+    });
+    let registry = ProviderRegistry::from_parts(
+        vec![
+            priced_provider("first", first_endpoint, prefix_pricing()),
+            priced_provider(
+                "second",
+                second_endpoint,
+                ModelPricing {
+                    input: Decimal::new(2, 4),
+                    output: Decimal::new(5, 4),
+                    ..Default::default()
+                },
+            ),
+        ],
+        vec![PoolConfig {
+            name: "both".to_owned(),
+            members: vec!["first".to_owned(), "second".to_owned()],
+            retry: RetryConfig {
+                max_attempts: 2,
+                backoff: Duration::from_millis(10),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            affinity: Default::default(),
+            health: Default::default(),
+        }],
+    )
+    .expect("provider registry with pool");
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine builds");
+
+    let failed = engine
+        .execute_stream(engine_request_for(
+            "both",
+            true,
+            "billed stop",
+            "caller-a",
+            None,
+        ))
+        .await;
+    assert!(failed.is_err(), "the stream never commits: {failed:?}");
+
+    let settled = settled_billed(&admission).await;
+    assert_eq!(
+        settled,
+        vec![(Some(12), Some(prefix_billed_cost()))],
+        "stop_with must charge the reporting member's usage and pricing, not the \
+         refused member's, got {settled:?}"
+    );
+    assert_eq!(
+        first_calls.load(Ordering::SeqCst),
+        2,
+        "both attempts ran on the reporting member"
+    );
+    assert_eq!(
+        second_calls.load(Ordering::SeqCst),
+        0,
+        "the refused member is never called"
+    );
 }
 
 async fn collect_stream(stream: EngineStream) -> Vec<CoreEvent> {

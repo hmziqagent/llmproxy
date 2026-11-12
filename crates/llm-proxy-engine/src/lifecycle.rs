@@ -2242,7 +2242,7 @@ fn build_core_event_stream(
                 last_error: None,
                 lead,
                 idempotency,
-                last_usage: None,
+                last_billed: None,
             };
             let order = stream.ladder.order.clone();
             let io = StreamIo {
@@ -2603,10 +2603,14 @@ struct StreamLadder {
     /// The idempotency claim (plan 06 step 3): completed with the collected
     /// events on a clean end.
     idempotency: Option<IdempotencyClaim>,
-    /// The last provider-reported usage a failed pre-commit prefix carried:
-    /// what settlement charges when every attempt fails and the task stops
-    /// (the provider billed those tokens; settlement must not drop them).
-    last_usage: Option<Usage>,
+    /// The last provider-reported usage a failed pre-commit prefix carried,
+    /// with the cost it was billed at the reporting attempt's pricing: what
+    /// settlement charges when every attempt fails and the task stops (the
+    /// provider billed those tokens; settlement must not drop them). The
+    /// latest report wins and a report-less attempt never erases one that
+    /// had it; an earlier failed attempt's billed prefix is superseded and
+    /// not charged — the serving attempt's usage is charged at success.
+    last_billed: Option<(Usage, Option<Cost>)>,
 }
 
 /// How a committed or abandoned stream attempt ended, for the single-flight
@@ -2722,13 +2726,20 @@ fn prefix_usage(pending: &[CoreEvent]) -> Option<Usage> {
     })
 }
 
-/// Stashes a failing prefix's reported usage on the ladder, so the failure
-/// funnel's settles (and `stop_with`, when every attempt fails) charge what
-/// the provider billed. A later attempt's report supersedes an earlier
-/// one's; a report-less attempt never erases one that had it.
-fn stash_prefix_usage(stream_ladder: &mut StreamLadder, pending: &[CoreEvent]) {
+/// Stashes a failing prefix's reported usage and its billed cost on the
+/// ladder, so the failure funnel's settles (and `stop_with`, when every
+/// attempt fails) charge what the provider billed. The cost is priced at the
+/// reporting attempt's own pricing (`ctx.pricing`), not whichever member the
+/// ladder is on when it settles. A later attempt's report supersedes an
+/// earlier one's; a report-less attempt never erases one that had it.
+fn stash_prefix_usage(
+    stream_ladder: &mut StreamLadder,
+    pending: &[CoreEvent],
+    pricing: Option<&ModelPricing>,
+) {
     if let Some(usage) = prefix_usage(pending) {
-        stream_ladder.last_usage = Some(usage);
+        let cost = billed_cost(&usage, pricing);
+        stream_ladder.last_billed = Some((usage, cost));
     }
 }
 
@@ -2761,8 +2772,14 @@ async fn stop_with(
     };
     inner.metrics.record_failure();
     signal_pre_stream_error(inner, stream, final_error.clone());
-    let usage = stream.last_usage.take();
-    settle(inner, &stream.ticket, false, usage.as_ref(), None);
+    let last_billed = stream.last_billed.take();
+    settle(
+        inner,
+        &stream.ticket,
+        false,
+        last_billed.as_ref().map(|(usage, _)| usage),
+        last_billed.as_ref().and_then(|(_, cost)| cost.as_ref()),
+    );
     // Joiners receive the same failure — a pre-commit failure reaches them
     // as their own first-byte error; the idempotency claim drops with the
     // task, releasing the key (failures are not stored).
@@ -2862,7 +2879,7 @@ async fn buffer_pre_commit(
                     if decode_chunk(&mut ctx, &bytes, &mut pending).is_err() {
                         // Framing/decode garbage: the ladder classifies it.
                         // The frames decoded before the garbage still billed.
-                        stash_prefix_usage(stream_ladder, &pending);
+                        stash_prefix_usage(stream_ladder, &pending, ctx.pricing.as_ref());
                         let error = EngineError::ProviderDecode(
                             "provider decode error before the first event".to_owned(),
                         );
@@ -2872,14 +2889,14 @@ async fn buffer_pre_commit(
                         continue;
                     }
                     if let Some(error) = leading_stream_error(&pending) {
-                        stash_prefix_usage(stream_ladder, &pending);
+                        stash_prefix_usage(stream_ladder, &pending, ctx.pricing.as_ref());
                         return failure_or_retry(inner, stream_ladder, member, &error, attempt_start, attempt_in_member).await;
                     }
                     return PreCommit::Committed(Box::new(CommittedStream { ctx, stream, head: pending }));
                 }
                 Some(Err(e)) => {
                     let error = map_provider_error(&e, ctx.passthrough_auth);
-                    stash_prefix_usage(stream_ladder, &pending);
+                    stash_prefix_usage(stream_ladder, &pending, ctx.pricing.as_ref());
                     return failure_or_retry(inner, stream_ladder, member, &error, attempt_start, attempt_in_member).await;
                 }
                 None => {
@@ -2927,9 +2944,9 @@ async fn failure_or_retry(
 /// `true` when the ladder continues with another attempt (the caller breaks
 /// the buffer loop and retries), `false` when the task must return — the
 /// terminal and exhausted cases signal the caller and settle here. The
-/// settles charge the prefix usage the caller stashed on the ladder (a
-/// retried attempt may report its own; the last reported one is what
-/// settlement charges).
+/// settles charge the prefix usage the caller stashed on the ladder, at the
+/// pricing of the attempt that reported it (a retried attempt may report
+/// its own; the last reported one is what settlement charges).
 async fn pre_commit_failure(
     inner: &Arc<EngineInner>,
     stream: &mut StreamLadder,
@@ -2952,8 +2969,11 @@ async fn pre_commit_failure(
                 inner,
                 &stream.ticket,
                 false,
-                stream.last_usage.as_ref(),
-                None,
+                stream.last_billed.as_ref().map(|(usage, _)| usage),
+                stream
+                    .last_billed
+                    .as_ref()
+                    .and_then(|(_, cost)| cost.as_ref()),
             );
             stream.finish_stream(StreamEnd::Failed(final_error));
             false
@@ -2968,8 +2988,11 @@ async fn pre_commit_failure(
                     inner,
                     &stream.ticket,
                     false,
-                    stream.last_usage.as_ref(),
-                    None,
+                    stream.last_billed.as_ref().map(|(usage, _)| usage),
+                    stream
+                        .last_billed
+                        .as_ref()
+                        .and_then(|(_, cost)| cost.as_ref()),
                 );
                 stream.finish_stream(StreamEnd::Failed(final_error));
                 false
