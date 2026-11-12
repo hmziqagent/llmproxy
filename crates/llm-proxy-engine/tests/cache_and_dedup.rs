@@ -49,9 +49,16 @@ impl CountingUpstream {
     }
 
     fn failing() -> Self {
+        Self::failing_after(Duration::ZERO)
+    }
+
+    /// A 500 upstream that answers after `delay`, so a joiner arrives while
+    /// the leader's failing attempt is still in flight and shares its
+    /// outcome instead of running its own ladder.
+    fn failing_after(delay: Duration) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
-            delay: Duration::ZERO,
+            delay,
             status: 500,
         }
     }
@@ -391,16 +398,44 @@ async fn single_flight_is_scoped_to_the_caller() {
 
 #[tokio::test]
 async fn a_single_flight_leader_failure_fails_its_joiners() {
-    let upstream = CountingUpstream::failing();
+    // A lone request first, on its own engine, to learn how many upstream
+    // calls one (ladder-retried) failing request makes. The leader+joiner
+    // pair must then add exactly that many calls: the joiner shares the
+    // leader's failed outcome instead of running its own ladder. An
+    // independent run would add twice as many.
+    let upstream = CountingUpstream::failing_after(Duration::from_millis(150));
     let endpoint = spawn_upstream(upstream.router()).await;
+    let lone_engine = build_engine(endpoint.clone(), Arc::new(RecordingBus::new()), None);
+    let lone = lone_engine
+        .execute(engine_request(false, "shared prompt", "caller-a", None))
+        .await;
+    assert!(
+        matches!(lone, Err(EngineError::Upstream { status: 500, .. })),
+        "the lone request fails with the upstream's 500: {lone:?}"
+    );
+    let lone_calls = upstream.calls.load(Ordering::SeqCst);
+    assert!(lone_calls >= 1, "the lone request reached the upstream");
+
     let bus = Arc::new(RecordingBus::new());
     let engine = build_engine(endpoint, Arc::clone(&bus), None);
-
-    let a = engine.execute(engine_request(false, "shared prompt", "caller-a", None));
-    let b = engine.execute(engine_request(false, "shared prompt", "caller-a", None));
-    let (a, b) = futures::future::join(a, b).await;
-    assert!(a.is_err(), "the leader fails");
-    assert!(matches!(b, Err(EngineError::Upstream { status: 500, .. })));
+    let leader = engine.execute(engine_request(false, "shared prompt", "caller-a", None));
+    let joiner = engine.execute(
+        engine_request(false, "shared prompt", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+    assert!(
+        matches!(leader, Err(EngineError::Upstream { status: 500, .. })),
+        "the leader fails"
+    );
+    assert!(
+        matches!(joiner, Err(EngineError::Upstream { status: 500, .. })),
+        "the joiner fails with the leader's error, not its own run"
+    );
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst) - lone_calls,
+        lone_calls,
+        "the failing ladder runs exactly once for the pair, not once per request"
+    );
     assert!(
         completed_rows(&bus).is_empty(),
         "no completion rows for failed requests"
@@ -1550,14 +1585,31 @@ async fn a_stream_joiner_completes_its_idempotency_claim_from_the_shared_outcome
     );
 }
 
-/// An admission step that waits (so a joiner arrives while the leader holds
-/// the flight) and then refuses, for the follower's error propagation.
+/// An admission step that counts its `reserve` calls, waits (so a joiner
+/// arrives while the leader holds the flight) and then refuses, for the
+/// follower's error propagation. A joiner parks on the flight before slot 6,
+/// so only the leader's reservation is counted.
 #[derive(Debug)]
-struct SlowRefusingAdmission;
+struct SlowRefusingAdmission {
+    reserves: Arc<AtomicUsize>,
+}
+
+impl SlowRefusingAdmission {
+    fn counted() -> (Arc<Self>, Arc<AtomicUsize>) {
+        let reserves = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                reserves: Arc::clone(&reserves),
+            }),
+            reserves,
+        )
+    }
+}
 
 #[async_trait]
 impl Admission for SlowRefusingAdmission {
     async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        self.reserves.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(120)).await;
         Err(EngineError::RateLimited {
             message: "rpm window spent".to_owned(),
@@ -1571,15 +1623,18 @@ impl Admission for SlowRefusingAdmission {
 #[tokio::test]
 async fn an_admission_refusal_reaches_single_flight_joiners() {
     // The leader's admission error (429 here) is what its joiners get —
-    // not a 500 from the leader-without-outcome backstop.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let endpoint = spawn_upstream(CountingUpstream::new(Duration::ZERO).router()).await;
+    // not a 500 from the leader-without-outcome backstop. Exactly one
+    // reservation is counted: the joiner parked on the flight and never
+    // reached admission — an independent run would reserve twice.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
     let bus = Arc::new(RecordingBus::new());
+    let (admission, reserves) = SlowRefusingAdmission::counted();
     let engine = engine_with(
         vec![provider(endpoint)],
         test_config(),
         Arc::clone(&bus),
-        Some(Arc::new(SlowRefusingAdmission)),
+        Some(admission),
         None,
     );
 
@@ -1598,7 +1653,16 @@ async fn an_admission_refusal_reaches_single_flight_joiners() {
     );
     assert_eq!(joiner_err.status_code(), 429);
     assert_eq!(joiner_err.kind_name(), leader_err.kind_name());
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing reached upstream");
+    assert_eq!(
+        reserves.load(Ordering::SeqCst),
+        1,
+        "only the leader reserved; the joiner joined the flight without its own admission"
+    );
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        0,
+        "nothing reached upstream"
+    );
 }
 
 #[tokio::test]
@@ -1617,22 +1681,47 @@ async fn a_single_flight_follower_reexecutes_when_its_leader_vanishes() {
             .execute(engine_request(false, "shared prompt", "caller-a", None))
             .await
     });
-    // The joiner starts while the leader holds the flight; it cannot finish
-    // before the leader does, so it is parked on the shared outcome here.
-    let joiner = engine.execute(
-        engine_request(false, "shared prompt", "caller-a", None).with_request_id("req-joiner"),
-    );
+    // The joiner runs as its own task, so it is polled while the leader's
+    // request is still in flight: it parks on the leader's flight instead of
+    // never being polled and running as a fresh leader after the abort.
+    let joiner_engine = engine.clone();
+    let joiner = tokio::spawn(async move {
+        joiner_engine
+            .execute(
+                engine_request(false, "shared prompt", "caller-a", None)
+                    .with_request_id("req-joiner"),
+            )
+            .await
+    });
     tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        1,
+        "only the leader's request is in flight; the joiner is parked on the leader's \
+         flight, and an independent run would already be at 2"
+    );
+    assert!(
+        !joiner.is_finished(),
+        "the joiner is parked on the leader's flight, not running its own request"
+    );
     leader.abort();
 
     let response = joiner
         .await
-        .expect("the joiner answers by running the request itself");
+        .expect("the joiner answers by running the request itself")
+        .expect("the re-execution succeeds");
     assert_eq!(response_text(&response), "hello from upstream");
     assert_eq!(
         upstream.calls.load(Ordering::SeqCst),
         2,
         "the vanished leader's upstream call plus the joiner's own re-execution"
+    );
+    assert!(
+        completed_rows(&bus)
+            .iter()
+            .any(|(_, id)| id == "req-joiner"),
+        "the joiner's re-execution records its completed row: {:?}",
+        completed_rows(&bus)
     );
 }
 
@@ -1826,10 +1915,26 @@ async fn a_key_reused_across_providers_is_a_client_error() {
     );
 }
 
-/// A pre-call guard that waits (so a joiner attaches to the leader's share)
-/// and then rejects the request, for the streaming refusal propagation.
+/// A pre-call guard that counts its inspections, waits (so a joiner attaches
+/// to the leader's share) and then rejects the request, for the streaming
+/// refusal propagation. A joiner parks on the share before slot 7, so only
+/// the leader's request is inspected.
 #[derive(Debug)]
-struct SlowRejectingGuard;
+struct SlowRejectingGuard {
+    inspections: Arc<AtomicUsize>,
+}
+
+impl SlowRejectingGuard {
+    fn counted() -> (Arc<Self>, Arc<AtomicUsize>) {
+        let inspections = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                inspections: Arc::clone(&inspections),
+            }),
+            inspections,
+        )
+    }
+}
 
 #[async_trait]
 impl llm_proxy_engine::Guard for SlowRejectingGuard {
@@ -1837,6 +1942,7 @@ impl llm_proxy_engine::Guard for SlowRejectingGuard {
         &self,
         _request: &CoreRequest,
     ) -> Result<llm_proxy_engine::GuardDecision, EngineError> {
+        self.inspections.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(120)).await;
         Ok(llm_proxy_engine::GuardDecision::Reject(
             "prompt blocked by policy".to_owned(),
@@ -1852,11 +1958,12 @@ async fn a_streaming_leaders_admission_refusal_reaches_its_joiners() {
     let upstream = CountingUpstream::new(Duration::ZERO);
     let endpoint = spawn_upstream(upstream.router()).await;
     let bus = Arc::new(RecordingBus::new());
+    let (admission, reserves) = SlowRefusingAdmission::counted();
     let engine = engine_with(
         vec![provider(endpoint)],
         test_config(),
         Arc::clone(&bus),
-        Some(Arc::new(SlowRefusingAdmission)),
+        Some(admission),
         None,
     );
 
@@ -1874,6 +1981,11 @@ async fn a_streaming_leaders_admission_refusal_reaches_its_joiners() {
     );
     assert_eq!(joiner_err.status_code(), 429);
     assert_eq!(joiner_err.kind_name(), leader_err.kind_name());
+    assert_eq!(
+        reserves.load(Ordering::SeqCst),
+        1,
+        "only the leader reserved; the joiner joined the stream share without its own admission"
+    );
     assert_eq!(
         upstream.calls.load(Ordering::SeqCst),
         0,
@@ -1893,11 +2005,12 @@ async fn a_streaming_leaders_guard_rejection_reaches_its_joiners() {
     let upstream = CountingUpstream::new(Duration::ZERO);
     let endpoint = spawn_upstream(upstream.router()).await;
     let bus = Arc::new(RecordingBus::new());
+    let (guard, inspections) = SlowRejectingGuard::counted();
     let registry = ProviderRegistry::from_providers(vec![provider(endpoint)]).expect("registry");
     let engine = EngineBuilder::new(test_config())
         .providers(Arc::new(registry))
         .event_bus(Arc::clone(&bus) as Arc<dyn EventBus>)
-        .guard(Arc::new(SlowRejectingGuard))
+        .guard(guard)
         .build()
         .expect("engine builds");
 
@@ -1915,6 +2028,11 @@ async fn a_streaming_leaders_guard_rejection_reaches_its_joiners() {
     );
     assert_eq!(joiner_err.status_code(), 400);
     assert_eq!(joiner_err.kind_name(), leader_err.kind_name());
+    assert_eq!(
+        inspections.load(Ordering::SeqCst),
+        1,
+        "the guard inspected the leader's request only; the joiner joined without its own inspection"
+    );
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1965,17 +2083,35 @@ async fn a_streaming_follower_reruns_when_its_leader_vanishes_before_the_first_b
             .execute_stream(engine_request(true, "shared stream", "caller-a", None))
             .await
     });
-    // The joiner starts while the leader holds the share; it cannot get a
-    // first byte before the leader does, so it is parked on the shared
-    // commit wait when the leader goes away.
-    let joiner = engine.execute_stream(
-        engine_request(true, "shared stream", "caller-a", None).with_request_id("req-joiner"),
-    );
+    // The joiner runs as its own task, so it is polled while the leader is
+    // still waiting for its first byte: it parks on the leader's stream
+    // share instead of never being polled and running as a fresh leader
+    // after the abort.
+    let joiner_engine = engine.clone();
+    let joiner = tokio::spawn(async move {
+        joiner_engine
+            .execute_stream(
+                engine_request(true, "shared stream", "caller-a", None)
+                    .with_request_id("req-joiner"),
+            )
+            .await
+    });
     tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the leader's request is in flight; the joiner is parked on the leader's \
+         share, and an independent run would already be at 2"
+    );
+    assert!(
+        !joiner.is_finished(),
+        "the joiner is parked on the leader's share, not running its own request"
+    );
     leader.abort();
 
     let stream = joiner
         .await
+        .expect("the joiner task runs")
         .expect("the joiner answers by running the request itself");
     let events = collect_stream(stream).await;
     assert!(
