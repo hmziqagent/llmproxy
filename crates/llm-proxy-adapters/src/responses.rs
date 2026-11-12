@@ -877,6 +877,38 @@ mod tests {
     }
 
     #[test]
+    fn usage_details_map_cache_and_reasoning() {
+        use llm_proxy_protocol::openai::{CompletionTokensDetails, PromptTokensDetails};
+
+        let usage = ResponsesUsage {
+            input_tokens: 20,
+            output_tokens: 11,
+            input_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(8),
+            }),
+            output_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(6),
+            }),
+        };
+        let mapped = build_responses_usage(&usage);
+        assert_eq!(mapped.input_tokens, 12);
+        assert_eq!(mapped.cache_read_input_tokens, Some(8));
+        assert_eq!(mapped.reasoning_tokens, Some(6));
+        assert_eq!(mapped.cache_creation_input_tokens, None);
+
+        let plain = ResponsesUsage {
+            input_tokens: 20,
+            output_tokens: 11,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        };
+        let mapped = build_responses_usage(&plain);
+        assert_eq!(mapped.input_tokens, 20);
+        assert_eq!(mapped.cache_read_input_tokens, None);
+        assert_eq!(mapped.reasoning_tokens, None);
+    }
+
+    #[test]
     fn documented_failed_event_carries_error_inside_response() {
         let target = make_target();
         let mut decoder = ResponsesAdapter.new_stream_decoder(&target);
