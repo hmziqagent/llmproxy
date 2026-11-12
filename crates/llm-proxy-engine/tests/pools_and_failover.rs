@@ -730,6 +730,119 @@ async fn the_ladder_deadline_spans_all_attempts() {
     );
 }
 
+/// An upstream that accepts the request and never answers at all: neither
+/// headers nor an error, so only the ladder's total deadline (not the
+/// transport's 60s first-byte timeout) can end the attempt.
+fn upstream_never_answers() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let never = std::future::pending::<axum::response::Response>();
+            never.await
+        }),
+    )
+}
+
+#[tokio::test]
+async fn the_ladder_deadline_bounds_an_attempt_in_flight() {
+    // The member hangs forever with the transport's first-byte timeout at
+    // its 60s default: the ladder's 200ms total must cut the attempt short,
+    // record its row, and end without a further attempt.
+    let silent = spawn_upstream(upstream_never_answers()).await;
+    let (engine, bus) = build_engine(
+        vec![member("silent", silent, None)],
+        vec![pool(
+            "racing",
+            vec!["silent"],
+            RetryConfig {
+                max_attempts: 3,
+                backoff: Duration::from_millis(10),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::from_millis(200),
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .execute(engine_request("racing", false))
+        .await
+        .expect_err("the ladder deadline ends the hanging attempt");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the ladder deadline must bound the attempt instead of the 60s first-byte timeout"
+    );
+    assert!(
+        matches!(error, EngineError::RetryExhausted { .. }),
+        "the deadline exhaustion is reported as an exhausted ladder, got {error:?}"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the deadline check prevents a further attempt after the timeout"
+    );
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(
+        rows[0].error_kind.as_deref(),
+        Some("UpstreamTimeout"),
+        "the hanging attempt is recorded as a timeout, got {:?}",
+        rows[0].error_kind
+    );
+}
+
+#[tokio::test]
+async fn the_ladder_deadline_bounds_a_stream_before_commit() {
+    // The upstream opens the stream and then never sends an event; with no
+    // hold budget the pre-commit window waits on it, and the ladder's 200ms
+    // total — not the 60s idle timeout — must end it before any commit.
+    let silent = spawn_upstream(upstream_silent_stream()).await;
+    let (engine, bus) = build_engine(
+        vec![member("silent", silent, None)],
+        vec![pool(
+            "racing",
+            vec!["silent"],
+            RetryConfig {
+                max_attempts: 3,
+                backoff: Duration::from_millis(10),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::from_millis(200),
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .execute_stream(engine_request("racing", true))
+        .await
+        .expect_err("the ladder deadline ends the silent stream before commit");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the ladder deadline must bound the pre-commit wait instead of the 60s idle timeout"
+    );
+    assert!(
+        matches!(error, EngineError::RetryExhausted { .. }),
+        "the deadline exhaustion is reported as an exhausted ladder, got {error:?}"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the deadline check prevents a further attempt after the timeout"
+    );
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(
+        rows[0].error_kind.as_deref(),
+        Some("UpstreamTimeout"),
+        "the silent attempt is recorded as a timeout, got {:?}",
+        rows[0].error_kind
+    );
+}
+
 #[tokio::test]
 async fn a_provider_retry_ladder_retries_the_same_member() {
     // The upstream fails the first request with 500 and succeeds after.

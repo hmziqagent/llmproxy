@@ -760,6 +760,46 @@ fn ladder_deadline(inner: &EngineInner, plan: &RoutePlan, start: Instant) -> Opt
     }
 }
 
+/// Bounds one in-flight attempt by the ladder's total deadline (plan 04
+/// step 3, fix brief 04-2): the transport's per-attempt `first_byte`/`idle`
+/// budgets do not know the ladder, so a slow upstream could otherwise run
+/// one attempt past `total_timeout`. The elapsed deadline is a transient
+/// [`EngineError::UpstreamTimeout`] that flows through the ladder's failure
+/// path; without a deadline the future runs unbounded.
+async fn within_deadline<T>(
+    deadline: Option<Instant>,
+    fut: impl Future<Output = T>,
+) -> Result<T, EngineError> {
+    // Boxed so the attempt's transport future stays off the ladder's own
+    // future, which the `large_futures` lint and the spawned task stack both
+    // hold to a modest size.
+    let fut = Box::pin(fut);
+    match deadline {
+        Some(deadline) => {
+            let outcome =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), fut).await;
+            match outcome {
+                Ok(output) => Ok(output),
+                // `Elapsed` carries no cause: the deadline itself is the fact
+                // the client needs.
+                Err(_) => Err(EngineError::UpstreamTimeout(
+                    "retry ladder deadline exceeded during the attempt".to_owned(),
+                )),
+            }
+        }
+        None => Ok(fut.await),
+    }
+}
+
+/// Resolves when the ladder's total deadline passes; never resolves without
+/// one (plan 04 step 3).
+async fn ladder_deadline_elapsed(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Whether the failure feedback marks the credential as rejected (its key
 /// should cool down separately from the member).
 fn credential_feedback(class: &ErrorClass, error: &EngineError) -> CredentialFeedback {
@@ -1467,11 +1507,15 @@ async fn run_ladder_once(
                 .encode_request(&strip.core, &attempt.target, &wire)
                 .map_err(map_encode_error)?;
 
-            let sent = inner.transport.client_for(&member).send(proxy_req).await;
+            let sent = within_deadline(
+                ladder.deadline,
+                inner.transport.client_for(&member).send(proxy_req),
+            )
+            .await;
 
             let response_bytes = match sent {
-                Ok(bytes) => bytes,
-                Err(error) => {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
                     let engine_error = map_provider_error(&error, attempt.passthrough);
                     last_error = Some(engine_error.clone());
                     record_attempt_failure(inner, &ladder, &member, &engine_error, attempt_start)
@@ -1491,6 +1535,16 @@ async fn run_ladder_once(
                         tokio::time::sleep(wait).await;
                         continue;
                     }
+                    continue 'ladder;
+                }
+                Err(engine_error) => {
+                    // The ladder deadline consumed the attempt mid-flight:
+                    // the row is written through the same failure path, then
+                    // the loop's deadline check ends the ladder — no further
+                    // attempt can fit (fix brief 04-2).
+                    last_error = Some(engine_error.clone());
+                    record_attempt_failure(inner, &ladder, &member, &engine_error, attempt_start)
+                        .await;
                     continue 'ladder;
                 }
             };
@@ -2530,15 +2584,34 @@ async fn stream_attempt(
             }
         };
 
-        let sent = inner
-            .transport
-            .client_for(&member)
-            .send_stream(proxy_req)
-            .await;
+        let sent = within_deadline(
+            stream.ladder.deadline,
+            inner.transport.client_for(&member).send_stream(proxy_req),
+        )
+        .await;
         let byte_stream = match sent {
-            Ok(byte_stream) => byte_stream,
-            Err(error) => {
+            Ok(Ok(byte_stream)) => byte_stream,
+            Ok(Err(error)) => {
                 let engine_error = map_provider_error(&error, attempt.passthrough);
+                if !pre_commit_failure(
+                    inner,
+                    stream,
+                    &member,
+                    &engine_error,
+                    attempt_start,
+                    attempt_in_member,
+                )
+                .await
+                {
+                    return false;
+                }
+                continue;
+            }
+            Err(engine_error) => {
+                // Same rule as the non-streaming ladder (fix brief 04-2): the
+                // deadline that ran out mid-attempt still writes its row
+                // through the failure path, then the loop's deadline check
+                // ends the ladder.
                 if !pre_commit_failure(
                     inner,
                     stream,
@@ -2842,6 +2915,7 @@ async fn buffer_pre_commit(
     // The share joiners replay from (plan 06 step 2): the leader's events
     // are tapped as they are forwarded.
     ctx.share = stream_ladder.lead.as_ref().map(StreamLead::share);
+    let ladder_deadline = ladder.deadline;
     let hold_deadline =
         (!hold.is_zero()).then(|| tokio::time::Instant::from_std(Instant::now() + hold));
     let mut pending: Vec<CoreEvent> = Vec::new();
@@ -2873,6 +2947,25 @@ async fn buffer_pre_commit(
                 // head. The client gets HTTP 200 plus heartbeats while the
                 // upstream stays silent; errors from here on are in-band.
                 return PreCommit::Committed(Box::new(CommittedStream { ctx, stream, head: pending }));
+            }
+            _ = ladder_deadline_elapsed(ladder_deadline), if pending.is_empty() => {
+                // The ladder's total deadline ran out while the attempt sat
+                // waiting for its first event (fix brief 04-2): the same
+                // pre-commit failure path records the row, and the attempt
+                // loop's deadline check ends the ladder. After commit the
+                // stream is bounded by `idle`, not `total`.
+                let error = EngineError::UpstreamTimeout(
+                    "retry ladder deadline exceeded during the attempt".to_owned(),
+                );
+                return failure_or_retry(
+                    inner,
+                    stream_ladder,
+                    member,
+                    &error,
+                    attempt_start,
+                    attempt_in_member,
+                )
+                .await;
             }
             chunk = stream.next() => match chunk {
                 Some(Ok(bytes)) => {
