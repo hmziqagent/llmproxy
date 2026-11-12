@@ -4,8 +4,9 @@
 //! needs a restart.
 //!
 //! What reload may change: the provider and pool files under `providers/`.
-//! What it must refuse: anything under `[server]`, `[auth]` or `[storage]`
-//! — those are wired into listeners, middleware and the ledger, and
+//! What it must refuse: anything under `[server]`, `[auth]` (including the
+//! `[auth.admin] key_store`), `[storage]`, `[replica]` or `[mcp]` — those
+//! are wired into listeners, middleware, stores and the ledger, and
 //! applying half of them would be worse than refusing. The refusal names
 //! the exact fields and changes nothing.
 //!
@@ -901,6 +902,72 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
         assert!(
             !message.contains("runtime-issued"),
             "a removed file key is a file edit, not a managed-keys artifact: {message}"
+        );
+    }
+
+    /// An added `[auth.admin] key_store` cannot be applied by a reload (the
+    /// store is opened once at startup): the diff must refuse it as its own
+    /// field and apply nothing.
+    #[tokio::test]
+    async fn a_key_store_edit_is_refused_as_restart_required() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        let dir_path = dir.path().display().to_string();
+        let config = |key_store: &str| {
+            format!(
+                r#"[server]
+bind = "127.0.0.1:3477"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "reload-test"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "{PHC_A}"
+
+[auth.admin]
+token = "admin-tok"
+{key_store}
+
+[storage]
+path = "{dir_path}/usage.db"
+"#
+            )
+        };
+        let path = {
+            let p = dir.path().join("config.toml");
+            std::fs::write(&p, config("")).expect("config file");
+            p
+        };
+
+        let state = state_for(dir.path()).await;
+        let engine_before = state.engine().expect("engine builds");
+
+        // Add the key store under an unchanged admin token, touching
+        // nothing else.
+        let key_store_line = format!("key_store = \"{dir_path}/k.db\"");
+        std::fs::write(&path, config(&key_store_line)).expect("config rewrite");
+
+        let error = reload_registry(&state, &path, None)
+            .await
+            .expect_err("an added key store cannot be applied by a reload");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restart-required:"),
+            "the refusal carries the stable prefix operators grep for: {message}"
+        );
+        assert!(
+            message.contains("auth.admin.key_store"),
+            "the refusal names the key store field: {message}"
+        );
+        let engine_after = state.engine().expect("engine");
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "the engine was not swapped by a refused reload"
         );
     }
 }

@@ -2941,9 +2941,10 @@ pub fn bare_v1_target_problems(
 /// field (compared as rendered values, so the message can name the field),
 /// the auth mode, the whole `[auth.clients]` map (key ids as a set, and —
 /// under an unchanged id — the verifier and policy too, named
-/// `auth.clients.<id>`), the admin token, and the storage ledger. Provider
-/// and pool files are reloadable and are not compared here. Empty result:
-/// the reload may proceed.
+/// `auth.clients.<id>`), the admin token, the admin key store
+/// (`auth.admin.key_store`), the storage ledger, the `[replica]` section
+/// and the `[mcp]` section. Provider and pool files are reloadable and are
+/// not compared here. Empty result: the reload may proceed.
 ///
 /// Secrets are compared by equality and never rendered. A verifier rotated
 /// under an existing key id or an edited policy is restart-required as
@@ -3001,12 +3002,79 @@ pub fn restart_required_changes(current: &AppConfig, next: &AppConfig) -> Vec<St
     if token_of(current) != token_of(next) {
         changes.push("auth.admin".to_owned());
     }
+    let key_store_of = |config: &AppConfig| -> Option<PathBuf> {
+        config
+            .auth
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.key_store.clone())
+    };
+    if key_store_of(current) != key_store_of(next) {
+        changes.push("auth.admin.key_store".to_owned());
+    }
     match (&current.storage, &next.storage) {
         (Some(a), Some(b)) if a == b => {}
         (None, None) => {}
         _ => changes.push("storage".to_owned()),
     }
+    if !replica_matches(&current.replica, &next.replica) {
+        changes.push("replica".to_owned());
+    }
+    if !mcp_matches(&current.mcp, &next.mcp) {
+        changes.push("mcp".to_owned());
+    }
     changes
+}
+
+/// Whether two `[replica]` sections are interchangeable without a restart:
+/// both absent, or both present with the same backend, key prefix and
+/// resolved URL. `ReplicaConfig` carries no `PartialEq` and its URL is
+/// `skip_serializing`, so the comparison is field-wise and the connection
+/// string is compared by equality without ever being rendered.
+fn replica_matches(current: &Option<ReplicaConfig>, next: &Option<ReplicaConfig>) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.backend == b.backend
+                && a.prefix == b.prefix
+                && a.url.expose_secret() == b.url.expose_secret()
+        }
+        _ => false,
+    }
+}
+
+/// Whether two `[mcp]` sections are interchangeable without a restart:
+/// both absent, or both present with the same bind, session TTL, tokens as
+/// an ordered list (rotation is a change), and upstreams pairwise on name,
+/// URL and bearer token. Every token is `skip_serializing`, so a
+/// rendered-JSON comparison would miss a token rotation; the comparison is
+/// field-wise and never renders a secret.
+fn mcp_matches(current: &Option<McpGatewayConfig>, next: &Option<McpGatewayConfig>) -> bool {
+    fn exposed(token: &Option<SecretString>) -> Option<&str> {
+        token.as_ref().map(SecretString::expose_secret)
+    }
+    let upstreams_match = |a: &[McpUpstreamConfig], b: &[McpUpstreamConfig]| -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                a.name == b.name && a.url == b.url && exposed(&a.token) == exposed(&b.token)
+            })
+    };
+    let tokens_match = |a: &[SecretString], b: &[SecretString]| -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(a, b)| a.expose_secret() == b.expose_secret())
+    };
+    match (current, next) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.bind == b.bind
+                && a.session_ttl == b.session_ttl
+                && tokens_match(&a.tokens, &b.tokens)
+                && upstreams_match(&a.upstreams, &b.upstreams)
+        }
+        _ => false,
+    }
 }
 
 /// Whether two specs for the same key id are the same key material and the
@@ -4142,6 +4210,109 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
             prune_interval: Duration::from_secs(3600),
         });
         assert!(restart_required_changes(&current, &next).contains(&"storage".to_owned()));
+    }
+
+    /// The managed key store, the `[replica]` store and the `[mcp]` gateway
+    /// are all wired once at startup, so any edit of them is
+    /// restart-required — including edits a rendered-JSON comparison cannot
+    /// see, because `url` and every token are `skip_serializing`. A refusal
+    /// names fields and never renders a secret.
+    #[test]
+    fn restart_required_changes_covers_key_store_replica_and_mcp() {
+        // A key_store added under an unchanged admin token is its own field,
+        // not blamed on the token.
+        let mut current = base_config();
+        current.auth.admin = Some(AdminAuthConfig {
+            token: SecretString::from("admin-tok"),
+            key_store: None,
+        });
+        let mut next = current.clone();
+        next.auth.admin = Some(AdminAuthConfig {
+            token: SecretString::from("admin-tok"),
+            key_store: Some("keys.db".into()),
+        });
+        let key_store_change = restart_required_changes(&current, &next);
+        assert!(
+            key_store_change.contains(&"auth.admin.key_store".to_owned()),
+            "an added key_store is restart-required: {key_store_change:?}"
+        );
+        assert!(
+            !key_store_change.contains(&"auth.admin".to_owned()),
+            "an unchanged token must not be blamed: {key_store_change:?}"
+        );
+
+        // [replica]: added, then URL-rotated between two Some sections, then
+        // merely re-stated.
+        let mut current = base_config();
+        current.replica = Some(ReplicaConfig {
+            backend: ReplicaBackend::Redis,
+            url: SecretString::from("redis://a"),
+            prefix: "p".to_owned(),
+        });
+        let mut next = current.clone();
+        next.replica = None;
+        assert_eq!(
+            restart_required_changes(&current, &next),
+            vec!["replica".to_owned()]
+        );
+        let mut next = current.clone();
+        next.replica = Some(ReplicaConfig {
+            backend: ReplicaBackend::Redis,
+            url: SecretString::from("redis://b"),
+            prefix: "p".to_owned(),
+        });
+        let replica_change = restart_required_changes(&current, &next);
+        assert_eq!(
+            replica_change,
+            vec!["replica".to_owned()],
+            "a rotated replica URL is restart-required even though it never renders"
+        );
+        assert!(
+            restart_required_changes(&current, &current).is_empty(),
+            "a merely re-stated [replica] section still reloads"
+        );
+
+        // [mcp]: added, then token-rotated between two Some sections (the
+        // case a JSON compare would miss), then merely re-stated.
+        let mcp = |token: &str| McpGatewayConfig {
+            bind: "127.0.0.1:9100".parse().expect("bind parses"),
+            tokens: vec![SecretString::from(token)],
+            upstreams: Vec::new(),
+            session_ttl: Duration::from_secs(1800),
+        };
+        let mut current = base_config();
+        current.mcp = Some(mcp("t1"));
+        let mut next = current.clone();
+        next.mcp = None;
+        assert_eq!(
+            restart_required_changes(&current, &next),
+            vec!["mcp".to_owned()]
+        );
+        let mut next = current.clone();
+        next.mcp = Some(mcp("t2"));
+        let mcp_change = restart_required_changes(&current, &next);
+        assert_eq!(
+            mcp_change,
+            vec!["mcp".to_owned()],
+            "a rotated gateway token is restart-required even though it never renders"
+        );
+        assert!(
+            restart_required_changes(&current, &current).is_empty(),
+            "a merely re-stated [mcp] section still reloads"
+        );
+
+        // No refusal anywhere names a secret.
+        for change in key_store_change
+            .iter()
+            .chain(&replica_change)
+            .chain(&mcp_change)
+        {
+            assert!(!change.contains("t1"), "tokens never render: {change}");
+            assert!(
+                !change.contains("redis://"),
+                "connection strings never render: {change}"
+            );
+        }
     }
 
     #[test]

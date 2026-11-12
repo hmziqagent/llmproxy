@@ -83,5 +83,6 @@ All eleven steps landed, each with regression tests:
 11. `server.hot_reload = true` + SIGHUP or `llm-proxy reload`: providers and
     pools reload through the startup gates and the engine slot swaps;
     in-flight requests finish on the engine they hold; anything under
-    `[server]`/`[auth]`/`[storage]` is refused whole with a stable
-    `restart-required:` error naming the fields.
+    `[server]`, `[auth]` (including `[auth.admin] key_store`), `[storage]`,
+    `[replica]` or `[mcp]` is refused whole with a stable `restart-required:`
+    error naming the fields.
