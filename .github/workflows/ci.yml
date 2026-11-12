@@ -54,6 +54,113 @@ jobs:
       - run: cargo install cargo-shear --locked --version 1.13.0
       - run: cargo shear
 
+  # The quality job builds only --all-features, so the feature-off refusal
+  # paths and the dependency-closure done-whens (server without rusqlite,
+  # core without tiktoken-rs, protocol/adapters network-free, engine without
+  # axum, one TLS stack) had no automated evidence. These jobs are it.
+  features-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (workspace, default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test (workspace, default features)
+        run: cargo test --workspace --locked
+
+      # The default build of the daemon must not compile any optional
+      # plan-09 crate. A match fails the step.
+      - name: Default build isolation
+        run: |
+          if cargo tree -p llm-proxy-app --locked -e normal --prefix none | grep -E '^llm-proxy-(store-redis|store-postgres|admin|guardrails|semantic-cache|mcp) '; then
+            echo "default build compiles an optional plan-09 crate"
+            exit 1
+          fi
+
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [store-redis, store-postgres, admin-ui, semantic-cache, mcp-gateway, endpoint-families]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (${{ matrix.feature }} alone)
+        run: cargo clippy -p llm-proxy-app --all-targets --features ${{ matrix.feature }} --locked -- -D warnings
+
+      - name: Test (${{ matrix.feature }} alone)
+        run: cargo test -p llm-proxy-app --features ${{ matrix.feature }} --locked
+
+  feature-closures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Server builds without rusqlite
+        run: |
+          cargo build -p llm-proxy-server --no-default-features --locked
+          if cargo tree -p llm-proxy-server --no-default-features -e normal --locked | grep -q rusqlite; then
+            echo "llm-proxy-server --no-default-features still depends on rusqlite"
+            exit 1
+          fi
+
+      - name: Core builds without tiktoken-rs and adapters never see it
+        run: |
+          cargo build -p llm-proxy-core --no-default-features --locked
+          if cargo tree -p llm-proxy-core --no-default-features -e normal --locked | grep -q tiktoken-rs; then
+            echo "llm-proxy-core --no-default-features still depends on tiktoken-rs"
+            exit 1
+          fi
+          if cargo tree -p llm-proxy-adapters -e normal --locked | grep -q tiktoken-rs; then
+            echo "llm-proxy-adapters depends on tiktoken-rs"
+            exit 1
+          fi
+
+      # Routing/encoding crates carry no network stack. The control case is
+      # llm-proxy-transport, whose tree does match this regex (verified when
+      # the job was added), so a regression cannot pass silently.
+      - name: Protocol and adapters stay network-free
+        run: |
+          for p in llm-proxy-protocol llm-proxy-adapters; do
+            if cargo tree -p "$p" -e normal --locked --prefix none | grep -Eq '^(reqwest|hyper|tokio|mio|socket2|rustls|axum) '; then
+              echo "$p depends on a network crate"
+              exit 1
+            fi
+          done
+
+      - name: Engine has no axum
+        run: |
+          if cargo tree -p llm-proxy-engine -e normal --locked --prefix none | grep -q '^axum '; then
+            echo "llm-proxy-engine depends on axum"
+            exit 1
+          fi
+
+      # BUG-23: exactly one TLS stack. The lockfile must not name a second
+      # one; coarse, but keeps an honest tree from regressing (reqwest 0.13
+      # is covered by the app's rustls feature, not here).
+      - name: One TLS stack
+        run: |
+          if grep -Eq '^name = "(native-tls|openssl|openssl-sys)"' Cargo.lock; then
+            echo "Cargo.lock contains a second TLS stack"
+            exit 1
+          fi
+
   # The macOS leg of the plan-10 done-when line (`pip install` and `npm
   # install` work on each platform with no Rust toolchain): builds the
   # universal2 artifacts on a macOS runner, installs the wheel and the
