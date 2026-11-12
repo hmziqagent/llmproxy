@@ -216,7 +216,7 @@ mod tests {
             },
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",

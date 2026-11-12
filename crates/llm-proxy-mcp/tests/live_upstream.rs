@@ -73,7 +73,7 @@ async fn gateway_over(upstream: &str) -> (axum::Router, Arc<RecordingBus>) {
         config,
         admission,
         Arc::clone(&bus) as Arc<dyn EventBus>,
-        Arc::new(ProxyClient::new()),
+        Arc::new(ProxyClient::try_new().expect("client")),
     );
     (gateway.router(), bus)
 }

@@ -388,7 +388,10 @@ async fn bind_mcp_gateway(
         config.clone(),
         admission,
         Arc::clone(state.event_bus()),
-        Arc::new(llm_proxy_transport::ProxyClient::new()),
+        Arc::new(
+            llm_proxy_transport::ProxyClient::try_new()
+                .context("building the MCP gateway transport client")?,
+        ),
     );
     let addr = gateway.bind();
     let router = gateway.router();

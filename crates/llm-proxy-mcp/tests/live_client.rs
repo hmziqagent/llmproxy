@@ -45,7 +45,7 @@ async fn spawn_gateway() -> String {
         config,
         Arc::new(llm_proxy_engine::AllowAllAdmission),
         Arc::new(NoopBus) as Arc<dyn EventBus>,
-        Arc::new(ProxyClient::new()),
+        Arc::new(ProxyClient::try_new().expect("client")),
     );
     let app = gateway.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

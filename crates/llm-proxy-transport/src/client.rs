@@ -15,10 +15,6 @@ use llm_proxy_core::AuthStyle;
 use secrecy::ExposeSecret;
 use tokio::time::Sleep;
 
-/// Default time-to-first-byte (response headers) deadline for upstream requests;
-/// bounds the headers phase without capping the streaming body.
-pub const DEFAULT_UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
-
 pub(crate) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
 
 /// Default per-chunk idle read timeout for streaming responses; a stream
@@ -50,36 +46,13 @@ impl fmt::Debug for ProxyClient {
     }
 }
 
-impl Default for ProxyClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ProxyClient {
-    /// Convenience wrapper around [`Self::try_new`] for the default
-    /// (infallible-in-practice) configuration; `try_new` is the fallible form.
-    #[expect(
-        clippy::expect_used,
-        reason = "documented infallible-in-practice constructor; try_new is the fallible alternative"
-    )]
-    pub fn new() -> Self {
-        Self::try_new().expect("failed to build reqwest client with default configuration")
-    }
-
-    /// Creates a transport client, returning an error if the HTTP client cannot
-    /// be built (custom TLS backends, proxy environment validation).
+    /// Creates a transport client with the default phases
+    /// ([`llm_proxy_core::UpstreamTimeoutsConfig::default()`]: connect 10s,
+    /// first-byte 60s, idle 60s), returning an error if the HTTP client
+    /// cannot be built (custom TLS backends, proxy environment validation).
     pub fn try_new() -> Result<Self, ProviderError> {
-        let http = pooled_http_builder(DEFAULT_CONNECT_TIMEOUT)
-            .build()
-            .map_err(provider_error_from_reqwest)?;
-
-        Ok(Self {
-            http,
-            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-            upstream_headers_timeout: DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-        })
+        Self::try_with_timeouts(&llm_proxy_core::UpstreamTimeoutsConfig::default())
     }
 
     /// Creates a client routed through a forward proxy with the same pool and
@@ -120,7 +93,9 @@ impl ProxyClient {
     }
 
     /// Override the time-to-first-byte deadline for upstream requests; the
-    /// default is [`DEFAULT_UPSTREAM_HEADERS_TIMEOUT`]. Does not cap the body.
+    /// default is the `first_byte` phase of
+    /// [`llm_proxy_core::UpstreamTimeoutsConfig::default()`]. Does not cap
+    /// the body.
     pub fn with_upstream_headers_timeout(mut self, deadline: Duration) -> Self {
         self.upstream_headers_timeout = deadline;
         self
@@ -705,7 +680,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -755,7 +730,11 @@ mod tests {
             extra_headers,
             forwarded_headers: std::collections::HashMap::new(),
         };
-        let seen = ProxyClient::new().send(req).await.unwrap();
+        let seen = ProxyClient::try_new()
+            .expect("client")
+            .send(req)
+            .await
+            .unwrap();
         assert_eq!(
             String::from_utf8(seen).unwrap(),
             "multipart/form-data; boundary=abc"
@@ -803,7 +782,7 @@ mod tests {
             axum::routing::get(describe).delete(describe).post(describe),
         );
         let base = start_test_server(app).await;
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
 
         let got = client
             .send_raw(
@@ -857,7 +836,8 @@ mod tests {
             axum::routing::get(|| async { (StatusCode::NOT_FOUND, r#"{"error":"no such file"}"#) }),
         );
         let base = start_test_server(app).await;
-        let error = ProxyClient::new()
+        let error = ProxyClient::try_new()
+            .expect("client")
             .send_raw(
                 reqwest::Method::GET,
                 raw_request(format!("{base}/gone"), b""),
@@ -878,7 +858,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -960,7 +940,7 @@ mod tests {
         )
         .await;
         let origin = start_test_server(redirect_to(format!("{other_origin}/capture"))).await;
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
 
         for style in [
             AuthStyle::Bearer,
@@ -1008,7 +988,8 @@ mod tests {
         });
         wait_for_ready(addr).await;
 
-        let reply = ProxyClient::new()
+        let reply = ProxyClient::try_new()
+            .expect("client")
             .send(secret_request(
                 format!("http://{addr}/start"),
                 AuthStyle::XApiKey,
@@ -1033,7 +1014,8 @@ mod tests {
         });
         wait_for_ready(addr).await;
 
-        let error = ProxyClient::new()
+        let error = ProxyClient::try_new()
+            .expect("client")
             .send(secret_request(
                 format!("http://{addr}/start"),
                 AuthStyle::Bearer,
@@ -1052,7 +1034,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1084,7 +1066,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1116,7 +1098,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1157,7 +1139,7 @@ mod tests {
         extra.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
         extra.insert("x-custom".to_owned(), "custom-value".to_owned());
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1192,7 +1174,7 @@ mod tests {
         let mut extra = std::collections::HashMap::new();
         extra.insert("x-stream-header".to_owned(), "stream-value".to_owned());
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1217,7 +1199,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1244,7 +1226,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let raw_body: Vec<u8> = vec![0x00, 0x01, 0x02, 0xFF, 0xFE];
         let req = ProxyRequest {
             url: format!("{}/test", base),
@@ -1283,7 +1265,7 @@ mod tests {
             .with_state(429u16);
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1313,7 +1295,7 @@ mod tests {
             .with_state(500u16);
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1346,7 +1328,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_stream_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1380,7 +1362,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1407,7 +1389,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let original_body = br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}"#;
         let req = ProxyRequest {
             url: format!("{}/test", base),
@@ -1475,7 +1457,7 @@ mod tests {
             .with_state(counter_clone);
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1540,7 +1522,9 @@ mod tests {
         let app = Router::new().route("/test", post(stalling_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new().with_stream_idle_timeout(Duration::from_millis(100));
+        let client = ProxyClient::try_new()
+            .expect("client")
+            .with_stream_idle_timeout(Duration::from_millis(100));
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1661,7 +1645,7 @@ mod tests {
         let app = Router::new().route("/test", post(partial_disconnect_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1712,7 +1696,7 @@ mod tests {
         let app = Router::new().route("/test", post(mid_stream_error_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -1738,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_url_returns_http_error() {
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: String::new(),
             auth: AuthHeaders {
@@ -1768,7 +1752,7 @@ mod tests {
             .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let large_body = "x".repeat(5 * 1024 * 1024);
         let req = ProxyRequest {
             url: format!("{}/test", base),
@@ -1867,7 +1851,8 @@ mod tests {
                 "egress client must keep the default stream idle timeout"
             );
             assert_eq!(
-                client.upstream_headers_timeout, DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
+                client.upstream_headers_timeout,
+                llm_proxy_core::UpstreamTimeoutsConfig::default().first_byte,
                 "egress client must keep the default headers timeout"
             );
         }
@@ -2062,7 +2047,7 @@ mod tests {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
 
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: format!("{}/test", base),
             auth: AuthHeaders {
@@ -2086,7 +2071,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_url_returns_http_error() {
-        let client = ProxyClient::new();
+        let client = ProxyClient::try_new().expect("client");
         let req = ProxyRequest {
             url: "http://192.0.2.1:1/test".to_owned(),
             auth: AuthHeaders {

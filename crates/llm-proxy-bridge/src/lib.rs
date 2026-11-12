@@ -437,8 +437,8 @@ impl Bridge {
     ///
     /// # Errors
     ///
-    /// [`BridgeError`] when the provider set fails validation or the runtime
-    /// cannot start.
+    /// [`BridgeError`] when the provider set fails validation, the transport
+    /// client cannot be built, or the runtime cannot start.
     pub fn from_config(config: BridgeConfig) -> Result<Self, BridgeError> {
         let BridgeConfig {
             providers,
@@ -465,11 +465,15 @@ impl Bridge {
             mcp: None,
         };
         let recording = record_usage.then(|| Arc::new(RecordingSink::default()));
+        let client = llm_proxy_transport::ProxyClient::try_with_timeouts(
+            &app_config.server.upstream_timeouts,
+        )
+        .map_err(|error| BridgeError::config(error.to_string()))?;
         let mut builder = EngineBuilder::from_parts(
             Arc::new(StaticConfigSource::new(Arc::new(app_config))),
             Arc::new(registry),
             Arc::new(ProviderAdapterRegistry::builtin()),
-            Arc::new(llm_proxy_transport::ProxyClient::new()),
+            Arc::new(client),
         );
         if let Some(sink) = &recording {
             let bus: Arc<dyn EventBus> = Arc::clone(sink) as Arc<dyn EventBus>;

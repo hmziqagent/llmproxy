@@ -334,7 +334,7 @@ mod tests {
             },
             registry,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::new(),
+            llm_proxy_transport::ProxyClient::try_new().expect("client"),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -396,7 +396,7 @@ mod tests {
             },
             registry,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::new(),
+            llm_proxy_transport::ProxyClient::try_new().expect("client"),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",

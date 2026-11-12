@@ -334,7 +334,8 @@ pub struct EngineBuilder {
     config: Arc<dyn ConfigSource>,
     providers: Arc<ProviderRegistry>,
     adapters: Arc<ProviderAdapterRegistry>,
-    transport: TransportTable,
+    shared_client: Option<Arc<ProxyClient>>,
+    egress: HashMap<String, Arc<ProxyClient>>,
     router: Option<Arc<dyn Router>>,
     admission: Option<Arc<dyn Admission>>,
     cache: Option<Arc<dyn Cache>>,
@@ -349,7 +350,8 @@ pub struct EngineBuilder {
 
 impl EngineBuilder {
     /// Start from a configuration snapshot, an empty provider registry, the
-    /// built-in adapters and one shared transport client.
+    /// built-in adapters and a shared transport client built from the
+    /// snapshot's `[server.upstream_timeouts]` in [`Self::build`].
     ///
     /// # Panics
     ///
@@ -362,12 +364,23 @@ impl EngineBuilder {
     pub fn new(config: AppConfig) -> Self {
         let providers = ProviderRegistry::from_providers(vec![])
             .expect("an empty provider registry is always valid");
-        Self::from_parts(
-            Arc::new(StaticConfigSource::new(Arc::new(config))),
-            Arc::new(providers),
-            Arc::new(ProviderAdapterRegistry::builtin()),
-            Arc::new(ProxyClient::new()),
-        )
+        Self {
+            config: Arc::new(StaticConfigSource::new(Arc::new(config))),
+            providers: Arc::new(providers),
+            adapters: Arc::new(ProviderAdapterRegistry::builtin()),
+            shared_client: None,
+            egress: HashMap::new(),
+            router: None,
+            admission: None,
+            cache: None,
+            guards: Vec::new(),
+            credentials: None,
+            usage: None,
+            catalogs: None,
+            metrics: None,
+            counter: None,
+            cooldowns: None,
+        }
     }
 
     /// Start from explicit parts.
@@ -382,7 +395,8 @@ impl EngineBuilder {
             config,
             providers,
             adapters,
-            transport: TransportTable::new(shared_client),
+            shared_client: Some(shared_client),
+            egress: HashMap::new(),
             router: None,
             admission: None,
             cache: None,
@@ -430,7 +444,7 @@ impl EngineBuilder {
     /// Wire the per-provider egress clients.
     #[must_use]
     pub fn egress_clients(mut self, egress: HashMap<String, Arc<ProxyClient>>) -> Self {
-        self.transport = self.transport.with_egress(egress);
+        self.egress = egress;
         self
     }
 
@@ -514,8 +528,19 @@ impl EngineBuilder {
     /// # Errors
     ///
     /// [`EngineError::Internal`] when a configured provider names a protocol
-    /// no registered adapter serves.
+    /// no registered adapter serves, when the configuration snapshot cannot
+    /// be loaded, or when the transport client cannot be built.
     pub fn build(self) -> Result<Engine, EngineError> {
+        let shared_client = match self.shared_client {
+            Some(client) => client,
+            None => {
+                let config = self.config.load()?;
+                Arc::new(
+                    ProxyClient::try_with_timeouts(&config.server.upstream_timeouts)
+                        .map_err(|error| EngineError::Internal(error.to_string()))?,
+                )
+            }
+        };
         let catalogs = self
             .catalogs
             .unwrap_or_else(|| Arc::new(ModelCatalogService::new(None)));
@@ -552,7 +577,7 @@ impl EngineBuilder {
             config: self.config,
             providers: self.providers,
             adapters: self.adapters,
-            transport: self.transport,
+            transport: TransportTable::new(shared_client).with_egress(self.egress),
             router,
             admission: self
                 .admission
@@ -584,7 +609,7 @@ mod tests {
 
     #[test]
     fn transport_table_picks_the_wired_egress_client_only_for_that_provider() {
-        let shared = Arc::new(ProxyClient::new());
+        let shared = Arc::new(ProxyClient::try_new().expect("client"));
         let egress = Arc::new(
             ProxyClient::try_with_egress_proxy("socks5h://127.0.0.1:1080")
                 .expect("egress proxy client builds"),

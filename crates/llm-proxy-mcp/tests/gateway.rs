@@ -146,7 +146,7 @@ async fn fixture(bind_port: u16) -> Fixture {
         gateway_config(upstream_url, bind_port),
         Arc::clone(&admission) as Arc<dyn Admission>,
         Arc::clone(&bus) as Arc<dyn EventBus>,
-        Arc::new(ProxyClient::new()),
+        Arc::new(ProxyClient::try_new().expect("client")),
     );
     Fixture {
         app: gateway.router(),
@@ -489,7 +489,7 @@ async fn a_tool_call_dropped_mid_upstream_still_settles_its_reservation() {
         gateway_config(upstream_url, 3979),
         Arc::clone(&admission) as Arc<dyn Admission>,
         Arc::new(RecordingBus::new()) as Arc<dyn EventBus>,
-        Arc::new(ProxyClient::new()),
+        Arc::new(ProxyClient::try_new().expect("client")),
     );
     let app = gateway.router();
 

@@ -100,7 +100,7 @@ mod tests {
             config,
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::new(),
+            llm_proxy_transport::ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",

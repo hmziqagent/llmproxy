@@ -175,7 +175,7 @@ mod tests {
             config,
             Arc::new(llm_proxy_engine::AllowAllAdmission),
             Arc::new(llm_proxy_storage::NoopBus),
-            Arc::new(ProxyClient::new()),
+            Arc::new(ProxyClient::try_new().expect("client")),
         );
         assert_eq!(
             gateway.token_id(Some("alpha-token")).as_deref(),
@@ -201,7 +201,7 @@ mod tests {
             config,
             Arc::new(llm_proxy_engine::AllowAllAdmission),
             Arc::new(llm_proxy_storage::NoopBus),
-            Arc::new(ProxyClient::new()),
+            Arc::new(ProxyClient::try_new().expect("client")),
         );
         assert_eq!(gateway.token_id(Some("anything")), None);
     }

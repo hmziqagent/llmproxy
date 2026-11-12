@@ -91,7 +91,7 @@ fn state(auth: AuthConfig, families: HashMap<String, EndpointFamilyConfig>) -> A
         app_config(auth, families),
         registry,
         ProviderAdapterRegistry::builtin(),
-        ProxyClient::new(),
+        ProxyClient::try_new().expect("client"),
         BuildInfo {
             name: "test",
             version: "0.0.0",

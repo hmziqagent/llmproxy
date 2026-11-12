@@ -167,17 +167,21 @@ impl ConfiguredProxy {
     /// # Errors
     ///
     /// [`EngineError`] when the provider set names protocols no registered
-    /// adapter serves.
+    /// adapter serves, or the transport client cannot be built from the
+    /// config's `[server.upstream_timeouts]`.
     pub fn engine(self) -> Result<Engine, EngineError> {
         let registry = core::ProviderRegistry::from_providers(self.inner.providers)
             .map_err(|error| EngineError::Internal(error.to_string()))?;
+        let client =
+            transport::ProxyClient::try_with_timeouts(&self.config.server.upstream_timeouts)
+                .map_err(|error| EngineError::Internal(error.to_string()))?;
         let mut builder = EngineBuilder::from_parts(
             Arc::new(StaticConfigSource::new(Arc::new(self.config))),
             Arc::new(registry),
             self.inner.adapters.unwrap_or_else(|| {
                 Arc::new(llm_proxy_adapters::ProviderAdapterRegistry::builtin())
             }),
-            Arc::new(transport::ProxyClient::new()),
+            Arc::new(client),
         );
         if let Some(bus) = self.inner.event_bus {
             builder = builder.event_bus(bus);

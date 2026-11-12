@@ -583,7 +583,7 @@ mod tests {
             make_app_config(),
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(state.server_name(), "test-proxy");
@@ -597,7 +597,7 @@ mod tests {
             make_app_config(),
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(state.server_name(), "test-proxy");
@@ -630,7 +630,7 @@ mod tests {
             make_app_config(),
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         let debug_output = format!("{:?}", state);
@@ -650,7 +650,7 @@ mod tests {
             make_app_config(),
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         let debug_output = format!("{:?}", state);
@@ -681,7 +681,7 @@ mod tests {
             make_app_config(),
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         let protocol_names = state.provider_adapters.protocol_names();
@@ -817,7 +817,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(
@@ -832,7 +832,7 @@ mod tests {
             make_app_config(),
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         let cloned = state.clone();
@@ -933,7 +933,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(state.request_timeout(), Duration::ZERO);
@@ -947,7 +947,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(state.server_name(), "");
@@ -961,7 +961,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(state.server_name(), "代理服务器-ünïcödé");
@@ -976,7 +976,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert_eq!(state.server_name(), long_name);
@@ -996,7 +996,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         );
         assert!(
@@ -1053,7 +1053,7 @@ mod tests {
                 cfg,
                 make_provider_registry(),
                 ProviderAdapterRegistry::builtin(),
-                ProxyClient::new(),
+                ProxyClient::try_new().expect("client"),
                 make_build_info(),
             );
         }
@@ -1126,7 +1126,7 @@ mod tests {
             cfg,
             make_provider_registry(),
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             make_build_info(),
         )
         .with_client_auth(Arc::new(client_auth));

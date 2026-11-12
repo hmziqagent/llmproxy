@@ -279,11 +279,23 @@ async fn probe_check(provider: &ProviderConfig, config: &AppConfig) -> CheckOutc
         forwarded_headers: std::collections::HashMap::new(),
     };
     let client =
-        llm_proxy_transport::ProxyClient::try_with_timeouts(&config.server.upstream_timeouts)
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "building the doctor transport client; using defaults");
-                llm_proxy_transport::ProxyClient::new()
-            });
+        match llm_proxy_transport::ProxyClient::try_with_timeouts(&config.server.upstream_timeouts)
+        {
+            Ok(client) => client,
+            Err(error) => {
+                return CheckOutcome {
+                    provider: provider.name.clone(),
+                    check,
+                    outcome: Outcome::Fail,
+                    detail: format!("building the transport client failed: {error}"),
+                    fix: Some(
+                        "check the [server.upstream_timeouts] phases and the proxy/TLS \
+                         environment reqwest builds under"
+                            .to_owned(),
+                    ),
+                };
+            }
+        };
     let detail_prefix = format!(
         "model {model} at {}",
         endpoint_without_query(&adapter.endpoint)

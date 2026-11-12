@@ -57,7 +57,7 @@ fn state() -> AppState {
         app_config(),
         registry,
         adapters::ProviderAdapterRegistry::builtin(),
-        transport::ProxyClient::new(),
+        transport::ProxyClient::try_new().expect("client"),
         BuildInfo {
             name: "sdk-test",
             version: "0.0.0",
@@ -277,5 +277,121 @@ async fn a_custom_protocol_registers_through_the_builder_alongside_the_builtins(
         with_custom.len(),
         builtin.len() + 1,
         "registration adds exactly the custom protocol, keeping {builtin:?}"
+    );
+}
+
+/// An upstream that accepts the TCP connection and never writes a byte:
+/// only the configured first-byte deadline can end the request.
+async fn hanging_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the hanging upstream");
+    let addr = listener.local_addr().expect("upstream address");
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _held = socket;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    format!("http://{addr}/v1/messages")
+}
+
+fn hanging_provider(endpoint: String) -> core::ProviderConfig {
+    let mut adapters = HashMap::new();
+    adapters.insert(
+        "main".to_owned(),
+        core::ProviderAdapterConfig {
+            protocol: "anthropic_messages".to_owned(),
+            endpoint,
+            headers: Arc::new(HashMap::new()),
+            forward_inbound_headers: None,
+            lossy: false,
+        },
+    );
+    core::ProviderConfig {
+        name: "hang".to_owned(),
+        api_key: secrecy::SecretString::from("configured-key"),
+        auth_style: core::AuthStyle::Bearer,
+        passthrough_auth: false,
+        api_keys: None,
+        retry: None,
+        egress: None,
+        adapters,
+        routes: core::ProviderRoutesConfig {
+            messages: Some("main".to_owned()),
+            ..Default::default()
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+        pricing: Default::default(),
+        concurrency: None,
+        pricing_sync: None,
+        prompt_cache: None,
+    }
+}
+
+#[tokio::test]
+async fn the_builder_honours_configured_upstream_timeouts() {
+    // The builder wires `[server.upstream_timeouts]` into its transport
+    // client: a 100ms first-byte budget must end a hung upstream fast,
+    // not after the historical fixed 60s headers timeout.
+    let mut config = app_config();
+    config.server.upstream_timeouts.first_byte = Duration::from_millis(100);
+    let engine = ProxyBuilder::new()
+        .app_config(config)
+        .provider(hanging_provider(hanging_upstream().await))
+        .engine()
+        .expect("engine builds from code");
+
+    let request = EngineRequest::new(
+        "hang",
+        core::ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        protocol::core::CoreRequest {
+            model: protocol::core::ModelRef {
+                requested: "m".to_owned(),
+                upstream: None,
+            },
+            system: Vec::new(),
+            messages: vec![protocol::core::CoreMessage {
+                role: protocol::core::CoreRole::User,
+                content: vec![protocol::core::CoreContent::Text {
+                    text: "x".to_owned(),
+                    cache: None,
+                }],
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            sampling: protocol::core::SamplingOptions::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: Default::default(),
+        },
+        engine::InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), engine.execute(request))
+        .await
+        .expect("the configured 100ms first-byte deadline must end the request well within 5s");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the builder-honoured first-byte deadline bounds the request, took {:?}",
+        started.elapsed()
+    );
+    let error = outcome.expect_err("a hanging upstream must time out");
+    assert!(
+        matches!(error, EngineError::UpstreamTimeout(_)),
+        "a hung upstream is an upstream timeout, got {error:?}"
     );
 }

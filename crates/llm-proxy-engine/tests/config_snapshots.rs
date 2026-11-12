@@ -174,7 +174,7 @@ fn engine_over(source: Arc<SwappingConfigSource>, endpoint: String) -> Engine {
         source as Arc<dyn ConfigSource>,
         Arc::new(registry),
         Arc::new(llm_proxy_adapters::ProviderAdapterRegistry::builtin()),
-        Arc::new(llm_proxy_transport::ProxyClient::new()),
+        Arc::new(llm_proxy_transport::ProxyClient::try_new().expect("client")),
     )
     .event_bus(Arc::new(NoopBus) as Arc<dyn EventBus>)
     .build()

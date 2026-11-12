@@ -94,7 +94,7 @@ mod tests {
             app_config(allowed_origins, auth),
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -419,7 +419,7 @@ mod loop_guard_tests {
             },
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",

@@ -56,7 +56,7 @@ mod tests {
             app_config,
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -134,7 +134,7 @@ mod tests {
             },
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -877,7 +877,7 @@ mod tests {
             app_config,
             registry,
             ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
+            ProxyClient::try_new().expect("client"),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -1009,7 +1009,7 @@ mod tests {
             },
             registry,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::new(),
+            llm_proxy_transport::ProxyClient::try_new().expect("client"),
             llm_proxy_server::BuildInfo {
                 name: "test",
                 version: "0.0.0",

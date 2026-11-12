@@ -198,7 +198,9 @@ fn proxy(base: &str, aliases: &[(&str, &str)]) -> (Router, Arc<RecordingBus>) {
         config(),
         registry,
         ProviderAdapterRegistry::builtin(),
-        ProxyClient::new().with_upstream_headers_timeout(Duration::from_secs(300)),
+        ProxyClient::try_new()
+            .expect("client")
+            .with_upstream_headers_timeout(Duration::from_secs(300)),
         BuildInfo {
             name: "live-families",
             version: "0.0.0",

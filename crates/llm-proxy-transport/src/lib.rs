@@ -10,5 +10,5 @@ pub mod client;
 /// Provider model discovery client and parsers.
 pub mod discovery;
 
-pub use client::{DEFAULT_STREAM_IDLE_TIMEOUT, DEFAULT_UPSTREAM_HEADERS_TIMEOUT, ProxyClient};
+pub use client::ProxyClient;
 pub use discovery::DiscoveryClient;
