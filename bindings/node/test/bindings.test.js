@@ -402,6 +402,150 @@ test('cancel unblocks a pending next on a stalled upstream', async () => {
   }
 });
 
+// Polls the usage ledger until the engine has settled a request as
+// ClientCancelled; the cancel reaches the engine asynchronously.
+async function waitForClientCancelledUsageRow(proxy, timeoutSecs, message) {
+  const deadline = Date.now() + timeoutSecs * 1000;
+  for (;;) {
+    const rows = proxy.usageEvents();
+    const cancelled = rows.some(
+      (row) => row.kind === 'response_failed' && row.error_kind === 'ClientCancelled'
+    );
+    if (cancelled) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      assert.fail(`${message}: ${JSON.stringify(rows)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+// Breaking out of a for-await loop must stop the upstream request through
+// the iterator's return(), exactly like an explicit cancel() would.
+test('breaking out of for-await cancels the upstream request', async () => {
+  const scenario = shared.cancellation;
+  const sse = await startUpstream(
+    shared.upstream_responses[scenario.upstream_response],
+    3_600_000
+  );
+  try {
+    const proxy = new Proxy({
+      record_usage: true,
+      providers: [providerFor(scenario.stream_provider, sse.baseUrl)],
+    });
+    const stream = await proxy.executeStream(
+      scenario.stream_provider,
+      scenario.dialect,
+      scenario.request
+    );
+
+    for await (const event of stream) {
+      assert.ok('MessageStart' in event);
+      break;
+    }
+
+    assert.ok(stream.cancelled, 'breaking out of the loop cancels the stream');
+    await waitForClientCancelledUsageRow(
+      proxy,
+      scenario.settle_timeout_secs || 5,
+      'the ClientCancelled row must land after the break'
+    );
+  } finally {
+    sse.stop();
+  }
+});
+
+// A throw in the loop body is an early exit too: the runtime calls
+// iterator.return() before propagating, which must cancel the stream.
+test('an exception inside the loop body cancels as well', async () => {
+  const scenario = shared.cancellation;
+  const sse = await startUpstream(
+    shared.upstream_responses[scenario.upstream_response],
+    3_600_000
+  );
+  try {
+    const proxy = new Proxy({
+      record_usage: true,
+      providers: [providerFor(scenario.stream_provider, sse.baseUrl)],
+    });
+    const stream = await proxy.executeStream(
+      scenario.stream_provider,
+      scenario.dialect,
+      scenario.request
+    );
+
+    await assert.rejects(
+      async () => {
+        for await (const event of stream) {
+          assert.ok('MessageStart' in event);
+          throw new Error('consumer gave up');
+        }
+      },
+      { message: 'consumer gave up' }
+    );
+
+    assert.ok(stream.cancelled, 'a throw in the loop body cancels the stream');
+    await waitForClientCancelledUsageRow(
+      proxy,
+      scenario.settle_timeout_secs || 5,
+      'the ClientCancelled row must land after the throw'
+    );
+  } finally {
+    sse.stop();
+  }
+});
+
+// return() fires only on early exit; a loop that runs to completion must
+// leave the stream uncanceled and settle as completed.
+test('completing the loop normally does not cancel', async () => {
+  const scenario = shared.cancellation;
+  const sse = await startUpstream(
+    shared.upstream_responses[scenario.upstream_response],
+    scenario.gap_ms || 250
+  );
+  try {
+    const proxy = new Proxy({
+      record_usage: true,
+      providers: [providerFor(scenario.stream_provider, sse.baseUrl)],
+    });
+    const stream = await proxy.executeStream(
+      scenario.stream_provider,
+      scenario.dialect,
+      scenario.request
+    );
+
+    let count = 0;
+    let last = null;
+    for await (const event of stream) {
+      last = event;
+      count += 1;
+    }
+    assert.ok(count >= 5, `the whole SSE response was consumed: ${count}`);
+    assert.ok('MessageStop' in last, `the terminal event arrived: ${JSON.stringify(last)}`);
+
+    assert.equal(stream.cancelled, false, 'normal completion does not cancel');
+    const deadline = Date.now() + (scenario.settle_timeout_secs || 5) * 1000;
+    for (;;) {
+      if (proxy.usageEvents().some((row) => row.kind === 'response_completed')) {
+        break;
+      }
+      if (Date.now() > deadline) {
+        assert.fail(
+          `the response_completed row must land: ${JSON.stringify(proxy.usageEvents())}`
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const cancelled = proxy
+      .usageEvents()
+      .some((row) => row.kind === 'response_failed' && row.error_kind === 'ClientCancelled');
+    assert.equal(cancelled, false, 'no ClientCancelled row after normal completion');
+  } finally {
+    sse.stop();
+  }
+});
+
 test('usage events record the lifecycle when opted in', async () => {
   const upstream = await startUpstream(shared.upstream_responses.anthropic_json);
   try {

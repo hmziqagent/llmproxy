@@ -64,8 +64,35 @@ class Stream {
           ? { done: true, value: undefined }
           : { done: false, value: event };
       },
+      // for-await calls return() on an early exit only (break, return,
+      // throw in the loop body) — never after the loop runs to completion —
+      // so breaking out stops the upstream request like an explicit cancel.
+      return: async () => {
+        await this._native.cancel();
+        return { done: true, value: undefined };
+      },
+      throw: async (error) => {
+        await this._native.cancel();
+        throw error;
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
     };
   }
+}
+
+// `await using` disposes the stream, stopping the upstream request. The
+// symbol is missing on runtimes older than Node 20.4, so the method is
+// attached with a computed key only when it exists.
+if (Symbol.asyncDispose) {
+  Object.defineProperty(Stream.prototype, Symbol.asyncDispose, {
+    value: async function asyncDispose() {
+      await this.cancel();
+    },
+    writable: true,
+    configurable: true,
+  });
 }
 
 class Proxy {

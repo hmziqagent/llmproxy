@@ -3,9 +3,11 @@
 //! and the JS layer (`index.js`) turns them into thrown `ProxyError`s and an
 //! async-iterable stream, so no logic lives here.
 //!
-//! Streaming works through `next()` promises; cancelling (or dropping the
-//! stream) drops the engine's event tail, which settles the request as
-//! `ClientCancelled`.
+//! Streaming works through `next()` promises; `cancel()` stops delivery and
+//! settles the request as `ClientCancelled`. `break` and `throw` inside a
+//! `for await` loop cancel through the iterator's `return()`, and a stream
+//! abandoned without a cancel is cancelled when the JS object is garbage
+//! collected — for prompt cancellation, call `await stream.cancel()`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -136,7 +138,10 @@ impl Proxy {
     }
 
     /// Run one streaming request; the returned stream yields event objects.
-    /// Cancelling (or dropping) it cancels the upstream request.
+    /// `cancel()` stops the upstream request and settles it as
+    /// `ClientCancelled`; `break` and `throw` inside a `for await` loop do
+    /// the same through the iterator's `return()`, and an abandoned stream
+    /// is cancelled when the JS object is garbage collected.
     ///
     /// A failure before the first event commits throws a napi error whose
     /// message is the JSON-encoded [`ErrorInfo`] — napi 3.4 cannot carry a

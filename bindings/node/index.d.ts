@@ -23,12 +23,19 @@ export declare class ProxyError extends Error {
 /** An event object from a streaming response (tagged core-event JSON). */
 export type StreamEvent = Record<string, unknown>;
 
-/** A streaming response; async-iterable, cancellable. */
+/**
+ * A streaming response; async-iterable, cancellable. Leaving a
+ * `for await` loop early (`break`, `return`, a throw in the body) stops
+ * the upstream request through the iterator's `return()`, as does
+ * `await using`; a loop that runs to completion does not cancel.
+ */
 export declare class Stream {
   next(): Promise<StreamEvent | null>;
   cancel(): Promise<void>;
   readonly cancelled: boolean;
   [Symbol.asyncIterator](): AsyncIterableIterator<StreamEvent>;
+  /** Present only on runtimes that have `Symbol.asyncDispose` (Node 20.4+). */
+  [Symbol.asyncDispose]?(): Promise<void>;
 }
 
 /**

@@ -77,7 +77,10 @@ the engine and add no logic of their own, so they start once its API has stopped
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
   pre-commit stream failures); `index.js` turns them into thrown
   `ProxyError`s and an async-iterable `Stream` whose `cancel()` settles as
-  `ClientCancelled`. 14 `node --test` tests pass; `npm install` of the
+  `ClientCancelled`, whose iterator `return()` cancels on a `for await`
+  early exit (`break` or a throw in the loop body) and which defines
+  `Symbol.asyncDispose` for `await using` on runtimes that have it. 17
+  `node --test` tests pass; `npm install` of the
   packed tarball (`npm pack` → `freeoxide-llm-proxy-0.1.0.tgz`) loads the
   prebuilt `llm-proxy.linux-x64-gnu.node` with no Rust toolchain. A
   Windows x64 binary (`llm-proxy.win32-x64-gnu.node`) is produced by
