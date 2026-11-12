@@ -22,7 +22,10 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-default = []
+default = ["tiktoken"]
+# Real BPE token counting, forwarded to llm-proxy-engine's `tiktoken`
+# feature.
+tiktoken = ["llm-proxy-engine/tiktoken"]
 # Replica-shared stores (plan 09 step 1): `[replica]` in config refuses to
 # start without the matching feature.
 store-redis = ["dep:llm-proxy-store-redis"]

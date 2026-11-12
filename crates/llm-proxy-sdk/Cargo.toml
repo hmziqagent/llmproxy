@@ -14,7 +14,10 @@ categories.workspace = true
 workspace = true
 
 [features]
-default = ["server", "sqlite"]
+default = ["server", "sqlite", "tiktoken"]
+# Real BPE token counting, forwarded to llm-proxy-engine's `tiktoken`
+# feature.
+tiktoken = ["llm-proxy-engine/tiktoken"]
 # The axum router binding (llm-proxy-server), for mounting in an existing app.
 server = ["dep:llm-proxy-server"]
 # The persistent SQLite usage ledger.

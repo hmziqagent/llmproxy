@@ -11,7 +11,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = []
+default = ["tiktoken"]
+# Real BPE token counting for the shared token counter (state
+# `token_counter`, the /count_tokens route and the engine's input
+# estimate), forwarded to llm-proxy-engine's `tiktoken` feature.
+tiktoken = ["llm-proxy-engine/tiktoken"]
 # Mounts the read-only admin /usage API (requires the SQLite ledger stack).
 admin = ["dep:llm-proxy-api", "llm-proxy-storage/sqlite"]
 # The semantic response cache (plan 09 step 5): wires

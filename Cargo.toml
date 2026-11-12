@@ -48,7 +48,10 @@ categories = ["web-programming::http-server", "api-bindings"]
 [workspace.dependencies]
 # Internal. Version keys are required for `cargo publish` (path-only
 # dependencies cannot be packaged) and must match each crate's version.
-llm-proxy-core = { path = "crates/llm-proxy-core", version = "0.1.0" }
+# Defaults stay off so crates that only route and encode requests
+# (adapters, transport, protocol, api) never compile tiktoken-rs; BPE
+# counting is opt-in through llm-proxy-engine's `tiktoken` default feature.
+llm-proxy-core = { path = "crates/llm-proxy-core", version = "0.1.0", default-features = false }
 llm-proxy-protocol = { path = "crates/llm-proxy-protocol", version = "0.1.0" }
 llm-proxy-adapters = { path = "crates/llm-proxy-adapters", version = "0.1.0" }
 llm-proxy-transport = { path = "crates/llm-proxy-transport", version = "0.1.0" }

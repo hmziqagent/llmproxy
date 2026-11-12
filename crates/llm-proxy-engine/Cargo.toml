@@ -13,6 +13,13 @@ categories.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["tiktoken"]
+# Real BPE token counting for known OpenAI model ids, forwarded to
+# llm-proxy-core's own `tiktoken` feature. Without it the input-token
+# estimate uses the ~4-chars/token heuristic everywhere.
+tiktoken = ["llm-proxy-core/tiktoken"]
+
 [dependencies]
 llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { workspace = true }

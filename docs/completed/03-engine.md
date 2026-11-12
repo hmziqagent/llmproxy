@@ -122,7 +122,12 @@ Every feature takes one of these places, in this order:
   (`--no-default-features`; the admin API is behind `admin`), the core
   without `tiktoken-rs` (`--no-default-features`), and reqwest uses
   rustls only — no native-tls/openssl anywhere in the transport tree
-  (BUG-23).
+  (BUG-23). `tiktoken-rs` is consumer-visible opt-in: the workspace
+  `llm-proxy-core` dependency keeps its defaults off, and
+  `llm-proxy-engine`'s default `tiktoken` feature (forwarded by
+  `llm-proxy-server`, `llm-proxy-sdk` and the app) is the only thing
+  enabling it, so `llm-proxy-adapters`, `-transport` and `-protocol`
+  never compile it.
 - **Publishable (step 10).** The `time = "=0.3.44"` pin is gone; all path
   dependencies carry `version = "0.1.0"`. Every crate passes
   `cargo publish --dry-run` (full package + verification build + upload
