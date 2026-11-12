@@ -615,7 +615,9 @@ mod tests {
         assert_eq!(text_out, "it is 72F");
         let terminal = chunks.last().expect("terminal chunk");
         assert_eq!(terminal["candidates"][0]["finishReason"], "STOP");
-        assert_eq!(terminal["usageMetadata"]["promptTokenCount"], 21);
+        // `promptTokenCount` includes the 8 cache-read tokens from the
+        // stream fixture's `message_start` (21 + 8).
+        assert_eq!(terminal["usageMetadata"]["promptTokenCount"], 29);
         assert_eq!(terminal["usageMetadata"]["candidatesTokenCount"], 6);
     }
 
@@ -1029,9 +1031,46 @@ mod tests {
             "it is 72F"
         );
         assert_eq!(value["candidates"][0]["finishReason"], "STOP");
-        assert_eq!(value["usageMetadata"]["promptTokenCount"], 21);
+        // Google documents `promptTokenCount` as the total prompt size
+        // including cached content, with `cachedContentTokenCount` as the
+        // cached subset; the fake upstream reports 21 evaluated + 8 cache
+        // read, so the prompt total is 29.
+        assert_eq!(value["usageMetadata"]["promptTokenCount"], 29);
+        assert_eq!(value["usageMetadata"]["cachedContentTokenCount"], 8);
         assert_eq!(value["usageMetadata"]["candidatesTokenCount"], 6);
-        assert_eq!(value["usageMetadata"]["totalTokenCount"], 27);
+        assert_eq!(value["usageMetadata"]["totalTokenCount"], 35);
+    }
+
+    /// The streamed terminal chunk carries the same cache-inclusive prompt
+    /// total: the Anthropic stream fixture's `message_start` reports
+    /// `cache_read_input_tokens: 8`.
+    #[tokio::test]
+    async fn gemini_stream_usage_includes_cache_reads() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::GenerateContent,
+            false,
+        );
+        let app = build_router(state);
+        let response = app
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                &gemini_request(),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        let chunks: Vec<Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).expect("valid json"))
+            .collect();
+        let terminal = chunks.last().expect("terminal chunk");
+        assert_eq!(terminal["usageMetadata"]["promptTokenCount"], 29);
+        assert_eq!(terminal["usageMetadata"]["cachedContentTokenCount"], 8);
     }
 
     #[tokio::test]

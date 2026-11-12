@@ -394,13 +394,23 @@ fn core_to_finish_reason(reason: &StopReason) -> String {
     }
 }
 
+/// Google documents `promptTokenCount` as the total prompt size including
+/// cached content, with `cachedContentTokenCount` naming the cached subset.
+/// The core's `input_tokens` excludes cache reads (Anthropic wire semantics),
+/// so the cache read is added back here, mirroring the Responses encoder.
+/// Cache-creation tokens have no Gemini wire field and are not reported.
 fn encode_usage(usage: &Usage) -> Value {
-    let total = i64::from(usage.input_tokens).saturating_add(i64::from(usage.output_tokens));
+    let cached = i64::from(usage.cache_read_input_tokens.unwrap_or(0));
+    let prompt = i64::from(usage.input_tokens).saturating_add(cached);
+    let total = prompt.saturating_add(i64::from(usage.output_tokens));
     let mut metadata = Map::new();
     metadata.insert(
         "promptTokenCount".to_owned(),
-        Value::from(usage.input_tokens),
+        Value::from(i32::try_from(prompt).unwrap_or(i32::MAX)),
     );
+    if let Some(read) = usage.cache_read_input_tokens.filter(|read| *read > 0) {
+        metadata.insert("cachedContentTokenCount".to_owned(), Value::from(read));
+    }
     metadata.insert(
         "candidatesTokenCount".to_owned(),
         Value::from(usage.output_tokens),
@@ -850,6 +860,21 @@ mod tests {
         assert_eq!(terminal["candidates"][0]["finishReason"], "STOP");
         assert_eq!(terminal["usageMetadata"]["promptTokenCount"], 4);
         assert_eq!(terminal["usageMetadata"]["totalTokenCount"], 6);
+    }
+
+    /// A usage with no cache read must not synthesize a
+    /// `cachedContentTokenCount` key: Google clients read its absence as "no
+    /// cached content", which is the truth here.
+    #[test]
+    fn usage_without_cache_reads_has_no_cached_content_token_count() {
+        let metadata = encode_usage(&Usage::provider_reported(10, 5));
+        assert_eq!(metadata["promptTokenCount"], 10);
+        assert_eq!(metadata["candidatesTokenCount"], 5);
+        assert_eq!(metadata["totalTokenCount"], 15);
+        assert!(
+            metadata.get("cachedContentTokenCount").is_none(),
+            "unexpected key: {metadata}"
+        );
     }
 
     #[test]
