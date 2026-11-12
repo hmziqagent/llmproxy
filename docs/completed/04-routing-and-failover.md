@@ -74,7 +74,9 @@ Add pools, retries and failover on top of the routing decision in the
   the route's `total_timeout` and `server.upstream_timeouts.total`;
   `the_ladder_deadline_spans_all_attempts`), with per-member attempts,
   backoff, and passive cooldowns on the `Cooldowns` trait — a 429 with a
-  reset time cools the member until it (`upstream_429_with_retry_after`)
+  reset time cools the member until it
+  (`a_429_cools_the_member_until_the_advertised_reset`,
+  `an_anthropic_rfc3339_reset_header_sets_the_cooldown`)
   and the optional synthetic probe clears it on recovery
   (`the_health_probe_clears_a_members_cooldown_when_it_recovers`).
 - Credential pools rotate `api_keys` with failure feedback: a rejected key

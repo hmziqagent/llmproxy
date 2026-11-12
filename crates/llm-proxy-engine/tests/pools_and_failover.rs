@@ -20,7 +20,9 @@ use llm_proxy_core::{
     ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ProviderRouteKind,
     ProviderRoutesConfig, RetryConfig, ServerConfig, UpstreamTimeoutsConfig,
 };
-use llm_proxy_engine::{ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest};
+use llm_proxy_engine::{
+    ClientDialect, CooldownStore, Cooldowns, Engine, EngineBuilder, EngineError, EngineRequest,
+};
 use llm_proxy_protocol::core::{
     CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
 };
@@ -51,7 +53,8 @@ fn upstream_json(status: StatusCode, body: &'static str) -> Router {
     )
 }
 
-fn upstream_429_with_retry_after(retry_after: &'static str) -> Router {
+/// An upstream that always answers 429, advertising the given `Retry-After`.
+fn throttled_upstream_with_retry_after(retry_after: &'static str) -> Router {
     Router::new().route(
         "/{*path}",
         post(move || async move {
@@ -63,6 +66,27 @@ fn upstream_429_with_retry_after(retry_after: &'static str) -> Router {
                 ],
                 r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
             )
+        }),
+    )
+}
+
+/// A 429 whose only reset signal is an Anthropic RFC 3339 reset timestamp —
+/// no `Retry-After` — the shape a real Anthropic throttle answers with.
+fn throttled_upstream_with_reset_header(reset: String) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move || async move {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static("anthropic-ratelimit-requests-reset"),
+                axum::http::HeaderValue::from_str(&reset).expect("valid reset header value"),
+            );
+            response
         }),
     )
 }
@@ -413,7 +437,7 @@ fn attempts(bus: &RecordingBus) -> Vec<AttemptCompleted> {
 
 #[tokio::test]
 async fn pool_survives_a_429_from_its_first_member_and_the_ledger_shows_every_attempt() {
-    let primary = spawn_upstream(upstream_429_with_retry_after("0")).await;
+    let primary = spawn_upstream(throttled_upstream_with_retry_after("0")).await;
     let secondary = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
     let (engine, bus) = build_engine(
         vec![
@@ -492,7 +516,7 @@ async fn pool_survives_a_5xx_then_a_connect_error_from_its_first_members() {
 
 #[tokio::test]
 async fn a_direct_provider_route_never_fails_over_or_wraps_the_error() {
-    let provider_upstream = spawn_upstream(upstream_429_with_retry_after("0")).await;
+    let provider_upstream = spawn_upstream(throttled_upstream_with_retry_after("0")).await;
     let (engine, bus) = build_engine(vec![member("solo", provider_upstream, None)], vec![]);
 
     let error = engine
@@ -509,8 +533,8 @@ async fn a_direct_provider_route_never_fails_over_or_wraps_the_error() {
 
 #[tokio::test]
 async fn an_exhausted_pool_reports_retries_exhausted_with_a_computed_retry_after() {
-    let first = spawn_upstream(upstream_429_with_retry_after("17")).await;
-    let second = spawn_upstream(upstream_429_with_retry_after("23")).await;
+    let first = spawn_upstream(throttled_upstream_with_retry_after("17")).await;
+    let second = spawn_upstream(throttled_upstream_with_retry_after("23")).await;
     let (engine, _bus) = build_engine(
         vec![member("first", first, None), member("second", second, None)],
         vec![pool(
@@ -1899,6 +1923,117 @@ fn probed_upstream() -> Router {
 
 const PROBED_OK_BODY: &str = r#"{"id":"msg_p","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
 const SPARE_OK_BODY: &str = r#"{"id":"msg_s","type":"message","role":"assistant","content":[{"type":"text","text":"spare"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#;
+
+/// Builds the engine over `providers`/`pools` with the test's own cooldown
+/// store, so the passive-health view stays observable from the test.
+fn build_engine_with_cooldowns(
+    providers: Vec<ProviderConfig>,
+    pools: Vec<PoolConfig>,
+    cooldowns: &Arc<CooldownStore>,
+) -> Engine {
+    let registry = ProviderRegistry::from_parts(providers, pools).expect("registry with pools");
+    EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .cooldowns(Arc::clone(cooldowns) as Arc<dyn Cooldowns>)
+        .build()
+        .expect("engine builds")
+}
+
+/// A one-attempt pool whose first member throttles: fix brief 04-5 pins the
+/// passive-health cooldown to the reset the upstream advertised, not the
+/// ladder's configured cooldown.
+async fn throttle_failover_setup(throttle: Router) -> (Engine, Arc<CooldownStore>) {
+    let primary = spawn_upstream(throttle).await;
+    let secondary = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let cooldowns = Arc::new(CooldownStore::new());
+    let engine = build_engine_with_cooldowns(
+        vec![
+            member("primary", primary, None),
+            member("secondary", secondary, None),
+        ],
+        vec![pool(
+            "both",
+            vec!["primary", "secondary"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+        &cooldowns,
+    );
+    (engine, cooldowns)
+}
+
+/// The cooldown must last the advertised reset (2s), not the configured
+/// 50ms ladder cooldown, and lift once the reset passes.
+#[tokio::test]
+async fn a_429_cools_the_member_until_the_advertised_reset() {
+    let (engine, cooldowns) =
+        throttle_failover_setup(throttled_upstream_with_retry_after("2")).await;
+
+    let response = engine
+        .execute(engine_request("both", false))
+        .await
+        .expect("the pool fails over to the secondary");
+    assert_eq!(response.core.usage.input_tokens, 10, "the secondary served");
+
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        !cooldowns.provider_available("primary", now).await,
+        "the 429 puts the member into cooldown"
+    );
+    let remaining = cooldowns
+        .soonest_reset(&["primary"], now)
+        .await
+        .expect("the cooled member reports its reset");
+    assert!(
+        (Duration::from_millis(1500)..=Duration::from_millis(2500)).contains(&remaining),
+        "the cooldown lasts the advertised 2s, got {remaining:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        cooldowns
+            .provider_available("primary", time::OffsetDateTime::now_utc())
+            .await,
+        "the member is back once the advertised reset passes"
+    );
+}
+
+/// An Anthropic reset timestamp with no `Retry-After` must set the cooldown
+/// too: before reset-header parsing this fell back to the configured 50ms.
+#[tokio::test]
+async fn an_anthropic_rfc3339_reset_header_sets_the_cooldown() {
+    let reset = (time::OffsetDateTime::now_utc() + time::Duration::seconds(2))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format the reset timestamp");
+    let (engine, cooldowns) =
+        throttle_failover_setup(throttled_upstream_with_reset_header(reset)).await;
+
+    let response = engine
+        .execute(engine_request("both", false))
+        .await
+        .expect("the pool fails over to the secondary");
+    assert_eq!(response.core.usage.input_tokens, 10, "the secondary served");
+
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        !cooldowns.provider_available("primary", now).await,
+        "the 429 puts the member into cooldown"
+    );
+    let remaining = cooldowns
+        .soonest_reset(&["primary"], now)
+        .await
+        .expect("the cooled member reports its reset");
+    assert!(
+        (Duration::from_millis(1500)..=Duration::from_millis(2500)).contains(&remaining),
+        "the RFC 3339 reset (2s ahead) sets the cooldown, got {remaining:?}"
+    );
+}
 
 // ---- Plan 04-1: the failover strip (provider-bound state) ----
 
