@@ -5,15 +5,6 @@ use std::collections::HashMap;
 
 use crate::traits::InboundHeaders;
 
-const NEVER_FORWARDED_PREFIXES: [&str; 3] = ["sec-", "access-control-", "browser-"];
-
-fn header_is_never_forwarded(lower_name: &str) -> bool {
-    llm_proxy_core::provider_config::NEVER_FORWARDED_HEADERS.contains(&lower_name)
-        || NEVER_FORWARDED_PREFIXES
-            .iter()
-            .any(|p| lower_name.starts_with(p))
-}
-
 /// Applies the per-provider allowlist to the inbound headers: every
 /// allowlisted name that is present (and not on the never-forwarded list)
 /// is selected verbatim for the upstream request.
@@ -24,7 +15,7 @@ pub fn select_forwarded_headers(
     let mut selected = HashMap::new();
     for name in allowlist {
         let lower = name.to_ascii_lowercase();
-        if header_is_never_forwarded(&lower) {
+        if llm_proxy_core::provider_config::is_never_forwarded_header(&lower) {
             if headers.contains_key(&lower) {
                 tracing::warn!(
                     header = %lower,
@@ -108,6 +99,26 @@ mod tests {
         let inbound = headers(&[("x-session-id", "abc\r\nx-injected: 1")]);
         let allowlist = vec!["x-session-id".to_owned()];
         assert!(select_forwarded_headers(&inbound, &allowlist).is_empty());
+    }
+
+    #[test]
+    fn select_forwarded_headers_enforces_the_shared_never_forwarded_set() {
+        let mut names: Vec<&str> =
+            llm_proxy_core::provider_config::NEVER_FORWARDED_HEADERS.to_vec();
+        names.extend([
+            "sec-fetch-mode",
+            "access-control-allow-origin",
+            "browser-use",
+        ]);
+        for name in names {
+            let inbound = headers(&[(name, "value")]);
+            let allowlist = vec![name.to_owned()];
+            let selected = select_forwarded_headers(&inbound, &allowlist);
+            assert!(
+                selected.is_empty(),
+                "never-forwarded header {name} must be dropped, got {selected:?}"
+            );
+        }
     }
 
     #[test]

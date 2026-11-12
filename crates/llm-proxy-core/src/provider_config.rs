@@ -1379,6 +1379,22 @@ pub const NEVER_FORWARDED_HEADERS: &[&str] = &[
     "x-llm-proxy-hop",
 ];
 
+/// Header-name prefixes that are never forwarded upstream: browser headers
+/// that leak the caller's environment, and CORS/security headers the browser
+/// owns. One definition shared by config validation and the runtime
+/// forwarder.
+pub const NEVER_FORWARDED_HEADER_PREFIXES: &[&str] = &["sec-", "access-control-", "browser-"];
+
+/// Whether a lowercased header name is on the never-forwarded set, by exact
+/// name or by prefix. Config validation rejects configured allowlist entries
+/// with this; the runtime forwarder drops them even when configured.
+pub fn is_never_forwarded_header(lower_name: &str) -> bool {
+    NEVER_FORWARDED_HEADERS.contains(&lower_name)
+        || NEVER_FORWARDED_HEADER_PREFIXES
+            .iter()
+            .any(|p| lower_name.starts_with(p))
+}
+
 /// How the API key is sent in HTTP headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2426,10 +2442,7 @@ fn validate_forwarded_inbound_headers(
             });
         }
         let lower = header.to_ascii_lowercase();
-        if NEVER_FORWARDED_HEADERS.contains(&lower.as_str())
-            || lower.starts_with("sec-")
-            || lower.starts_with("access-control-")
-        {
+        if is_never_forwarded_header(&lower) {
             return Err(ConfigValidationError::ForbiddenForwardedHeader {
                 provider: provider.to_owned(),
                 adapter: adapter.to_owned(),
@@ -4043,6 +4056,8 @@ hold = "1s"
             "cookie",
             "sec-fetch-mode",
             "x-request-id",
+            "browser-use",
+            "Sec-CH-UA",
         ] {
             let mut provider = make_minimal_provider("fwd-provider");
             let adapter = provider.adapters.get_mut("chat").expect("chat adapter");
