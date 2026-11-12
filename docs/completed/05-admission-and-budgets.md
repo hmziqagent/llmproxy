@@ -56,8 +56,11 @@ proposes three different admission models, and this plan replaces them with one.
   rpm/tpm/rpd windows (429 with the reset), a `usd_per_day` budget that
   reserves first (402) with an explicit unestimatable policy, and
   per-provider and per-model in-flight caps (503 with a one-second
-  `Retry-After`). Settlement charges exactly what the provider billed and
-  refunds a failure before any usage.
+  `Retry-After`). The allowlist verdict also runs on its own at pipeline
+  slot 2 (`Admission::authorize`), ahead of the idempotency replay, the
+  cache and single-flight, so a key restricted at runtime is not served an
+  answer stored for it earlier. Settlement charges exactly what the provider
+  billed and refunds a failure before any usage.
 - Preflight estimates input tokens once (shared with admission) and warns by
   default; enforce mode rejects only past the configured margin.
 - `llm-proxy pricing-sync` writes per-token pricing from models.dev into

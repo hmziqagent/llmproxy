@@ -7,7 +7,11 @@
 //! - **Allowlists** (step 3). A key with `allow_models` may only run a model
 //!   matching one of its globs (the requested name or the upstream name);
 //!   with `allow_providers`, only a matching route. A restricted key whose
-//!   request names no model fails closed. Refusals are 403.
+//!   request names no model fails closed. Refusals are 403. The engine asks
+//!   at pipeline slot 2, through [`Admission::authorize`] — ahead of the
+//!   idempotency replay, the cache and single-flight, so a key restricted
+//!   at runtime is not served an answer stored for it earlier — and
+//!   `reserve` checks again.
 //! - **Windows** (step 5). `rpm` and `rpd` count admitted requests per
 //!   calendar minute and UTC day; `tpm` counts tokens per calendar minute —
 //!   the input estimate plus `max_tokens` is reserved at admission and
@@ -358,40 +362,55 @@ impl PolicyAdmission {
             caps.and_then(|c| c.models.get(model).copied()),
         )
     }
+
+    /// The per-key allowlist verdict for one claim: a key with a policy may
+    /// only run a model and address a route its globs match. Reads config
+    /// only; no counter moves.
+    fn check_allowlists(&self, claim: &AdmissionClaim<'_>) -> Result<(), EngineError> {
+        let Some(policy) = self.keys.get(claim.caller) else {
+            return Ok(());
+        };
+        if !allowed_by(&policy.allow_models, claim.requested_model, claim.model) {
+            return Err(EngineError::Forbidden(
+                if claim.requested_model.is_empty() && claim.model.is_empty() {
+                    "this key is restricted to specific models and the request names none"
+                        .to_owned()
+                } else {
+                    format!(
+                        "this key may not use model \"{}\"",
+                        if claim.requested_model.is_empty() {
+                            claim.model
+                        } else {
+                            claim.requested_model
+                        }
+                    )
+                },
+            ));
+        }
+        if !allowed_by(&policy.allow_providers, claim.provider, "") {
+            return Err(EngineError::Forbidden(format!(
+                "this key may not use provider \"{}\"",
+                claim.provider
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Admission for PolicyAdmission {
+    async fn authorize(&self, claim: &AdmissionClaim<'_>) -> Result<(), EngineError> {
+        self.check_allowlists(claim)
+    }
+
     async fn reserve(&self, claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
         let now = (self.clock)();
         let policy = self.keys.get(claim.caller);
 
-        // Step 3: allowlists, before any accounting.
-        if let Some(policy) = policy {
-            if !allowed_by(&policy.allow_models, claim.requested_model, claim.model) {
-                return Err(EngineError::Forbidden(
-                    if claim.requested_model.is_empty() && claim.model.is_empty() {
-                        "this key is restricted to specific models and the request names none"
-                            .to_owned()
-                    } else {
-                        format!(
-                            "this key may not use model \"{}\"",
-                            if claim.requested_model.is_empty() {
-                                claim.model
-                            } else {
-                                claim.requested_model
-                            }
-                        )
-                    },
-                ));
-            }
-            if !allowed_by(&policy.allow_providers, claim.provider, "") {
-                return Err(EngineError::Forbidden(format!(
-                    "this key may not use provider \"{}\"",
-                    claim.provider
-                )));
-            }
-        }
+        // Allowlists again, before any accounting: the engine asks at slot 2
+        // (`authorize`), but callers that reserve directly — the
+        // endpoint-family routes, the MCP gateway — never do.
+        self.check_allowlists(claim)?;
 
         // Budget estimate is computed before any counter moves: it reads
         // only config.
@@ -721,6 +740,81 @@ mod tests {
             })
             .await
             .expect("keys without a policy are unrestricted");
+    }
+
+    #[tokio::test]
+    async fn authorize_gives_the_allowlist_verdict_without_moving_a_counter() {
+        // Slot 2's verdict is the allowlists `reserve` enforces, with no
+        // accounting: the key's one-request minute window is still whole
+        // after every authorize call below.
+        let policy = KeyPolicy {
+            allow_models: vec!["claude-*".to_owned()],
+            allow_providers: vec!["anthropic*".to_owned()],
+            limits: KeyWindowLimits {
+                rpm: Some(1),
+                ..KeyWindowLimits::default()
+            },
+            ..KeyPolicy::default()
+        };
+        let admission = admission(policy);
+        let ok = AdmissionClaim {
+            provider: "anthropic-pool",
+            member: "anthropic",
+            requested_model: "claude-sonnet-4-6",
+            model: "claude-sonnet-4-6",
+            ..claim("key", "anthropic", "claude-sonnet-4-6", 1, None)
+        };
+        admission
+            .authorize(&ok)
+            .await
+            .expect("matching model and provider");
+
+        let wrong_model = AdmissionClaim {
+            requested_model: "gpt-4o",
+            model: "gpt-4o",
+            ..ok
+        };
+        let refused = admission
+            .authorize(&wrong_model)
+            .await
+            .expect_err("model denied");
+        assert!(matches!(refused, EngineError::Forbidden(_)));
+        assert_eq!(refused.status_code(), 403);
+
+        let wrong_provider = AdmissionClaim {
+            provider: "openai",
+            ..ok
+        };
+        let refused = admission
+            .authorize(&wrong_provider)
+            .await
+            .expect_err("provider denied");
+        assert!(matches!(refused, EngineError::Forbidden(_)));
+        assert_eq!(refused.status_code(), 403);
+
+        // An unrestricted key (no policy entry) is authorized for anything.
+        admission
+            .authorize(&AdmissionClaim {
+                caller: "other",
+                ..wrong_model
+            })
+            .await
+            .expect("keys without a policy are unrestricted");
+
+        // No counter moved: the allowed claim still fits the minute window
+        // of one request, and that reservation is what spends it.
+        admission
+            .reserve(&ok)
+            .await
+            .expect("authorize spent none of the minute window");
+        let refused = admission
+            .reserve(&ok)
+            .await
+            .expect_err("the window holds exactly one request");
+        assert!(
+            matches!(refused, EngineError::RateLimited { .. }),
+            "got {refused:?}"
+        );
     }
 
     #[tokio::test]

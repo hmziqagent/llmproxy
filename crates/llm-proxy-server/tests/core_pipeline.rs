@@ -3915,6 +3915,89 @@ mod tests {
         );
     }
 
+    /// A rules swap that tightens a key's allowlist also cuts the key off
+    /// from the answers the running engine already stored for it: the
+    /// allowlist verdict runs ahead of the response cache, so the request
+    /// that was a cache hit a moment ago is refused, not served.
+    #[tokio::test]
+    async fn a_tightened_allowlist_refuses_a_request_the_cache_was_serving() {
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.cache = llm_proxy_core::ResponseCacheConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(60),
+                    max_entries: 16,
+                };
+            },
+        )
+        .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let registry = state.providers();
+        let backend: Arc<dyn llm_proxy_engine::AdmissionBackend> =
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "sekrit-token")),
+            admission_for("laptop", Vec::new(), None, Arc::clone(&backend), &registry),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
+        let app = build_router(state);
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let cache_hits = || {
+            bus.snapshot()
+                .into_iter()
+                .filter(
+                    |event| matches!(event, ProxyEvent::ResponseCompleted(row) if row.cache_hit),
+                )
+                .count()
+        };
+
+        // Fill the cache, then show the stored answer is what gets served.
+        for _ in 0..2 {
+            let served = app
+                .clone()
+                .oneshot(authorized_messages_request("sekrit-token", &body))
+                .await
+                .unwrap();
+            assert_eq!(served.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            cache_hits(),
+            1,
+            "the second identical request is served from the cache"
+        );
+
+        pair.replace_admission(admission_for(
+            "laptop",
+            vec!["other-*".to_owned()],
+            None,
+            backend,
+            &registry,
+        ));
+
+        let refused = app
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "the tightened allowlist must beat the answer cached before the swap"
+        );
+        assert_eq!(
+            cache_hits(),
+            1,
+            "the refused request is not recorded as a served copy"
+        );
+    }
+
     /// The counters a key already charged survive a rules swap (issuing
     /// another managed key must not hand anyone a fresh window): both the
     /// old and the new rules run over the same backend.

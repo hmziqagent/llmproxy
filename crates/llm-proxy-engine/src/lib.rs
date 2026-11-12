@@ -10,8 +10,10 @@
 //!
 //! 1. Authenticate the caller — the HTTP layer's job; the engine records the
 //!    identity it is given.
-//! 2. Apply caller limits and key allowlists — server middleware today, the
-//!    [`Admission`] trait's slot later.
+//! 2. Apply caller limits and key allowlists — the per-key allowlists are
+//!    [`Admission::authorize`], asked as soon as slot 3 names the first
+//!    member and before slots 4 and 5; the per-IP rate limit is server
+//!    middleware, and per-key windows and budgets are reserved at slot 6.
 //! 3. Resolve the route — [`Router`].
 //! 4. Claim the idempotency key — [`IdempotencyStore`] (opt-in; 409 only
 //!    while the first request runs, replay after).

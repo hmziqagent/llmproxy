@@ -5,7 +5,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -1633,6 +1633,260 @@ async fn a_streaming_follower_reruns_when_its_leader_vanishes_before_the_first_b
             .iter()
             .any(|(_, id)| id == "req-joiner"),
         "the joiner's re-run records a completed row: {:?}",
+        completed_rows(&bus)
+    );
+}
+
+/// An admission step whose slot-2 verdict flips at runtime: the shape of a
+/// key whose allowlist was tightened after an answer was already stored for
+/// it. `reserve` always succeeds, so a refusal can only come from
+/// `authorize`.
+#[derive(Debug)]
+struct ToggleAdmission {
+    forbid: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Admission for ToggleAdmission {
+    async fn authorize(&self, claim: &AdmissionClaim<'_>) -> Result<(), EngineError> {
+        if self.forbid.load(Ordering::SeqCst) {
+            return Err(EngineError::Forbidden(format!(
+                "this key may not use model \"{}\"",
+                claim.requested_model
+            )));
+        }
+        Ok(())
+    }
+
+    async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        Ok(AdmissionTicket::default())
+    }
+
+    fn settle(&self, _ticket: &AdmissionTicket, _outcome: &AdmissionOutcome<'_>) {}
+}
+
+/// A [`ToggleAdmission`] and the flag that restricts its key.
+fn toggle_admission() -> (Arc<AtomicBool>, Arc<dyn Admission>) {
+    let forbid = Arc::new(AtomicBool::new(false));
+    let admission = Arc::new(ToggleAdmission {
+        forbid: Arc::clone(&forbid),
+    });
+    (forbid, admission)
+}
+
+/// A streaming upstream that counts calls and runs cleanly to its terminal,
+/// so the stream's outcome is stored under its idempotency key.
+fn completing_stream_upstream(calls: Arc<AtomicUsize>) -> Router {
+    Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = vec![
+                    bytes::Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stored\"}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ),
+                ];
+                let body_stream =
+                    futures::stream::iter(chunks).map(Ok::<_, std::convert::Infallible>);
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_tightened_allowlist_beats_a_cached_answer() {
+    // The allowlist verdict is slot 2, ahead of the cache lookup (slot 5):
+    // the cache outlives the rules it was filled under, so a key restricted
+    // after its answer was stored is refused, not served the stored answer.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let (forbid, admission) = toggle_admission();
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        test_config(),
+        Arc::clone(&bus),
+        Some(admission),
+        Some(MemoryCache::new(Duration::from_secs(60), 16)),
+    );
+
+    engine
+        .execute(
+            engine_request(false, "restricted prompt", "caller-a", None).with_request_id("req-1"),
+        )
+        .await
+        .expect("the first request runs while the key is still allowed");
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+
+    forbid.store(true, Ordering::SeqCst);
+
+    let refused = engine
+        .execute(
+            engine_request(false, "restricted prompt", "caller-a", None).with_request_id("req-2"),
+        )
+        .await
+        .expect_err("a restricted key must not be served the answer stored before the restriction");
+    assert!(
+        matches!(refused, EngineError::Forbidden(_)),
+        "got {refused:?}"
+    );
+    assert_eq!(refused.status_code(), 403);
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        1,
+        "the refused request never reaches the upstream"
+    );
+    assert!(
+        failed_rows(&bus).contains(&"req-2".to_owned()),
+        "the refusal is recorded on the request's ledger row: {:?}",
+        failed_rows(&bus)
+    );
+    assert!(
+        !completed_rows(&bus).iter().any(|(hit, _)| *hit),
+        "no row may record a served copy for the restricted key: {:?}",
+        completed_rows(&bus)
+    );
+}
+
+#[tokio::test]
+async fn a_tightened_allowlist_beats_an_idempotent_replay() {
+    // Slot 2 is also ahead of the idempotency claim (slot 4): a matching
+    // retry of a completed request replays the stored outcome — unless the
+    // key has been restricted since.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let (forbid, admission) = toggle_admission();
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        idempotency_config(),
+        Arc::clone(&bus),
+        Some(admission),
+        None,
+    );
+
+    engine
+        .execute(
+            engine_request(false, "idem restricted", "caller-a", Some("key-1"))
+                .with_request_id("req-1"),
+        )
+        .await
+        .expect("the first request runs while the key is still allowed");
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+
+    forbid.store(true, Ordering::SeqCst);
+
+    let refused = engine
+        .execute(
+            engine_request(false, "idem restricted", "caller-a", Some("key-1"))
+                .with_request_id("req-2"),
+        )
+        .await
+        .expect_err(
+            "a restricted key must not be replayed the outcome stored before the restriction",
+        );
+    assert!(
+        matches!(refused, EngineError::Forbidden(_)),
+        "got {refused:?}"
+    );
+    assert_eq!(refused.status_code(), 403);
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        1,
+        "the refused retry never reaches the upstream"
+    );
+    assert!(
+        failed_rows(&bus).contains(&"req-2".to_owned()),
+        "the refusal is recorded on the retry's ledger row: {:?}",
+        failed_rows(&bus)
+    );
+    assert!(
+        !completed_rows(&bus).iter().any(|(hit, _)| *hit),
+        "no row may record a replay for the restricted key: {:?}",
+        completed_rows(&bus)
+    );
+}
+
+#[tokio::test]
+async fn a_tightened_allowlist_beats_a_cached_answer_on_the_streaming_path() {
+    // Streaming twin. The stored answer a stream can be served is its
+    // idempotent replay (the response cache holds only complete
+    // non-streaming responses); slot 2 is ahead of it on this path too.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(completing_stream_upstream(Arc::clone(&calls))).await;
+    let bus = Arc::new(RecordingBus::new());
+    let (forbid, admission) = toggle_admission();
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        idempotency_config(),
+        Arc::clone(&bus),
+        Some(admission),
+        None,
+    );
+
+    let first = engine
+        .execute_stream(
+            engine_request(true, "stream restricted", "caller-a", Some("key-s"))
+                .with_request_id("req-1"),
+        )
+        .await
+        .expect("the first stream runs while the key is still allowed");
+    let events = collect_stream(first).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the first stream runs to its terminal, so its outcome is stored: {events:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    forbid.store(true, Ordering::SeqCst);
+
+    let refused = engine
+        .execute_stream(
+            engine_request(true, "stream restricted", "caller-a", Some("key-s"))
+                .with_request_id("req-2"),
+        )
+        .await
+        .expect_err(
+            "a restricted key must not be replayed the stream stored before the restriction",
+        );
+    assert!(
+        matches!(refused, EngineError::Forbidden(_)),
+        "got {refused:?}"
+    );
+    assert_eq!(refused.status_code(), 403);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the refused retry never reaches the upstream"
+    );
+    assert!(
+        failed_rows(&bus).contains(&"req-2".to_owned()),
+        "the refusal is recorded on the retry's ledger row: {:?}",
+        failed_rows(&bus)
+    );
+    assert!(
+        !completed_rows(&bus).iter().any(|(hit, _)| *hit),
+        "no row may record a replay for the restricted key: {:?}",
         completed_rows(&bus)
     );
 }

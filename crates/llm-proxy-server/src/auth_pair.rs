@@ -153,6 +153,15 @@ impl std::fmt::Debug for SwappingAuthPair {
 
 #[async_trait::async_trait]
 impl Admission for SwappingAuthPair {
+    async fn authorize(
+        &self,
+        claim: &llm_proxy_engine::AdmissionClaim<'_>,
+    ) -> Result<(), llm_proxy_engine::EngineError> {
+        Arc::clone(self.current().admission())
+            .authorize(claim)
+            .await
+    }
+
     async fn reserve(
         &self,
         claim: &llm_proxy_engine::AdmissionClaim<'_>,

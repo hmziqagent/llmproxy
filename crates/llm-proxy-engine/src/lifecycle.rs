@@ -37,9 +37,9 @@ use crate::classification::{ErrorClass, classify, next_wait};
 use crate::error::{AuthOwner, EngineError, map_provider_error, sanitize_upstream_error_body};
 use crate::headers::select_forwarded_headers;
 use crate::traits::{
-    AdmissionOutcome, AdmissionTicket, CacheEntry, CacheKey, CredentialFeedback, CredentialPick,
-    CredentialQuery, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery, UnsettledLeaseGuard,
-    UsageSink,
+    AdmissionClaim, AdmissionOutcome, AdmissionTicket, CacheEntry, CacheKey, CredentialFeedback,
+    CredentialPick, CredentialQuery, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery,
+    UnsettledLeaseGuard, UsageSink,
 };
 use crate::types::{ClientDialect, EngineRequest, EngineResponse, EngineStream};
 use crate::{EngineInner, ProviderAdapterTarget};
@@ -360,6 +360,68 @@ pub fn billed_cost(usage: &Usage, pricing: Option<&ModelPricing>) -> Option<Cost
     pricing.map(|p| compute_cost(usage, p))
 }
 
+/// The member and upstream model the ladder will try first — cooldown
+/// reorder included (plan 05 step 4). Slot 2's allowlist verdict and slot
+/// 6's reservation both key on this pair, so they judge the same target.
+async fn first_member_and_model<'a>(
+    inner: &EngineInner,
+    plan: &'a RoutePlan,
+) -> (&'a str, &'a str) {
+    let first = ordered_candidates(inner, plan, OffsetDateTime::now_utc())
+        .await
+        .first()
+        .and_then(|index| plan.candidates.get(*index))
+        .or_else(|| plan.candidates.first());
+    (
+        first.map_or("", |candidate| candidate.target.provider_name.as_str()),
+        first.map_or("", |candidate| candidate.target.upstream_model.as_str()),
+    )
+}
+
+/// The admission claim for one request against the member the ladder starts
+/// on: what [`authorize_step`] and [`admit`] both hand to the admission
+/// step.
+fn admission_claim<'a>(
+    req: &'a EngineRequest,
+    member: &'a str,
+    model: &'a str,
+    estimated_input_tokens: u64,
+) -> AdmissionClaim<'a> {
+    AdmissionClaim {
+        caller: &req.caller,
+        provider: &req.provider_name,
+        member,
+        model,
+        requested_model: &req.core.model.requested,
+        body_hash: &req.body_hash,
+        estimated_input_tokens,
+        max_output_tokens: req
+            .core
+            .sampling
+            .max_tokens
+            .and_then(|n| u64::try_from(n).ok()),
+    }
+}
+
+/// Slot 2 for one request: the per-key allowlist verdict
+/// ([`Admission::authorize`](crate::traits::Admission::authorize)). It runs
+/// once the route plan (slot 3) names the member and model the allowlists
+/// match, and before the idempotency claim (slot 4), the cache lookup and
+/// single-flight (slot 5): a replay, a cached answer or a joined flight must
+/// never answer a key that may no longer run the request. Nothing is
+/// estimated or reserved here.
+async fn authorize_step(
+    inner: &EngineInner,
+    req: &EngineRequest,
+    plan: &RoutePlan,
+) -> Result<(), EngineError> {
+    let (member, model) = first_member_and_model(inner, plan).await;
+    inner
+        .admission
+        .authorize(&admission_claim(req, member, model, 0))
+        .await
+}
+
 /// Slots 6 and 8 for one request: the token estimate, the context-window
 /// preflight (plan 05 step 8) and the admission reservation against the
 /// member the ladder will try first — cooldown reorder included, so the
@@ -371,19 +433,9 @@ async fn admit(
     req: &EngineRequest,
     plan: &RoutePlan,
 ) -> Result<AdmissionTicket, EngineError> {
-    let first = ordered_candidates(inner, plan, OffsetDateTime::now_utc())
-        .await
-        .first()
-        .and_then(|index| plan.candidates.get(*index))
-        .or_else(|| plan.candidates.first());
-    let member = first.map_or("", |candidate| candidate.target.provider_name.as_str());
-    let model = first.map_or("", |candidate| candidate.target.upstream_model.as_str());
+    let (member, model) = first_member_and_model(inner, plan).await;
     let estimated_input_tokens = crate::preflight::estimate_input_tokens(&inner.counter, &req.core);
-    let max_output_tokens = req
-        .core
-        .sampling
-        .max_tokens
-        .and_then(|n| u64::try_from(n).ok());
+    let claim = admission_claim(req, member, model, estimated_input_tokens);
     let preflight_config = inner
         .config
         .load()
@@ -398,20 +450,10 @@ async fn admit(
         crate::preflight::PreflightInput {
             model,
             estimated_input_tokens,
-            max_output_tokens,
+            max_output_tokens: claim.max_output_tokens,
             context_length,
         },
     )?;
-    let claim = crate::traits::AdmissionClaim {
-        caller: &req.caller,
-        provider: &req.provider_name,
-        member,
-        model,
-        requested_model: &req.core.model.requested,
-        body_hash: &req.body_hash,
-        estimated_input_tokens,
-        max_output_tokens,
-    };
     inner.admission.reserve(&claim).await
 }
 
@@ -1096,7 +1138,7 @@ fn record_served_copy(
         }));
 }
 
-/// One non-streaming request pass (slots 3-13). A single-flight follower
+/// One non-streaming request pass (slots 2-13). A single-flight follower
 /// whose leader vanished without publishing (its handler future dropped on a
 /// client disconnect, or a panic) re-executes the request itself once: the
 /// leader's disappearance must not answer the follower with an internal
@@ -1133,6 +1175,11 @@ async fn run_once_attempt(
 ) -> Result<EngineResponse, EngineError> {
     // Slot 3: resolve the route to a plan (one candidate, or a pool's).
     let plan = resolve_plan(inner, req).await?;
+    // Slot 2: the per-key allowlist verdict. It needs the plan's first
+    // member, so it follows slot 3 — and precedes slots 4 and 5, so a key
+    // restricted since an answer was stored for it is refused, not served
+    // that answer. `execute` records the failure row for this error.
+    authorize_step(inner, req, &plan).await?;
     let first_model = plan
         .candidates
         .first()
@@ -1680,6 +1727,20 @@ async fn execute_stream_attempt(
 ) -> Result<EngineStream, EngineError> {
     // Slot 3: the route plan.
     let plan = resolve_plan(&inner, &req).await?;
+    // Slot 2: the per-key allowlist verdict, ahead of the idempotency
+    // replay and the stream shares — the same rule the non-streaming path
+    // follows. No lead exists yet, so there is nothing to publish.
+    if let Err(error) = authorize_step(&inner, &req, &plan).await {
+        emit_response_failed(
+            &inner,
+            &req.request_id,
+            Some(&req.provider_name),
+            Some(&req.core.model),
+            &error,
+            start,
+        );
+        return Err(error);
+    }
     let first_model = plan
         .candidates
         .first()

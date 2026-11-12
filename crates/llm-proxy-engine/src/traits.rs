@@ -217,17 +217,35 @@ impl Router for RegistryRouter {
     }
 }
 
-/// One admission step: reserve budget up front, then settle or refund
-/// (audit conflict 2's resolution). The default admits everything;
-/// [`PolicyAdmission`](crate::admission::PolicyAdmission) enforces per-key
-/// allowlists, rate windows, spend budgets and concurrency caps.
+/// One admission step: authorize the caller, reserve budget up front, then
+/// settle or refund (audit conflict 2's resolution). The default admits
+/// everything; [`PolicyAdmission`](crate::admission::PolicyAdmission)
+/// enforces per-key allowlists, rate windows, spend budgets and concurrency
+/// caps.
 ///
-/// `reserve` is async (it may consult a backend budget store); `settle` is
+/// `authorize` (slot 2) is the verdict that needs no accounting; `reserve`
+/// (slot 6) is async (it may consult a backend budget store); `settle` is
 /// synchronous fire-and-forget accounting, mirroring the contract of
 /// [`EventBus::emit`](llm_proxy_storage::EventBus::emit): implementations
 /// must not block the calling task.
 #[async_trait]
 pub trait Admission: Debug + Send + Sync {
+    /// Slot 2: whether this caller may run this request at all — the
+    /// per-key allowlists. Called before the idempotency claim, the cache
+    /// lookup and single-flight (slots 4 and 5), so a key restricted after
+    /// an answer was stored for it is refused instead of being served that
+    /// answer. No accounting: nothing is reserved here and nothing is
+    /// settled, so implementations must be cheap and side-effect free. The
+    /// claim carries no input estimate yet (`estimated_input_tokens` is 0).
+    ///
+    /// The verdict covers the member the ladder starts on. A failover to a
+    /// later member with a different upstream model is not authorized
+    /// again.
+    async fn authorize(&self, claim: &AdmissionClaim<'_>) -> Result<(), EngineError> {
+        let _ = claim;
+        Ok(())
+    }
+
     /// Reserve capacity (budget, tokens, concurrency) before egress. Returns
     /// an opaque ticket handed back at [`Admission::settle`].
     async fn reserve(&self, claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
@@ -281,7 +299,8 @@ pub struct AdmissionClaim<'a> {
     pub body_hash: &'a str,
     /// The engine's input token estimate (plan 05 step 8's counter): BPE for
     /// known OpenAI models, chars/4 otherwise; tools, tool results and
-    /// images are not counted.
+    /// images are not counted. Zero in the claim [`Admission::authorize`]
+    /// sees: nothing is estimated before the cache lookup.
     pub estimated_input_tokens: u64,
     /// The request's `max_tokens`, when it set one.
     pub max_output_tokens: Option<u64>,
