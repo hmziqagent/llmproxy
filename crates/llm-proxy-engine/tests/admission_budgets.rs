@@ -855,15 +855,21 @@ async fn cache_hits_never_reserve_and_are_recorded_as_hits() {
     assert_eq!(hits, 1, "the hit is recorded as a hit on its ledger row");
 }
 
-/// Records every settlement the engine hands to admission: what a budget
-/// would be charged.
+/// Records every reservation and settlement the engine hands to admission:
+/// what a budget would be charged.
 #[derive(Debug, Default)]
 struct SettlementLog {
+    reserves: AtomicUsize,
     settled: std::sync::Mutex<Vec<(bool, Option<Usage>, Option<Cost>)>>,
 }
 
 #[async_trait]
 impl Admission for SettlementLog {
+    async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        self.reserves.fetch_add(1, Ordering::SeqCst);
+        Ok(AdmissionTicket::default())
+    }
+
     fn settle(&self, _ticket: &AdmissionTicket, outcome: &AdmissionOutcome<'_>) {
         self.settled.lock().expect("settlement log").push((
             outcome.succeeded,
@@ -996,5 +1002,106 @@ async fn a_guard_rejected_stream_prefix_still_charges_what_the_provider_billed()
             .as_deref(),
         Some("0.0008"),
         "priced at the member's 0.0001 per token"
+    );
+}
+
+/// A pre-call guard that refuses any request whose text carries the marker
+/// (mirrors `BlockSecretText` in `open_provider_set.rs`).
+#[derive(Debug)]
+struct RejectMarkedRequest;
+
+#[async_trait]
+impl Guard for RejectMarkedRequest {
+    async fn inspect_request(&self, request: &CoreRequest) -> Result<GuardDecision, EngineError> {
+        let marked = request.messages.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(content, CoreContent::Text { text, .. } if text.contains("forbidden-marker"))
+            })
+        });
+        if marked {
+            Ok(GuardDecision::Reject(
+                "request rejected by test guard".to_owned(),
+            ))
+        } else {
+            Ok(GuardDecision::Allow)
+        }
+    }
+}
+
+fn marked_engine_request(request_id: &str, stream: bool) -> EngineRequest {
+    let mut core = core_request("claude-sonnet-4-6");
+    if let Some(message) = core.messages.first_mut()
+        && let Some(CoreContent::Text { text, .. }) = message.content.first_mut()
+    {
+        *text = "hello forbidden-marker".to_owned();
+    }
+    core.stream = stream;
+    EngineRequest::new(
+        "fake",
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core,
+        InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    )
+    .with_request_id(request_id)
+    .with_caller("anonymous")
+    .with_body_hash(format!("hash-{request_id}"))
+}
+
+#[tokio::test]
+async fn a_guard_refused_stream_reserves_then_refunds() {
+    // Behaviour parity with the non-streaming path: the pre-call guards run
+    // after the budget reservation, so a guard-refused request counts toward
+    // rpm/rpd exactly as a guard-refused non-streaming one does today — and
+    // the reservation is refunded with no usage charged.
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let registry = ProviderRegistry::from_providers(vec![provider(ok, None)]).expect("registry");
+    let log = Arc::new(SettlementLog::default());
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&log) as Arc<dyn Admission>)
+        .guard(Arc::new(RejectMarkedRequest) as Arc<dyn Guard>)
+        .build()
+        .expect("engine");
+
+    let error = engine
+        .execute_stream(marked_engine_request("marked-stream", true))
+        .await
+        .expect_err("the guard refuses the request");
+    assert!(
+        matches!(error, EngineError::InvalidRequest(ref message) if message.contains("guard")),
+        "got {error:?}"
+    );
+    assert_eq!(
+        log.reserves.load(Ordering::SeqCst),
+        1,
+        "the stream reserves before the guards refuse it"
+    );
+    assert_eq!(
+        log.settled.lock().expect("settlement log").as_slice(),
+        [(false, None, None)],
+        "the refusal refunds its reservation with no usage charged"
+    );
+
+    // Parity: a non-streaming refusal produces the identical log.
+    log.reserves.store(0, Ordering::SeqCst);
+    log.settled.lock().expect("settlement log").clear();
+    let error = engine
+        .execute(marked_engine_request("marked", false))
+        .await
+        .expect_err("the guard refuses the request");
+    assert!(matches!(error, EngineError::InvalidRequest(_)));
+    assert_eq!(log.reserves.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        log.settled.lock().expect("settlement log").as_slice(),
+        [(false, None, None)]
     );
 }

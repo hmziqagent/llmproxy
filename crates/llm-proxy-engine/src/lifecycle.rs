@@ -1929,29 +1929,6 @@ async fn execute_stream_attempt(
         }
     }
 
-    // Slot 7: pre-call guards, once per request. A refusal reaches the
-    // joiners through the lead as itself, not through the drop backstop's
-    // internal error.
-    for guard in &inner.guards {
-        let refusal = match guard.inspect_request(&req.core).await {
-            Ok(GuardDecision::Allow) => continue,
-            Ok(GuardDecision::Reject(message)) => EngineError::InvalidRequest(message),
-            Err(error) => error,
-        };
-        emit_response_failed(
-            &inner,
-            &req.request_id,
-            Some(&req.provider_name),
-            Some(&req.core.model),
-            &refusal,
-            start,
-        );
-        if let Some(lead) = stream_lead.take() {
-            lead.publish(Err(refusal.clone()));
-        }
-        return Err(refusal);
-    }
-
     // Slots 6 and 8: preflight, then one reservation for the whole ladder.
     // An admission refusal reaches the joiners as itself (402/429/…), not
     // through the lead drop backstop's internal error — same rule as the
@@ -1973,6 +1950,32 @@ async fn execute_stream_attempt(
             return Err(error);
         }
     };
+
+    // Slot 7: pre-call guards, once per request — after the reservation, so
+    // a refusal reserves and refunds exactly like the non-streaming path's
+    // (the refusal counts toward rpm/rpd). A refusal reaches the joiners
+    // through the lead as itself, not through the drop backstop's internal
+    // error.
+    for guard in &inner.guards {
+        let refusal = match guard.inspect_request(&req.core).await {
+            Ok(GuardDecision::Allow) => continue,
+            Ok(GuardDecision::Reject(message)) => EngineError::InvalidRequest(message),
+            Err(error) => error,
+        };
+        settle(&inner, &ticket, false, None, None);
+        emit_response_failed(
+            &inner,
+            &req.request_id,
+            Some(&req.provider_name),
+            Some(&req.core.model),
+            &refusal,
+            start,
+        );
+        if let Some(lead) = stream_lead.take() {
+            lead.publish(Err(refusal.clone()));
+        }
+        return Err(refusal);
+    }
 
     let request_id = req.request_id.clone();
     let route_name = req.provider_name.clone();
