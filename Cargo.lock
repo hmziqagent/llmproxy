@@ -2758,7 +2758,6 @@ dependencies = [
  "llm-proxy-engine",
  "llm-proxy-protocol",
  "llm-proxy-storage",
- "llm-proxy-store-redis",
  "redis",
  "serde",
  "serde_json",

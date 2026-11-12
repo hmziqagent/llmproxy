@@ -39,7 +39,14 @@ uuid = { workspace = true }
 [dev-dependencies]
 llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { workspace = true }
-# Self dev-dependency: enables `test-server` for this crate's own test
-# targets, so the in-process server in src/test_server.rs serves the
-# integration tests in tests/.
-llm-proxy-store-redis = { workspace = true, features = ["test-server"] }
+
+# `test-server` (the in-process server in src/test_server.rs) is enabled
+# for this crate's own replica_state tests by required-features below,
+# not by a self dev-dependency: cargo resolves a dev-dependency on the
+# crate itself against the registry when packaging, and the crate is not
+# there before its first publish, which fails `cargo publish --dry-run`.
+# Run them with --features test-server; the quality CI job's
+# --all-features run does.
+[[test]]
+name = "replica_state"
+required-features = ["test-server"]
