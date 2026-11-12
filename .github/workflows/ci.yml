@@ -161,6 +161,25 @@ jobs:
             exit 1
           fi
 
+  # The plan-03 done-when "`cargo publish --dry-run` passes for every
+  # published crate", re-proven on every push instead of self-reported.
+  # Every workspace member publishes (all path dependencies carry
+  # version = "0.1.0" via [workspace.dependencies]); cargo publishes
+  # members in dependency order with an in-order local overlay of the
+  # dry-run packages. The bindings/* packages carry publish = false and
+  # are standalone workspace roots outside this workspace.
+  publish-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish dry-run
+        run: cargo publish --workspace --dry-run --locked
+
   # The macOS leg of the plan-10 done-when line (`pip install` and `npm
   # install` work on each platform with no Rust toolchain): builds the
   # universal2 artifacts on a macOS runner, installs the wheel and the
