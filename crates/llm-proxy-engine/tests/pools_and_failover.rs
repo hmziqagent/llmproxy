@@ -18,7 +18,7 @@ use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
 use llm_proxy_core::{
     AffinityConfig, AffinityConflictPolicy, AppConfig, AuthStyle, PoolConfig,
     ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ProviderRouteKind,
-    ProviderRoutesConfig, RetryConfig, ServerConfig,
+    ProviderRoutesConfig, RetryConfig, ServerConfig, UpstreamTimeoutsConfig,
 };
 use llm_proxy_engine::{ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest};
 use llm_proxy_protocol::core::{
@@ -337,18 +337,26 @@ fn ladder_retry() -> RetryConfig {
     }
 }
 
-fn build_engine(
+fn build_engine_with(
+    config: AppConfig,
     providers: Vec<ProviderConfig>,
     pools: Vec<PoolConfig>,
 ) -> (Engine, Arc<RecordingBus>) {
     let registry = ProviderRegistry::from_parts(providers, pools).expect("registry with pools");
     let bus = Arc::new(RecordingBus::new());
-    let engine = EngineBuilder::new(test_config())
+    let engine = EngineBuilder::new(config)
         .providers(Arc::new(registry))
         .event_bus(Arc::<RecordingBus>::clone(&bus) as Arc<dyn EventBus>)
         .build()
         .expect("engine builds");
     (engine, bus)
+}
+
+fn build_engine(
+    providers: Vec<ProviderConfig>,
+    pools: Vec<PoolConfig>,
+) -> (Engine, Arc<RecordingBus>) {
+    build_engine_with(test_config(), providers, pools)
 }
 
 fn core_request(stream: bool) -> CoreRequest {
@@ -727,6 +735,110 @@ async fn the_ladder_deadline_spans_all_attempts() {
     assert!(
         started.elapsed() < Duration::from_millis(400),
         "the ladder stopped at its deadline instead of sleeping the full backoff"
+    );
+}
+
+/// A always-500 upstream plus a long backoff: whichever deadline the ladder
+/// honours decides whether it retries past 400ms.
+async fn spawn_racing_deadline_upstream() -> String {
+    spawn_upstream(upstream_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"down"}"#,
+    ))
+    .await
+}
+
+fn racing_deadline_pool() -> PoolConfig {
+    pool(
+        "racing",
+        vec!["failing"],
+        RetryConfig {
+            max_attempts: 5,
+            backoff: Duration::from_millis(500),
+            cooldown: Duration::from_millis(50),
+            total_timeout: Duration::ZERO,
+            hold: Duration::ZERO,
+        },
+        Default::default(),
+    )
+}
+
+#[tokio::test]
+async fn the_server_total_tightens_a_looser_route_deadline() {
+    // The route allows ten seconds; the server-wide upstream total of 100ms
+    // must cut the ladder short anyway (fix brief 04-3). `first_byte` is
+    // shrunk below the total so the config stays self-consistent even though
+    // constructing it directly skips validation.
+    let failing = spawn_racing_deadline_upstream().await;
+    let mut config = test_config();
+    config.server.upstream_timeouts = UpstreamTimeoutsConfig {
+        first_byte: Duration::from_millis(50),
+        total: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let mut route = ladder_retry();
+    route.max_attempts = 5;
+    route.backoff = Duration::from_millis(500);
+    route.total_timeout = Duration::from_secs(10);
+    let (engine, _bus) = build_engine_with(
+        config,
+        vec![member("failing", failing, None)],
+        vec![PoolConfig {
+            retry: route,
+            ..racing_deadline_pool()
+        }],
+    );
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .execute(engine_request("racing", false))
+        .await
+        .expect_err("the server total stops the ladder");
+    assert!(
+        matches!(error, EngineError::RetryExhausted { .. }),
+        "the deadline exhaustion is reported as an exhausted ladder, got {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "the ladder honoured the server total instead of running to the 10s route deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_looser_server_total_does_not_loosen_the_route_deadline() {
+    // The inverse: a ten-second server total must not push the ladder past
+    // the route's own 100ms deadline.
+    let failing = spawn_racing_deadline_upstream().await;
+    let mut config = test_config();
+    config.server.upstream_timeouts = UpstreamTimeoutsConfig {
+        total: Some(Duration::from_secs(10)),
+        ..Default::default()
+    };
+    let mut route = ladder_retry();
+    route.max_attempts = 5;
+    route.backoff = Duration::from_millis(500);
+    route.total_timeout = Duration::from_millis(100);
+    let (engine, _bus) = build_engine_with(
+        config,
+        vec![member("failing", failing, None)],
+        vec![PoolConfig {
+            retry: route,
+            ..racing_deadline_pool()
+        }],
+    );
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .execute(engine_request("racing", false))
+        .await
+        .expect_err("the route deadline still stops the ladder");
+    assert!(
+        matches!(error, EngineError::RetryExhausted { .. }),
+        "the deadline exhaustion is reported as an exhausted ladder, got {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "the ladder honoured the route deadline instead of running to the 10s server total"
     );
 }
 
