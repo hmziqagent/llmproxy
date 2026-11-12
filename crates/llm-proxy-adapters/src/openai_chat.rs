@@ -271,6 +271,7 @@ impl OpenAiChatStreamDecoder {
                     index: block_idx,
                     id: tool_id,
                     name: func_name.to_owned(),
+                    signature: None,
                 });
 
                 self.content_index += 1;

@@ -302,6 +302,7 @@ impl ResponsesStreamDecoder {
             index: block_idx,
             id: call_id,
             name,
+            signature: None,
         });
     }
 
@@ -329,6 +330,7 @@ impl ResponsesStreamDecoder {
             index: block_idx,
             id: synthetic_id,
             name: "<missing_function_name>".to_owned(),
+            signature: None,
         });
         block_idx
     }
@@ -1403,9 +1405,9 @@ mod tests {
         let starts: Vec<_> = all_events
             .iter()
             .filter_map(|e| match e {
-                CoreEvent::ToolCallStart { index, id, name } => {
-                    Some((*index, id.clone(), name.clone()))
-                }
+                CoreEvent::ToolCallStart {
+                    index, id, name, ..
+                } => Some((*index, id.clone(), name.clone())),
                 _ => None,
             })
             .collect();

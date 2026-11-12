@@ -745,7 +745,9 @@ impl StreamEncoder {
                 }));
             }
 
-            CoreEvent::ToolCallStart { index, id, name } => {
+            CoreEvent::ToolCallStart {
+                index, id, name, ..
+            } => {
                 let clamped = clamp_tool_index(index);
                 chunks.push(self.make_chunk(Choice {
                     index: 0,
@@ -1688,6 +1690,7 @@ mod tests {
                 index: 0,
                 id: "call_1".into(),
                 name: "get_weather".into(),
+                signature: None,
             })
             .unwrap();
         assert_eq!(start.len(), 1);
@@ -1999,6 +2002,7 @@ mod tests {
                 index: 2,
                 id: "call_1".into(),
                 name: "fn".into(),
+                signature: None,
             },
             CoreEvent::ToolCallDelta {
                 index: 2,

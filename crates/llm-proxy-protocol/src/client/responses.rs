@@ -1081,7 +1081,9 @@ impl StreamEncoder {
                 payload.insert("delta".into(), Value::String(text));
                 events.push(self.event("response.reasoning_summary_text.delta", payload));
             }
-            CoreEvent::ToolCallStart { index, id, name } => {
+            CoreEvent::ToolCallStart {
+                index, id, name, ..
+            } => {
                 self.close_open_items(&mut events);
                 let item = EncodedItem {
                     item_id: format!("fc_{}", self.output_index),
@@ -1565,6 +1567,7 @@ mod tests {
                     index: 1,
                     id: "call_9".into(),
                     name: "shell".into(),
+                    signature: None,
                 },
                 CoreEvent::ToolCallDelta {
                     index: 1,

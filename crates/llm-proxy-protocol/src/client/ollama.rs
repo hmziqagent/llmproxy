@@ -982,6 +982,7 @@ mod tests {
                 index: 1,
                 id: "x".into(),
                 name: "shell".into(),
+                signature: None,
             },
             CoreEvent::ToolCallDelta {
                 index: 1,

@@ -90,7 +90,11 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
             }
 
             if let Some(ref function_call) = part.function_call {
-                self.push_function_call(function_call, &mut events);
+                self.push_function_call(
+                    function_call,
+                    part.thought_signature.as_deref(),
+                    &mut events,
+                );
             }
         }
 
@@ -175,6 +179,7 @@ impl GeminiStreamDecoder {
     fn push_function_call(
         &mut self,
         function_call: &GeminiFunctionCall,
+        signature: Option<&str>,
         events: &mut Vec<CoreEvent>,
     ) {
         self.close_content_if_open();
@@ -187,6 +192,9 @@ impl GeminiStreamDecoder {
             index: block_idx,
             id: format!("gemini_call_{}", self.tool_id_counter),
             name: function_call.name.clone(),
+            // Streaming must carry the thought signature exactly like the
+            // non-streaming decode does, or the replayed call degrades.
+            signature: signature.map(str::to_owned),
         });
         self.tool_id_counter += 1;
 
@@ -1703,6 +1711,61 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CoreEvent::UsageDelta { .. })),
             "usage-only chunk must emit UsageDelta"
+        );
+    }
+
+    #[test]
+    fn stream_function_call_captures_thought_signature() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}},"thoughtSignature":"sig-1"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+        );
+
+        let events = decoder.decode_frame(&frame).unwrap();
+
+        let signature = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::ToolCallStart { signature, .. } => Some(signature.clone()),
+                _ => None,
+            })
+            .expect("ToolCallStart from the functionCall part");
+        assert_eq!(
+            signature.as_deref(),
+            Some("sig-1"),
+            "the streamed functionCall part's thoughtSignature must ride ToolCallStart"
+        );
+    }
+
+    #[test]
+    fn stream_function_call_without_thought_signature_has_none() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+        );
+
+        let events = decoder.decode_frame(&frame).unwrap();
+
+        let has_start = events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::ToolCallStart { .. }));
+        assert!(has_start, "expected a ToolCallStart");
+        let signature = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::ToolCallStart { signature, .. } => Some(signature.is_none()),
+                _ => None,
+            })
+            .expect("ToolCallStart from the functionCall part");
+        assert!(
+            signature,
+            "an unsigned functionCall part must yield signature: None"
         );
     }
 

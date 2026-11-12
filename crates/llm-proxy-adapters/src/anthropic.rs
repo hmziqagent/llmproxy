@@ -302,6 +302,7 @@ impl AnthropicStreamDecoder {
                     index: idx,
                     id,
                     name: original_name,
+                    signature: None,
                 });
             }
             _ => {

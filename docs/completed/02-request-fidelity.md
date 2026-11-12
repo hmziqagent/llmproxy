@@ -121,7 +121,9 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   opaque signature: Gemini `thoughtSignature` values are captured on
   `functionCall` parts and re-emitted on both the replayed `functionCall` part
   and the matching `functionResponse` part; they ride the Anthropic client
-  wire on `tool_use.signature`. An explicitly empty `reasoning_content`
+  wire on `tool_use.signature`, for streamed tool calls too
+  (`CoreEvent::ToolCallStart.signature` → the streamed `content_block_start`
+  `tool_use` block). An explicitly empty `reasoning_content`
   round-trips as an empty thinking block instead of vanishing.
 - **Header allowlist (step 7, row 12, backlog 10).** `ProxyRequest` gained
   `forwarded_headers`; the pipeline selects inbound headers through the

@@ -810,6 +810,10 @@ pub enum CoreEvent {
         id: String,
         /// Name of the tool being called.
         name: String,
+        /// Provider signature accompanying the call (e.g. a Gemini thought
+        /// signature), which clients must replay with the call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// Incremental tool-call arguments.
     ToolCallDelta {
@@ -867,11 +871,17 @@ impl fmt::Debug for CoreEvent {
                 .field("index", &index)
                 .field("text", &text)
                 .finish(),
-            CoreEvent::ToolCallStart { index, id, name } => f
+            CoreEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                signature,
+            } => f
                 .debug_struct("ToolCallStart")
                 .field("index", &index)
                 .field("id", &id)
                 .field("name", &name)
+                .field("signature", &signature.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
             CoreEvent::ToolCallDelta { index, args_delta } => f
                 .debug_struct("ToolCallDelta")
@@ -1414,6 +1424,7 @@ mod tests {
                 index: 2,
                 id: "call_1".into(),
                 name: "get_weather".into(),
+                signature: Some("sig_rt".into()),
             },
             CoreEvent::ToolCallDelta {
                 index: 2,

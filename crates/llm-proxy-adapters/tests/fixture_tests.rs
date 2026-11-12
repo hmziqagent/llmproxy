@@ -945,7 +945,9 @@ mod tests {
                         );
                     }
                 }
-                CoreEvent::ToolCallStart { index, id, name } => {
+                CoreEvent::ToolCallStart {
+                    index, id, name, ..
+                } => {
                     if let Some(exp_id) = expected.get("id") {
                         assert_eq!(
                             id,

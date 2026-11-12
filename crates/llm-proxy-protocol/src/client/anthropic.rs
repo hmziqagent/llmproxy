@@ -823,16 +823,26 @@ impl StreamEncoder {
                 });
             }
 
-            CoreEvent::ToolCallStart { index, id, name } => {
+            CoreEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                signature,
+            } => {
+                let mut block = ContentBlock::new_tool_use(
+                    id,
+                    name,
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+                // Tool-call signatures (e.g. Gemini thought signatures routed
+                // through an Anthropic-dialect client) ride the `signature`
+                // field so clients that replay blocks verbatim return them.
+                block.signature = signature;
                 events.push(MessageEvent {
                     r#type: "content_block_start".to_owned(),
                     message: None,
                     index: Some(index),
-                    content_block: Some(ContentBlock::new_tool_use(
-                        id,
-                        name,
-                        serde_json::Value::Object(serde_json::Map::new()),
-                    )),
+                    content_block: Some(block),
                     delta: None,
                     usage: None,
                     error: None,
@@ -1690,6 +1700,7 @@ mod tests {
                 index: 0,
                 id: "tu_1".into(),
                 name: "get_weather".into(),
+                signature: None,
             })
             .unwrap();
         assert_eq!(start_events.len(), 1);
@@ -1720,6 +1731,46 @@ mod tests {
     }
 
     #[test]
+    fn stream_tool_call_start_with_signature_emits_signature_on_block() {
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        let events = enc
+            .encode_event(CoreEvent::ToolCallStart {
+                index: 0,
+                id: "tu_1".into(),
+                name: "get_weather".into(),
+                signature: Some("sig-1".into()),
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].r#type, "content_block_start");
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            json["content_block"]["signature"], "sig-1",
+            "the signature must ride the content_block_start tool_use block: {json}"
+        );
+    }
+
+    #[test]
+    fn stream_tool_call_start_without_signature_omits_the_key() {
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        let events = enc
+            .encode_event(CoreEvent::ToolCallStart {
+                index: 0,
+                id: "tu_1".into(),
+                name: "get_weather".into(),
+                signature: None,
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].r#type, "content_block_start");
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert!(
+            json["content_block"].get("signature").is_none(),
+            "no signature on the event must mean no signature key on the block: {json}"
+        );
+    }
+
+    #[test]
     fn streaming_content_start_tool_use_defers_to_tool_call_start() {
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
 
@@ -1740,6 +1791,7 @@ mod tests {
                 index: 0,
                 id: "tu_1".into(),
                 name: "get_weather".into(),
+                signature: None,
             })
             .unwrap();
         assert_eq!(tool_start_events.len(), 1);
@@ -2046,6 +2098,7 @@ mod tests {
                 index: 2,
                 id: "tu_1".into(),
                 name: "fn".into(),
+                signature: None,
             },
             CoreEvent::ToolCallDelta {
                 index: 2,
