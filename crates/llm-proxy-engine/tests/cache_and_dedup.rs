@@ -2391,3 +2391,262 @@ async fn a_tightened_allowlist_beats_a_cached_answer_on_the_streaming_path() {
         completed_rows(&bus)
     );
 }
+
+/// The two registry counts the engine's `Debug` output carries —
+/// `SingleFlight { in_flight: N }` and `StreamShares { in_flight: M }`, in
+/// that order — parsed with `str::find` and `parse`, so the probe needs no
+/// second public path onto the registries.
+fn in_flight(engine: &Engine) -> (usize, usize) {
+    let debug = format!("{engine:?}");
+    let count = |marker: &str| {
+        let at = debug.find(marker).map_or_else(
+            || panic!("the engine Debug output lacks {marker:?}: {debug}"),
+            |found| found + marker.len(),
+        );
+        let rest = &debug[at..];
+        let end = rest
+            .find(" }")
+            .unwrap_or_else(|| panic!("no count terminates after {marker:?}: {debug}"));
+        rest[..end]
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("the count after {marker:?} is not a number: {error}"))
+    };
+    (
+        count("SingleFlight { in_flight: "),
+        count("StreamShares { in_flight: "),
+    )
+}
+
+/// A streaming upstream that waits `delay` and then streams cleanly to its
+/// terminal, so a leader stays in flight while a joiner parks on its share.
+fn clean_stream_upstream(calls: Arc<AtomicUsize>, delay: Duration) -> Router {
+    Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                let chunks = vec![
+                    bytes::Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_drain\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"drained\"}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ),
+                ];
+                let body_stream =
+                    futures::stream::iter(chunks).map(Ok::<_, std::convert::Infallible>);
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the five kinds of end share one engine state: sampling the registries \
+              after each in one test is what makes the drain claim cover success, \
+              failure, a vanished leader and both stream ends"
+)]
+#[tokio::test]
+async fn single_flight_registries_drain_after_every_kind_of_end() {
+    // Plan 06's Done statement, "nothing is retained after completion":
+    // every way a flight or a share can end — a successful shared run, a
+    // failing shared run, a leader aborted mid-flight, a clean shared
+    // stream, a mid-stream failure — must leave both registries empty.
+    let upstream = CountingUpstream::new(Duration::from_millis(150));
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let engine = build_engine(endpoint, Arc::new(RecordingBus::new()), None);
+
+    // 1. The probe is not vacuous: a leader mid-flight is visible in
+    //    SingleFlight, and only there.
+    let leader_engine = engine.clone();
+    let probe = tokio::spawn(async move {
+        leader_engine
+            .execute(engine_request(false, "drain probe", "caller-a", None))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        in_flight(&engine),
+        (1, 0),
+        "the probe must see the running leader's flight: {engine:?}"
+    );
+    probe
+        .await
+        .expect("the probe's task joins")
+        .expect("the probe's leader completes");
+
+    // 2. A successful shared run (four callers, one flight) drains.
+    let mut requests = Vec::new();
+    for i in 0..4 {
+        let engine = engine.clone();
+        requests.push(async move {
+            engine
+                .execute(
+                    engine_request(false, "drain shared", "caller-a", None)
+                        .with_request_id(format!("req-{i}")),
+                )
+                .await
+        });
+    }
+    for result in futures::future::join_all(requests).await {
+        result.expect("the shared run succeeds");
+    }
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        2,
+        "one probe call plus one shared upstream call"
+    );
+    assert_eq!(
+        in_flight(&engine),
+        (0, 0),
+        "the successful shared run releases its flight"
+    );
+
+    // 3. A failing shared run drains.
+    let failing = CountingUpstream::failing_after(Duration::from_millis(150));
+    let failing_engine = build_engine(
+        spawn_upstream(failing.router()).await,
+        Arc::new(RecordingBus::new()),
+        None,
+    );
+    let leader = failing_engine.execute(engine_request(false, "drain failing", "caller-a", None));
+    let joiner = failing_engine.execute(engine_request(false, "drain failing", "caller-a", None));
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+    assert!(
+        matches!(leader, Err(EngineError::Upstream { status: 500, .. })),
+        "the leader fails: {leader:?}"
+    );
+    assert!(
+        matches!(joiner, Err(EngineError::Upstream { status: 500, .. })),
+        "the joiner shares the failure: {joiner:?}"
+    );
+    assert_eq!(
+        in_flight(&failing_engine),
+        (0, 0),
+        "the failing shared run releases its flight"
+    );
+
+    // 4. A leader aborted mid-flight drains once its joiner re-runs.
+    let leader_engine = engine.clone();
+    let leader = tokio::spawn(async move {
+        leader_engine
+            .execute(engine_request(false, "drain vanish", "caller-a", None))
+            .await
+    });
+    let joiner_engine = engine.clone();
+    let joiner = tokio::spawn(async move {
+        joiner_engine
+            .execute(
+                engine_request(false, "drain vanish", "caller-a", None)
+                    .with_request_id("req-joiner"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        3,
+        "only the vanished leader's call is new; the joiner is parked on its flight"
+    );
+    assert!(
+        !joiner.is_finished(),
+        "the joiner is parked on the vanished leader's flight"
+    );
+    leader.abort();
+    let response = joiner
+        .await
+        .expect("the joiner task joins")
+        .expect("the joiner re-runs the request itself");
+    assert_eq!(response_text(&response), "hello from upstream");
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        4,
+        "the joiner's re-execution ran upstream"
+    );
+    assert_eq!(
+        in_flight(&engine),
+        (0, 0),
+        "the aborted leader's release must drain the registry"
+    );
+
+    // 5. Streaming: a clean shared stream drains its share...
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_engine = build_engine(
+        spawn_upstream(clean_stream_upstream(
+            Arc::clone(&calls),
+            Duration::from_millis(120),
+        ))
+        .await,
+        Arc::new(RecordingBus::new()),
+        None,
+    );
+    let leader =
+        stream_engine.execute_stream(engine_request(true, "drain clean stream", "caller-a", None));
+    let joiner = stream_engine.execute_stream(
+        engine_request(true, "drain clean stream", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+    let leader_events = collect_stream(leader.expect("leader streams")).await;
+    let joiner_events = collect_stream(joiner.expect("joiner joins the shared stream")).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(leader_events, joiner_events);
+    assert!(
+        joiner_events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the clean shared stream reached its terminal: {joiner_events:?}"
+    );
+    assert_eq!(
+        in_flight(&stream_engine),
+        (0, 0),
+        "the clean shared stream releases its share"
+    );
+
+    // ...and the mid_stream_failure_upstream stream drains too.
+    let failed_calls = Arc::new(AtomicUsize::new(0));
+    let failed_stream_engine = build_engine(
+        spawn_upstream(mid_stream_failure_upstream(
+            Arc::clone(&failed_calls),
+            Duration::from_millis(120),
+        ))
+        .await,
+        Arc::new(RecordingBus::new()),
+        None,
+    );
+    let stream = failed_stream_engine
+        .execute_stream(engine_request(
+            true,
+            "drain failing stream",
+            "caller-a",
+            None,
+        ))
+        .await
+        .expect("the stream commits before failing");
+    let events = collect_stream(stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::Error { .. })),
+        "the stream fails in-band: {events:?}"
+    );
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        in_flight(&failed_stream_engine),
+        (0, 0),
+        "the mid-stream failure releases its share"
+    );
+}
