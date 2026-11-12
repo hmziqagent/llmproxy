@@ -20,8 +20,9 @@ mod tests {
     };
     use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
-        AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
-        ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+        AppConfig, AuthStyle, PoolConfig, PoolFile, ProviderAdapterConfig, ProviderCatalogConfig,
+        ProviderCatalogMode, ProviderConfig, ProviderRegistry, ProviderRouteKind,
+        ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
     };
     use llm_proxy_server::{AppState, BuildInfo, build_router};
     use llm_proxy_storage::{
@@ -341,6 +342,28 @@ mod tests {
         route: ProviderRouteKind,
         chat_route: bool,
     ) -> AppState {
+        let provider = provider_config(
+            "dialect-provider",
+            upstream,
+            protocol,
+            route,
+            chat_route,
+            None,
+        );
+        state_from(vec![provider], Vec::new())
+    }
+
+    /// A `ProviderConfig` named `name`, serving `route` (and optionally the
+    /// chat-completions route) via `protocol` at the fake upstream, with an
+    /// optional model catalog.
+    fn provider_config(
+        name: &str,
+        upstream: &FakeUpstream,
+        protocol: &str,
+        route: ProviderRouteKind,
+        chat_route: bool,
+        catalog: Option<ProviderCatalogConfig>,
+    ) -> ProviderConfig {
         let adapter_name = "upstream";
         let endpoint = match protocol {
             "anthropic_messages" => format!("{}/v1/messages", upstream.base_url),
@@ -353,8 +376,8 @@ mod tests {
             }
             _ => format!("{}/v1/chat/completions", upstream.base_url),
         };
-        let provider = ProviderConfig {
-            name: "dialect-provider".to_owned(),
+        ProviderConfig {
+            name: name.to_owned(),
             api_key: secrecy::SecretString::from("operator-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
@@ -389,13 +412,18 @@ mod tests {
             },
             model_aliases: HashMap::new(),
             discovery: None,
-            catalog: None,
+            catalog,
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
             prompt_cache: None,
-        };
-        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        }
+    }
+
+    /// App state over `providers` and `pools`, against the shared server
+    /// config every scenario in this file uses.
+    fn state_from(providers: Vec<ProviderConfig>, pools: Vec<PoolConfig>) -> AppState {
+        let registry = ProviderRegistry::from_parts(providers, pools).expect("registry");
         AppState::new(
             AppConfig {
                 server: ServerConfig {
@@ -435,6 +463,16 @@ mod tests {
                 git_sha: "test",
             },
         )
+    }
+
+    /// A static catalog entry with only its id set.
+    fn catalog_entry(id: &str) -> StaticModelCatalogEntry {
+        StaticModelCatalogEntry {
+            id: id.to_owned(),
+            display_name: None,
+            supports: Vec::new(),
+            context_length: None,
+        }
     }
 
     async fn body_text(response: axum::http::Response<Body>) -> String {
@@ -1738,18 +1776,27 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // /api/tags lists the provider's models in the Ollama shape.
+    // /api/tags lists the provider's static catalog in the Ollama shape,
+    // the deduplicated union of a pool's member catalogs, and a 404 in
+    // Ollama error shape for an unknown provider.
     // ------------------------------------------------------------------
 
     #[tokio::test]
     async fn ollama_tags_lists_models_from_the_catalog() {
         let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
-        let state = state_with_provider(
+        let provider = provider_config(
+            "dialect-provider",
             &upstream,
             "anthropic_messages",
             ProviderRouteKind::ChatCompletions,
             true,
+            Some(ProviderCatalogConfig {
+                mode: ProviderCatalogMode::Static,
+                models: vec![catalog_entry("alpha-model"), catalog_entry("beta-model")],
+                ..Default::default()
+            }),
         );
+        let state = state_from(vec![provider], Vec::new());
         let response = build_router(state)
             .oneshot(
                 Request::builder()
@@ -1762,13 +1809,102 @@ mod tests {
             .expect("served");
         assert_eq!(response.status(), StatusCode::OK);
         let value: Value = serde_json::from_str(&body_text(response).await).expect("json response");
-        let models = value["models"].as_array().cloned().unwrap_or_default();
-        // The static catalog seeds a default model set; the shape is what the
-        // assertion pins (name + model per entry).
-        for model in &models {
-            assert!(model["name"].is_string(), "{model}");
-            assert!(model["model"].is_string(), "{model}");
-        }
+        assert_eq!(
+            value["models"],
+            json!([
+                {"name": "alpha-model", "model": "alpha-model"},
+                {"name": "beta-model", "model": "beta-model"},
+            ]),
+            "the catalog must list exactly its two static entries, name == model"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_tags_for_a_pool_lists_the_deduplicated_union() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let dialect_a = provider_config(
+            "dialect-a",
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+            Some(ProviderCatalogConfig {
+                mode: ProviderCatalogMode::Static,
+                models: vec![catalog_entry("alpha"), catalog_entry("shared")],
+                ..Default::default()
+            }),
+        );
+        let dialect_b = provider_config(
+            "dialect-b",
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+            Some(ProviderCatalogConfig {
+                mode: ProviderCatalogMode::Static,
+                models: vec![catalog_entry("shared"), catalog_entry("beta")],
+                ..Default::default()
+            }),
+        );
+        let pool = toml::from_str::<PoolFile>(
+            "[pool]\nname=\"duo\"\nmembers=[\"dialect-a\",\"dialect-b\"]\n",
+        )
+        .expect("pool file parses")
+        .pool;
+        let state = state_from(vec![dialect_a, dialect_b], vec![pool]);
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/providers/duo/api/tags")
+                    .body(Body::empty())
+                    .expect("body"),
+            )
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&body_text(response).await).expect("json response");
+        let names: Vec<&str> = value["models"]
+            .as_array()
+            .expect("models is an array")
+            .iter()
+            .map(|model| model["name"].as_str().expect("name is a string"))
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha", "shared", "beta"],
+            "union of both members' catalogs, shared listed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_tags_for_an_unknown_provider_is_a_not_found_error_in_ollama_shape() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+        );
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/providers/nope/api/tags")
+                    .body(Body::empty())
+                    .expect("body"),
+            )
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let value: Value = serde_json::from_str(&body_text(response).await).expect("json response");
+        let error = value["error"]
+            .as_str()
+            .expect("ollama error body: error is a string");
+        assert!(
+            error.contains("nope"),
+            "the message names the provider: {error}"
+        );
     }
 
     // ------------------------------------------------------------------
