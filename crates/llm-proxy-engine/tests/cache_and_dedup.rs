@@ -635,6 +635,27 @@ async fn the_cache_evicts_oldest_entries_at_its_bound() {
     );
 }
 
+/// An admission step that counts reservations and settlements, so the
+/// idempotency tests can prove a replay and an in-flight 409 never reach
+/// the budget reservation: only a request that executes reaches slot 6.
+#[derive(Debug, Default)]
+struct CountingAdmission {
+    reserves: AtomicUsize,
+    settles: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Admission for CountingAdmission {
+    async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        self.reserves.fetch_add(1, Ordering::SeqCst);
+        Ok(AdmissionTicket::default())
+    }
+
+    fn settle(&self, _ticket: &AdmissionTicket, _outcome: &AdmissionOutcome<'_>) {
+        self.settles.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn idempotency_config() -> AppConfig {
     let mut config = test_config();
     config.server.idempotency = IdempotencyConfig {
@@ -660,7 +681,14 @@ async fn idempotency_key_replays_after_completion_and_409s_while_in_flight() {
     let upstream = CountingUpstream::new(Duration::from_millis(150));
     let endpoint = spawn_upstream(upstream.router()).await;
     let bus = Arc::new(RecordingBus::new());
-    let engine = build_idempotent_engine(endpoint, Arc::clone(&bus));
+    let admission = Arc::new(CountingAdmission::default());
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        idempotency_config(),
+        Arc::clone(&bus),
+        Some(Arc::clone(&admission) as Arc<dyn Admission>),
+        None,
+    );
 
     // While the first is in flight, a matching retry is 409 — only then.
     let leader_engine = engine.clone();
@@ -674,7 +702,20 @@ async fn idempotency_key_replays_after_completion_and_409s_while_in_flight() {
             ))
             .await
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // The leader's reservation (slot 6) precedes its upstream call, so once
+    // the upstream sees the request the admission counts are final until the
+    // leader completes — which it has not (the upstream answers after 150 ms).
+    let mut waited_ms = 0;
+    while upstream.calls.load(Ordering::SeqCst) == 0 && waited_ms < 3_000 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        waited_ms += 5;
+    }
+    assert!(
+        upstream.calls.load(Ordering::SeqCst) > 0,
+        "the leader never reached the upstream"
+    );
+    let reserved_before_409 = admission.reserves.load(Ordering::SeqCst);
+    let settled_before_409 = admission.settles.load(Ordering::SeqCst);
     let conflict = engine
         .execute(engine_request(
             false,
@@ -689,13 +730,25 @@ async fn idempotency_key_replays_after_completion_and_409s_while_in_flight() {
         "got {conflict:?}"
     );
     assert_eq!(conflict.status_code(), 409);
+    assert_eq!(
+        admission.reserves.load(Ordering::SeqCst),
+        reserved_before_409,
+        "the in-flight 409 must not reserve budget"
+    );
+    assert_eq!(
+        admission.settles.load(Ordering::SeqCst),
+        settled_before_409,
+        "the in-flight 409 must not settle a reservation"
+    );
     let first = first
         .await
         .expect("join of the spawned first request")
         .expect("first completes");
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
 
-    // A retry after completion replays the stored response — no second call.
+    // A retry after completion replays the stored response — no second call,
+    // and no second reservation: the replay is answered at slot 4, before
+    // the budget check (plan 06 step 3).
     let replay = engine
         .execute(engine_request(
             false,
@@ -707,6 +760,16 @@ async fn idempotency_key_replays_after_completion_and_409s_while_in_flight() {
         .expect("matching retry replays");
     assert_eq!(response_text(&replay), response_text(&first));
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        admission.reserves.load(Ordering::SeqCst),
+        1,
+        "only the executing request may reserve budget"
+    );
+    assert_eq!(
+        admission.settles.load(Ordering::SeqCst),
+        1,
+        "only the executing request may settle"
+    );
 
     let rows = completed_rows(&bus);
     assert_eq!(rows.len(), 2);
@@ -855,7 +918,14 @@ async fn a_streaming_outcome_replays_as_a_stream_for_a_matching_retry() {
     );
     let endpoint = spawn_upstream(app).await;
     let bus = Arc::new(RecordingBus::new());
-    let engine = build_idempotent_engine(endpoint, Arc::clone(&bus));
+    let admission = Arc::new(CountingAdmission::default());
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        idempotency_config(),
+        Arc::clone(&bus),
+        Some(Arc::clone(&admission) as Arc<dyn Admission>),
+        None,
+    );
 
     let first = engine
         .execute_stream(engine_request(
@@ -890,6 +960,16 @@ async fn a_streaming_outcome_replays_as_a_stream_for_a_matching_retry() {
     assert_eq!(
         events, replayed,
         "the replay yields exactly the stored events"
+    );
+    assert_eq!(
+        admission.reserves.load(Ordering::SeqCst),
+        1,
+        "only the first stream may reserve budget; the replay never reaches admission"
+    );
+    assert_eq!(
+        admission.settles.load(Ordering::SeqCst),
+        1,
+        "only the first stream may settle"
     );
 
     let rows = completed_rows(&bus);
