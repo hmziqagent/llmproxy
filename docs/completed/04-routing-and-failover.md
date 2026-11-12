@@ -85,11 +85,16 @@ Add pools, retries and failover on top of the routing decision in the
   `a_rejected_key_cools_the_key_not_the_member`).
 - Pre-output failover is the hold budget: the buffer phase holds the
   response for the configured window (committing an empty head when it
-  expires in silence, heartbeats covering the gap), fails over before the
-  first byte, and after commit every failure is in-band with a terminal
-  event and a failed row (`a_stream_that_fails_before_commit_fails_over`,
+  expires in silence; heartbeats start at the commit — with `hold = 0`
+  (default) there is no response, hence no heartbeat, until the first
+  event), fails over before the first byte, and after commit every
+  failure is in-band with a terminal event and a failed row
+  (`a_stream_that_fails_before_commit_fails_over`,
   `a_stream_that_fails_after_commit_ends_with_an_in_band_error…`,
-  `the_hold_budget_commits_a_silent_stream_and_covers_the_gap`).
+  `the_hold_budget_commits_a_silent_stream_and_covers_the_gap`; the
+  heartbeat wire frame and the no-hold-no-response rule are pinned over
+  HTTP in `a_committed_silent_stream_emits_keepalive_comments` and
+  `a_stream_with_no_hold_budget_sends_nothing_before_the_first_event`).
 - Connect/first-byte/idle/total timeouts come from
   `server.upstream_timeouts`, validated at config load
   (`validate_upstream_timeouts`);
