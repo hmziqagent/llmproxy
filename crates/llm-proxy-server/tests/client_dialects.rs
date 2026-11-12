@@ -1229,6 +1229,59 @@ mod tests {
         );
     }
 
+    // A tool-level `strict: true` on a Responses function tool carries the
+    // client's structured-output guarantee; crossing to a protocol with no
+    // equivalent must reject it by name, never silently drop it.
+    #[tokio::test]
+    async fn responses_strict_tool_is_rejected_by_name_cross_format() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let mut body = responses_request(false);
+        body["tools"][0]["strict"] = json!(true);
+        let response = build_router(state)
+            .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("strict") && text.contains("get_weather"),
+            "the rejection must name strict and the tool: {text}"
+        );
+    }
+
+    // Same-format Responses passthrough forwards the raw body, so the
+    // tool-level `strict` flag survives untouched.
+    #[tokio::test]
+    async fn responses_strict_tool_survives_same_format() {
+        let upstream = spawn_fake_upstream(Behavior::ResponsesNonStream).await;
+        let state = state_with_provider(
+            &upstream,
+            "openai_responses",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let app = build_router(state);
+        let mut body = responses_request(false);
+        body["tools"][0]["strict"] = json!(true);
+        let response = app
+            .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_body = captured(&upstream).await;
+        assert_eq!(
+            upstream_body["tools"][0]["strict"],
+            json!(true),
+            "same-format passthrough must keep tools[0].strict"
+        );
+    }
+
     // Same-format Responses streaming: the upstream's Responses SSE decodes
     // and re-encodes back into Responses SSE.
     #[tokio::test]

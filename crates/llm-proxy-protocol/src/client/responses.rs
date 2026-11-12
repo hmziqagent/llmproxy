@@ -452,7 +452,10 @@ fn decode_input_image(part: &Map<String, Value>) -> Result<Option<Value>, Protoc
 /// Function tools decode into core tools; every other tool type is a server
 /// tool the core cannot represent — it stays out of the core list (the
 /// cross-format policy rejects it by name; same-format passthrough carries
-/// the raw body untouched).
+/// the raw body untouched). A tool-level `strict` flag is intentionally not
+/// part of the core tool: same-format passthrough keeps it in the raw body,
+/// and the cross-format policy (`check_strict_function_tools`) rejects
+/// `strict: true` by name instead of silently dropping it.
 fn decode_tools(tools: Option<&Value>) -> Result<Vec<CoreTool>, ProtocolError> {
     let Some(Value::Array(items)) = tools else {
         return Ok(Vec::new());
@@ -1261,7 +1264,8 @@ mod tests {
                 "type": "function",
                 "name": "shell",
                 "description": "Run a shell command",
-                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"], "strict": true}
+                "strict": true,
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}
             }],
             "tool_choice": "auto",
             "parallel_tool_calls": false,

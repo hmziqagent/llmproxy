@@ -331,6 +331,7 @@ pub fn apply_field_policy(
     }
 
     check_cross_format_tools(client, provider, lossy)?;
+    check_strict_function_tools(client, provider, lossy)?;
     check_output_config_subkeys(client, provider, lossy)?;
 
     if rejected.is_empty() {
@@ -457,6 +458,56 @@ fn check_cross_format_tools(
     Err(ProviderError::InvalidRequest(format!(
         "server tool(s) [{}] have no {provider} equivalent; remove them or enable the route's lossy mode",
         server_tools.join(", "),
+    )))
+}
+
+/// A tool-level `strict: true` on a Responses function tool (Codex sends it)
+/// carries the client's structured-output guarantee. The core tool models no
+/// such field (`decode_tools` reads `name`/`description`/`parameters` only),
+/// so crossing formats would silently drop the guarantee — these tools are
+/// rejected by name (dropped with a warning under `lossy`), while
+/// `strict: false`/absent pass (they are the default meaning and lose
+/// nothing) and same-format passthrough carries the raw body untouched.
+fn check_strict_function_tools(
+    client: &ClientWireRequest,
+    provider: &ProtocolName,
+    lossy: bool,
+) -> Result<(), ProviderError> {
+    if client.format != ClientWireFormat::OpenAiResponses {
+        return Ok(());
+    }
+    let Some(Value::Array(tools)) = client.body.as_object().and_then(|obj| obj.get("tools")) else {
+        return Ok(());
+    };
+    let mut strict_tools: Vec<&str> = Vec::new();
+    for tool in tools.iter().filter_map(Value::as_object) {
+        // `type` absent or "function" is a function tool; every other type
+        // is a server tool already handled by `check_cross_format_tools`.
+        let is_function = matches!(
+            tool.get("type").and_then(Value::as_str),
+            None | Some("function")
+        );
+        if is_function
+            && tool.get("strict") == Some(&Value::Bool(true))
+            && let Some(name) = tool.get("name").and_then(Value::as_str)
+        {
+            strict_tools.push(name);
+        }
+    }
+    if strict_tools.is_empty() {
+        return Ok(());
+    }
+    if lossy {
+        tracing::warn!(
+            tools = ?strict_tools,
+            provider = %provider,
+            "lossy route: dropping function tools' strict flag with no provider equivalent"
+        );
+        return Ok(());
+    }
+    Err(ProviderError::InvalidRequest(format!(
+        "function tool(s) [{}] set strict: true, which has no {provider} equivalent; remove strict or enable the route's lossy mode",
+        strict_tools.join(", "),
     )))
 }
 
@@ -992,6 +1043,74 @@ mod tests {
         )
         .unwrap();
         assert!(!anthropic_body_has_server_tools(&client.body));
+    }
+
+    // A tool-level `strict: true` on a Responses function tool carries the
+    // client's structured-output guarantee; the core tool has no such field,
+    // so crossing formats must reject it by name instead of silently
+    // dropping the guarantee.
+    #[test]
+    fn strict_function_tools_are_rejected_by_name_cross_format() {
+        let tool = json!({
+            "type": "function", "name": "get_weather", "strict": true,
+            "parameters": {"type": "object"}
+        });
+        for provider in [
+            protocols::ANTHROPIC_MESSAGES,
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::GEMINI_GENERATE_CONTENT,
+        ] {
+            let client = wire(
+                ClientWireFormat::OpenAiResponses,
+                json!({"model": "m", "input": [], "tools": [tool.clone()]}),
+            );
+            let err = apply_field_policy(&client, &ProtocolName::new(provider), false)
+                .expect_err("strict: true must be rejected cross-format");
+            let text = err.to_string();
+            assert!(
+                text.contains("strict") && text.contains("get_weather"),
+                "error must name strict and the tool for {provider}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_false_and_absent_pass_cross_format() {
+        let body = json!({
+            "model": "m", "input": [],
+            "tools": [
+                {"type": "function", "name": "with_false", "strict": false, "parameters": {}},
+                {"name": "absent", "parameters": {}}
+            ]
+        });
+        for provider in [
+            protocols::ANTHROPIC_MESSAGES,
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::GEMINI_GENERATE_CONTENT,
+        ] {
+            let client = wire(ClientWireFormat::OpenAiResponses, body.clone());
+            apply_field_policy(&client, &ProtocolName::new(provider), false)
+                .unwrap_or_else(|err| panic!("strict {provider} must pass: {err}"));
+        }
+    }
+
+    #[test]
+    fn strict_tools_pass_on_lossy_routes() {
+        let client = wire(
+            ClientWireFormat::OpenAiResponses,
+            json!({
+                "model": "m", "input": [],
+                "tools": [
+                    {"type": "function", "name": "get_weather", "strict": true, "parameters": {}}
+                ]
+            }),
+        );
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            true,
+        )
+        .expect("a lossy route drops strict with a warning instead of failing");
     }
 
     fn media_core_request() -> CoreRequest {

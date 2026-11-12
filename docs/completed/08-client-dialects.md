@@ -26,7 +26,8 @@ pipeline code.
 - **OpenAI Responses (step 1, backlog 9).**
   `llm-proxy-protocol/src/client/responses.rs` decodes the documented request
   shape (`instructions`, typed `input` items including replayed `reasoning`
-  items with `encrypted_content`, function tools with strict schemas,
+  items with `encrypted_content`, function tools (a tool-level `strict: true`
+  is carried same-format and rejected by name cross-format),
   `tool_choice`, sampling, `reasoning.effort`) and encodes responses and
   synthesized SSE events. Tool-call ordering is the Codex contract:
   `response.output_item.added` (with the call id and empty arguments) before
