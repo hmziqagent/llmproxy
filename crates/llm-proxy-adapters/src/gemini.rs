@@ -393,6 +393,80 @@ fn encode_tool_choice(
     Ok(Some(config))
 }
 
+/// The client's `generationConfig` object under either spelling; the camelCase
+/// spelling wins when both are present, matching the client decode.
+fn generation_config_mut(
+    body: &mut serde_json::Value,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    let key = if body.get("generationConfig").is_some() {
+        "generationConfig"
+    } else {
+        "generation_config"
+    };
+    body.get_mut(key).and_then(serde_json::Value::as_object_mut)
+}
+
+/// The `thinkingConfig` object inside a `generationConfig`, under either
+/// spelling.
+fn thinking_config_mut(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    let key = if config.contains_key("thinkingConfig") {
+        "thinkingConfig"
+    } else {
+        "thinking_config"
+    };
+    config
+        .get_mut(key)
+        .and_then(serde_json::Value::as_object_mut)
+}
+
+/// Same-format passthrough edit: the client's `thinkingBudget` is clamped to
+/// the upstream model's limits through the same filter every route into Gemini
+/// uses, instead of reaching the wire unclamped. The `-1` (dynamic) and `0`
+/// (disabled) sentinels pass through untouched; both the camelCase and
+/// snake_case spellings are located and edited in place, and every other field
+/// survives untouched. A non-integer budget is rejected by name rather than
+/// forwarded.
+fn clamp_same_format_thinking_budget(
+    body: &mut serde_json::Value,
+    upstream_model: &str,
+) -> Result<(), ProviderError> {
+    let Some(config) = generation_config_mut(body) else {
+        return Ok(());
+    };
+    let Some(thinking) = thinking_config_mut(config) else {
+        return Ok(());
+    };
+    let budget_key = if thinking.contains_key("thinkingBudget") {
+        "thinkingBudget"
+    } else if thinking.contains_key("thinking_budget") {
+        "thinking_budget"
+    } else {
+        return Ok(());
+    };
+    let Some(budget) = thinking.get(budget_key).and_then(serde_json::Value::as_i64) else {
+        return Err(ProviderError::InvalidRequest(
+            "thinkingBudget must be an integer".to_owned(),
+        ));
+    };
+    if budget == -1 || budget == 0 {
+        return Ok(());
+    }
+    let limits = super::reasoning::thinking_limits(upstream_model);
+    let clamped = super::reasoning::clamp_budget(budget, limits);
+    if clamped != budget {
+        tracing::warn!(
+            budget,
+            clamped,
+            upstream_model,
+            "clamping the client's thinkingBudget to the upstream model's limits"
+        );
+        thinking.insert(budget_key.to_owned(), serde_json::Value::from(clamped));
+    }
+    Ok(())
+}
+
 impl GeminiAdapter {
     /// Encode a core request into a Gemini GenerateContent request.
     #[expect(
@@ -410,13 +484,14 @@ impl GeminiAdapter {
         let url = gemini_stream_url(expand_url_template(&target.endpoint, target)?, core.stream);
 
         // Same-format passthrough (plan 08 step 2): a Gemini-dialect client
-        // forwards its raw body unchanged (the model lives in the URL, which
-        // the alias resolution above already rewrote; streaming lives in the
-        // method, which the URL rewrite above already selected).
+        // forwards its raw body with only surgical edits (the model lives in
+        // the URL, which the alias resolution above already rewrote; streaming
+        // lives in the method, which the URL rewrite above already selected).
         if client.same_format_as(&ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT))
             && client.body_object().is_some()
         {
             let mut value = (*client.body).clone();
+            clamp_same_format_thinking_budget(&mut value, &target.upstream_model)?;
             if let Some(hygiene) = &target.prompt_cache {
                 super::mutation::apply_prompt_hygiene(&mut value, hygiene, false);
             }
@@ -1995,6 +2070,133 @@ mod tests {
             tool_call_stop_count, 1,
             "ToolCallStop should be emitted exactly once"
         );
+    }
+
+    /// A Gemini-dialect client wire, so these tests exercise the same-format
+    /// passthrough branch rather than the cross-format encode.
+    fn gemini_client_wire(body: serde_json::Value) -> ClientWireRequest {
+        ClientWireRequest::new(ClientWireFormat::GeminiGenerateContent, body)
+    }
+
+    fn same_format_core_request() -> CoreRequest {
+        make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }])
+    }
+
+    #[test]
+    fn same_format_thinking_budget_is_clamped_to_model_max() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 100_000}},
+        });
+        let target = make_target();
+        let client = gemini_client_wire(body);
+        let proxy_req = GeminiAdapter
+            .encode_request(&same_format_core_request(), &target, &client)
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            wire["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(32_768),
+            "a Gemini client's thinkingBudget must be clamped to gemini-2.5-pro's max: {wire}"
+        );
+    }
+
+    #[test]
+    fn same_format_thinking_budget_minus_one_and_zero_pass_through() {
+        for budget in [-1i64, 0] {
+            let body = serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"thinkingConfig": {"thinkingBudget": budget}},
+            });
+            let target = make_target();
+            let client = gemini_client_wire(body);
+            let proxy_req = GeminiAdapter
+                .encode_request(&same_format_core_request(), &target, &client)
+                .unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+            assert_eq!(
+                wire["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                serde_json::json!(budget),
+                "the Gemini sentinels -1 (dynamic) and 0 (disabled) must not be clamped: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_format_without_thinking_config_is_byte_identical() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"temperature": 0.5, "topP": 0.9},
+        });
+        let target = make_target();
+        let client = gemini_client_wire(body);
+        let proxy_req = GeminiAdapter
+            .encode_request(&same_format_core_request(), &target, &client)
+            .unwrap();
+        assert_eq!(
+            proxy_req.body,
+            serde_json::to_vec(&*client.body).unwrap(),
+            "same-format passthrough without a thinkingConfig must forward the client bytes unchanged"
+        );
+    }
+
+    #[test]
+    fn same_format_snake_case_thinking_budget_is_clamped() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generation_config": {"thinking_config": {"thinking_budget": 100_000}},
+        });
+        let target = make_target();
+        let client = gemini_client_wire(body);
+        let proxy_req = GeminiAdapter
+            .encode_request(&same_format_core_request(), &target, &client)
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            wire["generation_config"]["thinking_config"]["thinking_budget"],
+            serde_json::json!(32_768),
+            "the snake_case spelling must be located and clamped in place: {wire}"
+        );
+        assert!(
+            wire["generation_config"]["thinking_config"]
+                .get("thinkingBudget")
+                .is_none(),
+            "clamping must not invent a second camelCase key: {wire}"
+        );
+    }
+
+    #[test]
+    fn same_format_non_integer_thinking_budget_is_rejected() {
+        for budget in [
+            serde_json::json!("100000"),
+            serde_json::json!(100_000.5),
+            serde_json::json!({"budget": 100_000}),
+        ] {
+            let body = serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"thinkingConfig": {"thinkingBudget": budget}},
+            });
+            let target = make_target();
+            let client = gemini_client_wire(body);
+            let err = GeminiAdapter
+                .encode_request(&same_format_core_request(), &target, &client)
+                .expect_err("a non-integer thinkingBudget must be rejected, not forwarded");
+            assert!(
+                matches!(err, ProviderError::InvalidRequest(_)),
+                "expected InvalidRequest, got: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("thinkingBudget must be an integer"),
+                "the rejection must name the field and the expectation, got: {err}"
+            );
+        }
     }
 
     #[test]
