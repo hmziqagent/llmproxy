@@ -1097,6 +1097,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_client_prompt_tokens_include_cache_tokens() {
+        let upstream = serde_json::to_vec(&json!({
+            "id": "msg_cached",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Hello from mock!" }],
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 5,
+                "cache_creation_input_tokens": 10
+            }
+        }))
+        .unwrap();
+        let mock_url = spawn_mock_server(upstream, "application/json").await;
+        let state = state_with_openai_chat_client_anthropic_upstream(&mock_url);
+        let app = build_router(state);
+
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64
+        });
+        let resp = app
+            .oneshot(openai_chat_request(&body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // 100 uncached input + 5 cache read + 10 cache creation.
+        assert_eq!(
+            out["usage"]["prompt_tokens"], 115,
+            "prompt_tokens must include cached prompt tokens: {out}"
+        );
+        assert_eq!(out["usage"]["prompt_cache_hit_tokens"], 5);
+    }
+
+    #[tokio::test]
     async fn openai_client_without_include_usage_gets_no_usage_chunk() {
         let mock_url = spawn_mock_openai_chat_usage_after_finish_stream().await;
         let state = state_with_openai_chat_provider(&mock_url);

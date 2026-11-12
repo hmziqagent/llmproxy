@@ -50,7 +50,8 @@ Make what already exists correct and truthful before anything is built on it.
   cached_tokens` (chat and Responses), `completion_tokens_details.
   reasoning_tokens` and Anthropic's 5m/1h `cache_creation` split map into the
   core fields; absent usage is labelled missing (`SyntheticZero`), not
-  provider-reported zeros.
+  provider-reported zeros. OpenAI clients receive `prompt_tokens` including
+  cached tokens.
 - **Ledger accuracy (BUG-10, BUG-21, BUG-26, backlog 5):** streaming rows keep
   `model_upstream` under aliases; a client disconnect before the first event
   settles its row; events lost to a failed ledger batch or a full channel are

@@ -15,7 +15,7 @@ use crate::core::{CoreStreamError, CoreStreamErrorKind};
 use crate::openai::{CacheControl as OpenAICacheControl, StreamOptions};
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
-    FunctionCall, ToolCall, UsageInfo,
+    CompletionTokensDetails, FunctionCall, PromptTokensDetails, ToolCall, UsageInfo,
 };
 
 fn unix_timestamp_secs() -> i64 {
@@ -570,22 +570,37 @@ fn encode_finish_reason(reason: StopReason) -> String {
 }
 
 fn encode_usage(usage: &Usage) -> UsageInfo {
-    if let Some(rt) = usage.reasoning_tokens {
-        if rt != 0 {
-            tracing::warn!(
-                reasoning_tokens = rt,
-                "OpenAI UsageInfo does not map reasoning_tokens to completion_tokens_details; dropping"
-            );
-        }
-    }
+    let cache_read = usage.cache_read_input_tokens;
+    let cache_creation = usage.cache_creation_input_tokens;
+    // Core `input_tokens` is net of cache everywhere, but OpenAI clients
+    // read `prompt_tokens` as the full prompt: it must include both the
+    // cached and the cache-creation tokens.
+    let cached = cache_read
+        .unwrap_or(0)
+        .saturating_add(cache_creation.unwrap_or(0));
+    let prompt_tokens = usage.input_tokens.saturating_add(cached);
+    // Cache-creation tokens are uncached prompt tokens from the client's
+    // view, so they land in "miss", not in "hit"; hit + miss then
+    // reconstructs `prompt_tokens` (the DeepSeek invariant).
+    let miss_tokens = (cache_read.is_some() || cache_creation.is_some()).then(|| {
+        usage
+            .input_tokens
+            .saturating_add(cache_creation.unwrap_or(0))
+    });
     UsageInfo {
-        prompt_tokens: usage.input_tokens,
+        prompt_tokens,
         completion_tokens: usage.output_tokens,
-        total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
-        prompt_cache_hit_tokens: usage.cache_read_input_tokens,
-        prompt_cache_miss_tokens: usage.cache_creation_input_tokens,
-        prompt_tokens_details: None,
-        completion_tokens_details: None,
+        total_tokens: prompt_tokens.saturating_add(usage.output_tokens),
+        prompt_cache_hit_tokens: cache_read,
+        prompt_cache_miss_tokens: miss_tokens,
+        prompt_tokens_details: cache_read.map(|cached_tokens| PromptTokensDetails {
+            cached_tokens: Some(cached_tokens),
+        }),
+        completion_tokens_details: usage.reasoning_tokens.map(|reasoning_tokens| {
+            CompletionTokensDetails {
+                reasoning_tokens: Some(reasoning_tokens),
+            }
+        }),
     }
 }
 
@@ -1519,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_mapping() {
+    fn usage_with_cache_sums_prompt_tokens_and_details() {
         let usage = Usage {
             input_tokens: 100,
             output_tokens: 200,
@@ -1529,11 +1544,80 @@ mod tests {
             provenance: UsageProvenance::ProviderReported,
         };
         let out = encode_usage(&usage);
-        assert_eq!(out.prompt_tokens, 100);
+        assert_eq!(out.prompt_tokens, 115);
         assert_eq!(out.completion_tokens, 200);
-        assert_eq!(out.total_tokens, 300);
+        assert_eq!(out.total_tokens, 315);
         assert_eq!(out.prompt_cache_hit_tokens, Some(5));
-        assert_eq!(out.prompt_cache_miss_tokens, Some(10));
+        assert_eq!(out.prompt_cache_miss_tokens, Some(110));
+        assert_eq!(
+            out.prompt_tokens_details,
+            Some(PromptTokensDetails {
+                cached_tokens: Some(5)
+            })
+        );
+    }
+
+    #[test]
+    fn cache_hit_plus_miss_equals_prompt_tokens() {
+        // hit + miss must reconstruct prompt_tokens for every client that
+        // reads the DeepSeek-style hit/miss fields.
+        let tuples = [
+            (100, Some(5), Some(10)),
+            (100, Some(5), None),
+            (50, Some(0), Some(0)),
+            (30, Some(30), None),
+        ];
+        for (input, read, creation) in tuples {
+            let usage = Usage {
+                input_tokens: input,
+                output_tokens: 3,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: creation,
+                cache_read_input_tokens: read,
+                provenance: UsageProvenance::ProviderReported,
+            };
+            let out = encode_usage(&usage);
+            if out.prompt_cache_hit_tokens.is_none() {
+                continue;
+            }
+            assert_eq!(
+                out.prompt_cache_hit_tokens.unwrap_or(0)
+                    + out.prompt_cache_miss_tokens.unwrap_or(0),
+                out.prompt_tokens,
+                "hit + miss must equal prompt_tokens for input {input}, read {read:?}, creation {creation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_without_cache_reports_bare_prompt_tokens() {
+        let usage = Usage::provider_reported(100, 200);
+        let out = encode_usage(&usage);
+        assert_eq!(out.prompt_tokens, 100);
+        assert_eq!(out.prompt_cache_hit_tokens, None);
+        assert_eq!(out.prompt_cache_miss_tokens, None);
+        assert_eq!(out.prompt_tokens_details, None);
+        assert_eq!(out.completion_tokens_details, None);
+        // Clients with no cache must see exactly today's JSON: absent keys,
+        // not nulls.
+        let json = serde_json::to_value(&out).unwrap();
+        assert!(json.get("prompt_cache_hit_tokens").is_none(), "{json}");
+        assert!(json.get("prompt_cache_miss_tokens").is_none(), "{json}");
+        assert!(json.get("prompt_tokens_details").is_none(), "{json}");
+        assert!(json.get("completion_tokens_details").is_none(), "{json}");
+    }
+
+    #[test]
+    fn reasoning_tokens_map_to_completion_tokens_details() {
+        let mut usage = Usage::provider_reported(10, 30);
+        usage.reasoning_tokens = Some(9);
+        let out = encode_usage(&usage);
+        assert_eq!(
+            out.completion_tokens_details,
+            Some(CompletionTokensDetails {
+                reasoning_tokens: Some(9)
+            })
+        );
     }
 
     #[test]
