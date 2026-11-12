@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -23,6 +24,9 @@ mod tests {
         ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
     };
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_storage::{
+        EventBus, RequestFilter, RequestRow, RetentionPolicy, SqliteEventBus, UsageReader,
+    };
     use llm_proxy_transport::ProxyClient;
     use serde_json::{Value, json};
     use tower::ServiceExt;
@@ -1354,5 +1358,195 @@ mod tests {
             assert!(model["name"].is_string(), "{model}");
             assert!(model["model"].is_string(), "{model}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Usage ledger (08-2): each new dialect's request lands exactly one
+    // completed row carrying its dialect, route kind, provider, streaming
+    // flag and the upstream's usage numbers. The write path was already
+    // real when these were written (lifecycle.rs emits RequestReceived
+    // with client_dialect_str / route_kind_str and ResponseCompleted with
+    // usage), so they pass on current code; they would fail if
+    // `client_dialect_str` (crates/llm-proxy-engine/src/lifecycle.rs)
+    // returned "openai_chat" for the OpenAiResponses/Gemini/Ollama arms —
+    // every `client_protocol` assertion below pins one distinct string.
+    // ------------------------------------------------------------------
+
+    fn open_ledger(path: &Path) -> Arc<SqliteEventBus> {
+        Arc::new(
+            SqliteEventBus::open(
+                path,
+                RetentionPolicy {
+                    max_age: None,
+                    max_rows: None,
+                    prune_every: Duration::from_secs(3600),
+                },
+            )
+            .expect("ledger opens"),
+        )
+    }
+
+    async fn close_ledger(bus: Arc<SqliteEventBus>) {
+        tokio::task::spawn_blocking(move || bus.close())
+            .await
+            .expect("close joins");
+    }
+
+    async fn ledger_rows(db: &Path) -> Vec<RequestRow> {
+        UsageReader::new(db)
+            .requests(RequestFilter {
+                limit: 50,
+                ..Default::default()
+            })
+            .await
+            .expect("rows")
+            .rows
+    }
+
+    /// The completed row every dialect request must produce, beyond its
+    /// dialect-specific strings.
+    fn assert_completed_row(row: &RequestRow, dialect: &str, route_kind: &str, streaming: bool) {
+        assert_eq!(row.client_protocol.as_deref(), Some(dialect), "{row:?}");
+        assert_eq!(row.route_kind.as_deref(), Some(route_kind), "{row:?}");
+        assert_eq!(row.provider.as_deref(), Some("dialect-provider"), "{row:?}");
+        assert_eq!(row.streaming, Some(streaming), "{row:?}");
+        assert_eq!(row.state, "completed", "{row:?}");
+    }
+
+    /// The Anthropic fake's usage: input 21 (cache reads excluded, core
+    /// semantics), output 6, cache_read 8, cache_creation 4, no reasoning.
+    fn assert_row_tokens(
+        row: &RequestRow,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_creation: i64,
+    ) {
+        let tokens = row.tokens.as_ref().expect("usage is on the row");
+        assert_eq!(tokens.input, input, "{row:?}");
+        assert_eq!(tokens.output, output, "{row:?}");
+        assert_eq!(tokens.cache_read, cache_read, "{row:?}");
+        assert_eq!(tokens.cache_creation, cache_creation, "{row:?}");
+        assert_eq!(tokens.reasoning, 0, "{row:?}");
+    }
+
+    #[tokio::test]
+    async fn responses_request_is_recorded_with_its_dialect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let bus = open_ledger(&db);
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        )
+        .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1/responses",
+                &responses_request(false),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        close_ledger(bus).await;
+        let rows = ledger_rows(&db).await;
+        assert_eq!(rows.len(), 1, "exactly one ledger row: {rows:?}");
+        let row = rows.first().expect("the one row");
+        assert_completed_row(row, "openai_responses", "responses", false);
+        assert_row_tokens(row, 21, 6, 8, 4);
+    }
+
+    #[tokio::test]
+    async fn gemini_request_is_recorded_with_its_dialect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let bus = open_ledger(&db);
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::GenerateContent,
+            false,
+        )
+        .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:generateContent",
+                &gemini_request(),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        close_ledger(bus).await;
+        let rows = ledger_rows(&db).await;
+        assert_eq!(rows.len(), 1, "exactly one ledger row: {rows:?}");
+        let row = rows.first().expect("the one row");
+        assert_completed_row(row, "gemini", "generate_content", false);
+        assert_row_tokens(row, 21, 6, 8, 4);
+    }
+
+    #[tokio::test]
+    async fn ollama_request_is_recorded_with_its_dialect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let bus = open_ledger(&db);
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+        )
+        .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/api/chat",
+                &ollama_chat_request(false),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        close_ledger(bus).await;
+        let rows = ledger_rows(&db).await;
+        assert_eq!(rows.len(), 1, "exactly one ledger row: {rows:?}");
+        let row = rows.first().expect("the one row");
+        assert_completed_row(row, "ollama", "chat_completions", false);
+        assert_row_tokens(row, 21, 6, 8, 4);
+    }
+
+    #[tokio::test]
+    async fn streamed_dialect_request_is_recorded_after_the_stream_ends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let upstream = spawn_fake_upstream(Behavior::AnthropicStream { tool_call: false }).await;
+        let bus = open_ledger(&db);
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        )
+        .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1/responses",
+                &responses_request(true),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        // The completion row is written when the stream ends, so the SSE
+        // body must be drained before the ledger closes.
+        let text = body_text(response).await;
+        assert!(text.contains("event: response.completed"), "{text}");
+        close_ledger(bus).await;
+        let rows = ledger_rows(&db).await;
+        assert_eq!(rows.len(), 1, "exactly one ledger row: {rows:?}");
+        let row = rows.first().expect("the one row");
+        assert_completed_row(row, "openai_responses", "responses", true);
+        assert_eq!(row.tokens.as_ref().map(|tokens| tokens.input), Some(21));
     }
 }
