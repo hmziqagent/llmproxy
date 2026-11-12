@@ -415,6 +415,9 @@ fn encode_usage(usage: &Usage) -> Value {
         "candidatesTokenCount".to_owned(),
         Value::from(usage.output_tokens),
     );
+    if let Some(reasoning) = usage.reasoning_tokens {
+        metadata.insert("thoughtsTokenCount".to_owned(), Value::from(reasoning));
+    }
     metadata.insert(
         "totalTokenCount".to_owned(),
         Value::from(i32::try_from(total).unwrap_or(i32::MAX)),
@@ -464,12 +467,7 @@ fn content_parts(content: &[CoreContent]) -> Vec<Value> {
 /// Encode a [`CoreResponse`] into a Gemini `GenerateContentResponse`.
 pub fn encode_response(resp: &CoreResponse) -> Result<Value, ProtocolError> {
     let parts = content_parts(&resp.content);
-    let mut usage_metadata = encode_usage(&resp.usage);
-    if let Some(reasoning) = resp.usage.reasoning_tokens
-        && let Some(obj) = usage_metadata.as_object_mut()
-    {
-        obj.insert("thoughtsTokenCount".to_owned(), Value::from(reasoning));
-    }
+    let usage_metadata = encode_usage(&resp.usage);
     Ok(serde_json::json!({
         "candidates": [{
             "content": {"role": "model", "parts": parts},
@@ -860,6 +858,29 @@ mod tests {
         assert_eq!(terminal["candidates"][0]["finishReason"], "STOP");
         assert_eq!(terminal["usageMetadata"]["promptTokenCount"], 4);
         assert_eq!(terminal["usageMetadata"]["totalTokenCount"], 6);
+    }
+
+    /// The streamed terminal chunk must carry the same `thoughtsTokenCount`
+    /// the non-streaming response carries, so Gemini clients see reasoning
+    /// usage in both paths.
+    #[test]
+    fn stream_terminal_chunk_carries_thoughts_token_count() {
+        let mut encoder = StreamEncoder::new("gemini-2.5-pro".into());
+        let mut usage = Usage::provider_reported(4, 2);
+        usage.reasoning_tokens = Some(3);
+        let mut chunks = Vec::new();
+        for event in [
+            CoreEvent::UsageDelta { usage },
+            CoreEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            },
+        ] {
+            chunks.extend(encoder.encode_event(event).expect("encode"));
+        }
+        let terminal = chunks.last().cloned().unwrap_or_default();
+        assert_eq!(terminal["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(terminal["usageMetadata"]["thoughtsTokenCount"], 3);
     }
 
     /// A usage with no cache read must not synthesize a
