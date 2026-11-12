@@ -650,6 +650,60 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A discovery endpoint whose `nextPageToken` never changes, so live
+    /// refresh must fail instead of caching a one-page truncation.
+    async fn stalled_pagination_server() -> String {
+        let body = serde_json::json!({
+            "models": [{
+                "name": "models/live-model",
+                "supportedGenerationMethods": ["generateContent"]
+            }],
+            "nextPageToken": "stale"
+        });
+        let app = Router::new().route(
+            "/models",
+            get(move || {
+                let body = body.clone();
+                async move { (StatusCode::OK, axum::Json(body)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/models")
+    }
+
+    #[tokio::test]
+    async fn stalled_pagination_does_not_overwrite_the_cached_catalog() {
+        let directory = temp_dir();
+        write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
+        let cache_path = directory.join("test-provider.toml");
+        let before = std::fs::read(&cache_path).unwrap();
+
+        let endpoint = stalled_pagination_server().await;
+        let mut provider = provider(endpoint);
+        provider
+            .discovery
+            .as_mut()
+            .expect("fixture provider has discovery")
+            .kind = ProviderDiscoveryKind::GeminiModels;
+        let service = ModelCatalogService::new(Some(directory.clone()));
+
+        let models = service.catalog(&provider, true).await.unwrap();
+
+        assert_eq!(
+            models.len(),
+            1,
+            "stale cache must survive the failed refresh"
+        );
+        assert_eq!(models[0].id, "cached-model");
+        let after = std::fs::read(&cache_path).unwrap();
+        assert_eq!(before, after, "on-disk catalog must be byte-identical");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn discovered_mode_does_not_treat_static_models_as_refresh_fallback() {
         let (endpoint, count) = failing_server().await;

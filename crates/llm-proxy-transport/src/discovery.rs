@@ -38,7 +38,8 @@ impl DiscoveryClient {
     }
 
     /// Fetch and normalize the configured provider model list; errors on missing
-    /// discovery config, invalid responses, pagination, or transport failures.
+    /// discovery config, invalid responses, stalled or over-limit pagination,
+    /// or transport failures.
     pub async fn discover(
         &self,
         provider: &ProviderConfig,
@@ -67,7 +68,7 @@ impl DiscoveryClient {
                 )));
             }
 
-            let Some((name, token)) = next_page(discovery.kind, &value) else {
+            let Some((name, token)) = next_page(discovery.kind, &value)? else {
                 models.sort_by(|a, b| a.id.cmp(&b.id));
                 models.dedup_by(|a, b| a.id == b.id);
                 if dropped > 0 {
@@ -82,15 +83,11 @@ impl DiscoveryClient {
             };
 
             if previous_token.as_deref() == Some(token.as_str()) {
-                tracing::warn!(
-                    provider = %provider.name,
-                    token = %token,
-                    "discovery pagination token did not advance; stopping early \
-                     to avoid repeated identical page fetches",
-                );
-                models.sort_by(|a, b| a.id.cmp(&b.id));
-                models.dedup_by(|a, b| a.id == b.id);
-                return Ok(models);
+                return Err(ProviderError::InvalidConfig(format!(
+                    "provider \"{}\" discovery pagination token did not advance after {} model(s)",
+                    provider.name,
+                    models.len()
+                )));
             }
             previous_token = Some(token.clone());
 
@@ -308,37 +305,42 @@ fn set_query_parameter(url: &mut Url, name: &str, value: &str) {
     serializer.append_pair(name, value);
 }
 
-fn next_page(kind: ProviderDiscoveryKind, value: &Value) -> Option<(&'static str, String)> {
+fn next_page(
+    kind: ProviderDiscoveryKind,
+    value: &Value,
+) -> Result<Option<(&'static str, String)>, ProviderError> {
     match kind {
-        ProviderDiscoveryKind::GeminiModels => value
+        ProviderDiscoveryKind::GeminiModels => Ok(value
             .get("nextPageToken")
             .and_then(Value::as_str)
             .filter(|token| !token.is_empty())
-            .map(|token| ("pageToken", token.to_owned())),
+            .map(|token| ("pageToken", token.to_owned()))),
         ProviderDiscoveryKind::AnthropicModels => {
             let has_more = value
                 .get("has_more")
                 .and_then(Value::as_bool)
                 .is_some_and(|b| b);
             if !has_more {
-                return None;
+                return Ok(None);
             }
-            let token = value.get("last_id").and_then(Value::as_str);
-            if token.is_none() {
-                tracing::warn!(
-                    "Anthropic discovery: has_more is true but last_id is missing; \
-                     pagination will stop early"
-                );
+            let token = value
+                .get("last_id")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty());
+            match token {
+                Some(token) => Ok(Some(("after_id", token.to_owned()))),
+                None => Err(ProviderError::InvalidConfig(
+                    "Anthropic discovery response has `has_more` without `last_id`".to_owned(),
+                )),
             }
-            token.map(|t| ("after_id", t.to_owned()))
         }
-        ProviderDiscoveryKind::FireworksAccountModels => value
+        ProviderDiscoveryKind::FireworksAccountModels => Ok(value
             .get("nextPageToken")
             .or_else(|| value.get("next_page_token"))
             .and_then(Value::as_str)
             .filter(|token| !token.is_empty())
-            .map(|token| ("pageToken", token.to_owned())),
-        _ => None,
+            .map(|token| ("pageToken", token.to_owned()))),
+        _ => Ok(None),
     }
 }
 
@@ -562,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_stops_on_non_advancing_pagination_token() {
+    async fn discovery_fails_when_pagination_token_does_not_advance() {
         async fn static_token_models(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
             calls.fetch_add(1, Ordering::SeqCst);
             Json(json!({
@@ -587,18 +589,44 @@ mod tests {
             HashMap::new(),
         );
 
-        let models = DiscoveryClient::default()
+        let error = DiscoveryClient::default()
             .discover(&provider)
             .await
-            .expect("non-advancing token should stop early, not error");
+            .expect_err("a stalled pagination token must fail discovery");
 
+        assert!(
+            matches!(error, ProviderError::InvalidConfig(ref message) if message.contains("did not advance")),
+            "expected InvalidConfig mentioning 'did not advance', got: {error}"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
             "pagination should stop after detecting the repeated token"
         );
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "models/gemini-pro");
+    }
+
+    #[tokio::test]
+    async fn discovery_fails_when_anthropic_has_more_without_last_id() {
+        let endpoint = start_test_server(Router::new().route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "claude-x"}], "has_more": true})) }),
+        ))
+        .await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::AnthropicModels,
+            HashMap::new(),
+        );
+
+        let error = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect_err("`has_more` without `last_id` must fail discovery");
+
+        assert!(
+            matches!(error, ProviderError::InvalidConfig(ref message) if message.contains("has_more")),
+            "expected InvalidConfig mentioning 'has_more', got: {error}"
+        );
     }
 
     #[test]
