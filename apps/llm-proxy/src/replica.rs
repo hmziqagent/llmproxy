@@ -78,6 +78,10 @@ async fn redis_replica(
         .map_err(|error| {
             anyhow::anyhow!("connecting to the Redis replica store from [replica]: {error}")
         })?;
+    // The lease crash bound: a replica that dies before settling must not
+    // hold its reservation forever, so this timer reaps every lease past
+    // its deadline (mirroring the Postgres purge timer below).
+    llm_proxy_store_redis::spawn_reaper(store.clone());
     let admission = llm_proxy_store_redis::replica_admission_over_config(
         &state.app_config().auth,
         registry,

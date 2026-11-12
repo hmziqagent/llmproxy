@@ -22,9 +22,16 @@
 //! direction is fail-closed — a concurrent admission may see a fuller
 //! window than it truly has and refuse — and no two admitted requests can
 //! both fit a budget that only fits one, because the check runs after the
-//! increments of both are visible. Leases that are never settled (a
-//! crashed replica) expire on a TTL, so the budget they held is released
-//! without operator action.
+//! increments of both are visible. A lease is a record plus one entry in
+//! a deadline sorted set (`{prefix}:leases`, score = deadline unix-ms).
+//! A replica that dies before settling never releases its own counters,
+//! so [`spawn_reaper`] runs on every replica: past the lease's deadline
+//! it releases exactly what settlement releases — once, claimed by the
+//! record's `DEL` reply count. The admit writes the index entry first
+//! and the record second, so a crash between the counter increments and
+//! the `ZADD` (a window of microseconds) still leaks the counters until
+//! their own TTLs; a replica on an older build writes TTL records with
+//! no index entry, which this reaper never sees.
 //!
 //! Settlement is ordered, not transactional. An admission reads the
 //! reserved counter (the `INCR` reply) strictly before it reads `spent`,
@@ -129,8 +136,9 @@ impl RedisStore {
 }
 
 /// The persisted form of one reservation: everything settlement needs to
-/// release exactly what was reserved, stored under the lease id with a
-/// TTL so a crashed replica's reservation cannot hold a budget forever.
+/// release exactly what was reserved, stored under the lease id (no TTL —
+/// the deadline lives in the lease index and [`spawn_reaper`] enforces
+/// it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LeaseRecord {
     caller: String,
@@ -144,8 +152,13 @@ struct LeaseRecord {
     holds_model_slot: bool,
 }
 
-/// How long an unsettled lease holds its reservation before expiring.
+/// How long an unsettled lease keeps its reservation before the reaper
+/// releases it (the crash bound).
 const LEASE_TTL: Duration = Duration::from_secs(3600);
+/// How often the reaper timer looks for leases past their deadline.
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// How many deadline-index entries one reaper pass takes at most.
+const REAP_BATCH: isize = 100;
 /// Counters for a calendar minute outlive the minute itself by this much.
 const MINUTE_TTL: Duration = Duration::from_secs(120);
 /// Day counters outlive the day so late settlements still land.
@@ -164,6 +177,12 @@ fn day_stamp(now: OffsetDateTime) -> String {
 
 fn unix_minute(now: OffsetDateTime) -> i64 {
     now.unix_timestamp().div_euclid(60)
+}
+
+/// The instant as whole milliseconds since the Unix epoch (the lease
+/// deadline index's score).
+fn unix_ms(now: OffsetDateTime) -> i64 {
+    i64::try_from(now.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap_or(i64::MAX)
 }
 
 fn until_next_minute(now: OffsetDateTime) -> Duration {
@@ -212,17 +231,31 @@ impl CommittedWindows {
 }
 
 /// The Redis-backed [`AdmissionBackend`]: windows, budgets, concurrency
-/// caps and leases held in the shared store.
+/// caps and leases held in the shared store. Every lease is indexed under
+/// its release deadline; [`spawn_reaper`] is the crash bound that
+/// releases what an unsettled lease holds.
 #[derive(Debug, Clone)]
 pub struct RedisAdmissionBackend {
     store: RedisStore,
+    lease_ttl: Duration,
 }
 
 impl RedisAdmissionBackend {
-    /// Over a connected store.
+    /// Over a connected store, with the default lease deadline.
     #[must_use]
     pub fn new(store: RedisStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            lease_ttl: LEASE_TTL,
+        }
+    }
+
+    /// Sets how long an unsettled lease keeps its reservation before the
+    /// reaper releases it (the crash bound).
+    #[must_use]
+    pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+        self.lease_ttl = ttl;
+        self
     }
 
     /// The settlement write, as an async operation: the sync
@@ -233,7 +266,7 @@ impl RedisAdmissionBackend {
     ///
     /// [`RedisStoreError`] when Redis fails; the lease is deleted before
     /// any counter moves, so a failure here leaks nothing but may leave
-    /// the reservation in flight until its TTL.
+    /// the reservation in flight until the reaper releases it.
     pub async fn settle_async(
         &self,
         lease: &LeaseId,
@@ -245,7 +278,7 @@ impl RedisAdmissionBackend {
         let Some(raw) = raw else {
             tracing::warn!(
                 lease = lease.as_str(),
-                "admission settle for an unknown or expired lease; ignoring"
+                "admission settle for an unknown, already settled or reaped lease; ignoring"
             );
             return Ok(());
         };
@@ -257,7 +290,30 @@ impl RedisAdmissionBackend {
         if removed == 0 {
             return Ok(());
         }
+        self.release_lease(&mut conn, &record, Some(settlement))
+            .await?;
+        // Off the deadline index too: a settled lease is no longer a
+        // crash candidate for the reaper.
+        let _: usize = conn.zrem(self.leases_index_key(), lease.as_str()).await?;
+        Ok(())
+    }
 
+    /// The lease whose deadline every replica's reaper checks: a sorted
+    /// set of lease ids scored by their release deadline in unix-ms.
+    fn leases_index_key(&self) -> String {
+        format!("{}:leases", self.store.prefix)
+    }
+
+    /// The release half of settlement: charge what was billed to today,
+    /// release the reserved USD from its day, replace the reserved tokens
+    /// with the reported usage in their minute, and release both in-flight
+    /// slots. The reaper passes no settlement — no usage, no charge.
+    async fn release_lease(
+        &self,
+        conn: &mut ConnectionManager,
+        record: &LeaseRecord,
+        settlement: Option<&Settlement>,
+    ) -> Result<(), RedisStoreError> {
         // Money: charge to today first, release from the day it was
         // reserved on second (spend is never dropped at a midnight
         // boundary). Spent is charged before the reservation is released
@@ -265,7 +321,9 @@ impl RedisAdmissionBackend {
         // before `spent` — can only over-count the exposure, never see
         // the reservation gone while the charge is missing (see the
         // atomicity model above).
-        if let Some(charged) = settlement.charged_usd {
+        if let Some(settlement) = settlement
+            && let Some(charged) = settlement.charged_usd
+        {
             let today = self.spent_key(&record.caller, &day_stamp(settlement.now));
             let _: i64 = conn.incr(&today, charged).await?;
             let _: bool = conn.expire(&today, DAY_TTL.as_secs() as i64).await?;
@@ -285,7 +343,9 @@ impl RedisAdmissionBackend {
         // charging into a gone window is how the usage lands.
         let token_key = self.token_key(&record.caller, record.minute);
         let key_existed = record.reserved_tokens > 0 && conn.exists(&token_key).await?;
-        let delta = settlement.usage_tokens.map_or(0, |tokens| tokens as i64)
+        let delta = settlement
+            .and_then(|settlement| settlement.usage_tokens)
+            .map_or(0, |tokens| tokens as i64)
             - if key_existed {
                 record.reserved_tokens as i64
             } else {
@@ -294,12 +354,67 @@ impl RedisAdmissionBackend {
         if delta != 0 || key_existed {
             let _: i64 = conn.incr(&token_key, delta).await?;
         }
-        if settlement.usage_tokens.is_some() {
+        if settlement.is_some_and(|settlement| settlement.usage_tokens.is_some()) {
             let _: bool = conn.expire(&token_key, MINUTE_TTL.as_secs() as i64).await?;
         }
 
-        self.release_slots(&mut conn, &record).await?;
-        Ok(())
+        self.release_slots(conn, record).await
+    }
+
+    /// Releases every lease whose deadline has passed: the reservation a
+    /// replica that died before settling still holds — its reserved tokens
+    /// in their minute, its reserved USD in its day, and both in-flight
+    /// slots — with no usage and no charge. Exactly one reaper wins each
+    /// lease: the record is claimed by the `DEL` reply count, the same
+    /// claim settlement uses, so several replicas reaping concurrently
+    /// release each lease once. Returns the number of leases released.
+    ///
+    /// # Errors
+    ///
+    /// [`RedisStoreError`] when Redis fails or a lease record is corrupt.
+    pub async fn reap_expired(&self, now: OffsetDateTime) -> Result<u64, RedisStoreError> {
+        let index_key = self.leases_index_key();
+        let mut conn = self.store.conn.clone();
+        let ids: Vec<String> = conn
+            .zrangebyscore_limit(
+                &index_key,
+                f64::NEG_INFINITY,
+                unix_ms(now) as f64,
+                0,
+                REAP_BATCH,
+            )
+            .await?;
+        let mut reaped = 0_u64;
+        for id in ids {
+            let record_key = self.lease_key(&LeaseId::new(id.clone()));
+            let raw: Option<String> = conn.get(&record_key).await?;
+            let Some(raw) = raw else {
+                // An index entry without a record: an admit that died
+                // between the ZADD and the SET, or a record an older
+                // build already let expire. Nothing is held — drop the
+                // stale entry.
+                let _: usize = conn.zrem(&index_key, &id).await?;
+                continue;
+            };
+            let record: LeaseRecord = serde_json::from_str(&raw)?;
+            // Claim the lease by the delete count, exactly like
+            // settlement: a concurrent settle or a second reaper that
+            // loses this race releases nothing.
+            let removed: i64 = conn.del(&record_key).await?;
+            if removed == 0 {
+                continue;
+            }
+            self.release_lease(&mut conn, &record, None).await?;
+            let _: usize = conn.zrem(&index_key, &id).await?;
+            reaped = reaped.saturating_add(1);
+            tracing::warn!(
+                lease = %id,
+                caller = %record.caller,
+                "unsettled admission lease past its deadline was reaped; its reservation and \
+                 slots are released"
+            );
+        }
+        Ok(reaped)
     }
 
     fn lease_key(&self, lease: &LeaseId) -> String {
@@ -636,10 +751,12 @@ impl AdmissionBackend for RedisAdmissionBackend {
 
         self.admit_caps(&mut conn, demand).await?;
 
-        // Every check passed: persist the lease. The TTL is the crash
-        // bound — a replica that dies mid-request releases its budget
-        // within the hour without operator action.
+        // Every check passed: persist the lease. The record carries no
+        // TTL of its own — the crash bound is the deadline index: index
+        // entry first, record second, so a reaper that finds an entry
+        // without a record just drops the entry.
         let id = Uuid::new_v4();
+        let lease = LeaseId::new(id.to_string());
         let record = LeaseRecord {
             caller: demand.caller.to_owned(),
             member: demand.member.to_owned(),
@@ -658,21 +775,26 @@ impl AdmissionBackend for RedisAdmissionBackend {
             holds_member_slot: demand.member_cap.is_some(),
             holds_model_slot: demand.model_cap.is_some(),
         };
-        let record_key = self.lease_key(&LeaseId::new(id.to_string()));
+        let record_key = self.lease_key(&lease);
         let payload = serde_json::to_string(&record).map_err(|error| {
             EngineError::Internal(format!("serializing admission lease: {error}"))
         })?;
-        let _: () = conn
-            .set_ex(record_key, payload, LEASE_TTL.as_secs().max(1))
+        let deadline = demand.now + self.lease_ttl;
+        let _: usize = conn
+            .zadd(self.leases_index_key(), lease.as_str(), unix_ms(deadline))
             .await
             .map_err(|error| store_error(&error))?;
-        Ok(LeaseId::new(id.to_string()))
+        let _: () = conn
+            .set(record_key, payload)
+            .await
+            .map_err(|error| store_error(&error))?;
+        Ok(lease)
     }
 
     fn settle(&self, lease: &LeaseId, settlement: &Settlement) {
         // Fire-and-forget, mirroring the trait contract: never block the
         // calling task. Without a runtime (settlement outside async
-        // context) the write is dropped; the lease TTL bounds the leak.
+        // context) the write is dropped; the reaper bounds the leak.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let backend = self.clone();
@@ -683,7 +805,8 @@ impl AdmissionBackend for RedisAdmissionBackend {
                         tracing::warn!(
                             %error,
                             lease = lease.as_str(),
-                            "admission settlement write failed; reservation expires with its TTL"
+                            "admission settlement write failed; the reaper releases the \
+                             reservation past its deadline"
                         );
                     }
                 });
@@ -691,7 +814,8 @@ impl AdmissionBackend for RedisAdmissionBackend {
             Err(_) => {
                 tracing::warn!(
                     lease = lease.as_str(),
-                    "admission settlement outside a runtime was dropped; reservation expires with its TTL"
+                    "admission settlement outside a runtime was dropped; the reaper releases the \
+                     reservation past its deadline"
                 );
             }
         }
@@ -770,8 +894,9 @@ impl AdmissionBackend for RedisAdmissionBackend {
             }
         }
 
-        // Release the old slots and record the move, keeping the lease's
-        // TTL (a moving lease must not outlive its crash bound).
+        // Release the old slots and record the move. The record carries
+        // no TTL — the deadline lives in the index and is unchanged by a
+        // rekey, so a moving lease keeps its crash bound.
         self.release_slots(&mut conn, &record)
             .await
             .map_err(|error: RedisStoreError| EngineError::Internal(error.to_string()))?;
@@ -782,9 +907,8 @@ impl AdmissionBackend for RedisAdmissionBackend {
         let payload = serde_json::to_string(&record).map_err(|error| {
             EngineError::Internal(format!("serializing admission lease: {error}"))
         })?;
-        let options = redis::SetOptions::default().with_expiration(redis::SetExpiry::KEEPTTL);
         let _: Option<String> = conn
-            .set_options(record_key, payload, options)
+            .set(record_key, payload)
             .await
             .map_err(|error| store_error(&error))?;
         Ok(())
@@ -823,4 +947,30 @@ pub fn replica_admission_over_config(
         providers,
         Arc::new(RedisAdmissionBackend::new(store)),
     )
+}
+
+/// The lease crash bound: a timer that runs on every replica, releasing
+/// the reservation, budget share and slots of every lease whose deadline
+/// has passed (its replica died before settling). The `DEL` claim inside
+/// [`RedisAdmissionBackend::reap_expired`] makes the release happen
+/// exactly once across all the reapers; dropping the handle leaves the
+/// task running.
+pub fn spawn_reaper(store: RedisStore) -> tokio::task::JoinHandle<()> {
+    let backend = RedisAdmissionBackend::new(store);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(REAP_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match backend.reap_expired(OffsetDateTime::now_utc()).await {
+                Ok(reaped) if reaped > 0 => {
+                    tracing::debug!(reaped, "released unsettled leases past their deadline");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "lease reaper pass failed");
+                }
+            }
+        }
+    })
 }

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use llm_proxy_core::{KeyBudgetConfig, KeyWindowLimits, ModelPricing, UnestimatableCostPolicy};
 use llm_proxy_engine::{
-    Admission, AdmissionClaim, AdmissionOutcome, Cooldowns, KeyPolicy, Settlement,
+    Admission, AdmissionClaim, AdmissionOutcome, Cooldowns, KeyPolicy, PolicyAdmission, Settlement,
 };
 use llm_proxy_storage::{EventBus, ProxyEvent};
 use llm_proxy_store_redis::{
@@ -648,6 +648,130 @@ async fn settlement_never_lets_a_concurrent_admission_see_less_exposure_than_the
             "{direction}: usage replaces the reservation exactly once"
         );
     }
+}
+
+/// The done-when of plan 09 step 2: an unsettled lease (a replica that
+/// died before settling) releases exactly the budget share and slots it
+/// held once its deadline passes and the reaper runs — and nothing before
+/// that — so the next claim can be admitted again.
+#[tokio::test]
+async fn an_unsettled_lease_releases_its_budget_and_slots_when_reaped() {
+    // Variant "1": the budget fits exactly one claim, so the second claim
+    // refuses on the budget. Variant "3": it fits three, so the second
+    // claim refuses on the member cap of one — the reaper must release
+    // both counters either way.
+    for (budget_usd, refusal) in [("1", "budget"), ("3", "cap")] {
+        let server = TestRedis::start().expect("bind the in-process test Redis");
+        let store = RedisStore::connect(&server.url(), "reap")
+            .await
+            .expect("connect");
+        let backend =
+            RedisAdmissionBackend::new(store.clone()).with_lease_ttl(Duration::from_secs(60));
+        let admission = PolicyAdmission::over_backend(
+            budgeted(budget_usd),
+            pricing(),
+            caps(1),
+            Arc::new(backend.clone()),
+        );
+
+        let reserved_at = OffsetDateTime::now_utc();
+        let first = admission
+            .reserve(&claim("key", "p", "m"))
+            .await
+            .expect("the first claim takes the budget and the only slot");
+        assert!(first.lease.is_some(), "the redis backend issues a lease");
+
+        // Before the deadline the lease still holds both counters.
+        let second = admission
+            .reserve(&claim("key", "p", "m"))
+            .await
+            .expect_err("the unsettled lease still holds its budget and slot");
+        match (refusal, second) {
+            ("budget", llm_proxy_engine::EngineError::BudgetExhausted { .. }) => {}
+            ("cap", llm_proxy_engine::EngineError::Overloaded { .. }) => {}
+            (which, other) => panic!("{which} variant: expected a refusal, got {other:?}"),
+        }
+
+        // Reaping before the deadline releases nothing: the refusal stands.
+        let reaped = backend
+            .reap_expired(reserved_at)
+            .await
+            .expect("reap before the deadline");
+        assert_eq!(reaped, 0, "a lease before its deadline is not reaped");
+        admission
+            .reserve(&claim("key", "p", "m"))
+            .await
+            .expect_err("the lease is not past its deadline, so it still holds");
+
+        // Past the deadline the reaper releases what settlement would:
+        // reservation, budget share and the slot. Exactly once.
+        let reaped = backend
+            .reap_expired(reserved_at + Duration::from_secs(120))
+            .await
+            .expect("reap past the deadline");
+        assert_eq!(reaped, 1, "the expired lease is reaped once");
+
+        // The released budget admits the next claim again.
+        admission
+            .reserve(&claim("key", "p", "m"))
+            .await
+            .expect("the reaped lease's budget and slot are free again");
+
+        let day = day_stamp(reserved_at);
+        assert_eq!(
+            server.get(&format!("reap:ad:spent:key:{day}")),
+            None,
+            "the reap must not charge spend"
+        );
+        assert_eq!(
+            server.get(&format!("reap:ad:resv:key:{day}")).as_deref(),
+            Some("1000000"),
+            "the reservation counter holds only the new claim's estimate"
+        );
+        assert_eq!(
+            server.get("reap:ad:infl:m:p").as_deref(),
+            Some("1"),
+            "the slot counter holds only the new claim's slot"
+        );
+    }
+}
+
+/// Two reapers racing over the same expired lease must release its
+/// counters exactly once: the record is claimed by the DEL reply count,
+/// so the loser of the race releases nothing and no counter dips
+/// negative.
+#[tokio::test]
+async fn reaping_twice_concurrently_releases_once() {
+    let server = TestRedis::start().expect("bind the in-process test Redis");
+    let store = RedisStore::connect(&server.url(), "reap2")
+        .await
+        .expect("connect");
+    let backend = RedisAdmissionBackend::new(store.clone()).with_lease_ttl(Duration::from_secs(60));
+    let admission =
+        PolicyAdmission::over_backend(budgeted("1"), pricing(), caps(1), Arc::new(backend.clone()));
+    let reserved_at = OffsetDateTime::now_utc();
+    let ticket = admission
+        .reserve(&claim("key", "p", "m"))
+        .await
+        .expect("one claim, holding the budget and the only slot");
+    assert!(ticket.lease.is_some(), "the redis backend issues a lease");
+
+    let past = reserved_at + Duration::from_secs(120);
+    let (first, second) = tokio::join!(backend.reap_expired(past), backend.reap_expired(past));
+    let reaped = first.expect("first reaper") + second.expect("second reaper");
+    assert_eq!(reaped, 1, "exactly one reaper wins the claim and releases");
+
+    let day = day_stamp(reserved_at);
+    let reserved: i64 = server
+        .get(&format!("reap2:ad:resv:key:{day}"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(reserved, 0, "the reservation is released once, never twice");
+    let slot: i64 = server
+        .get("reap2:ad:infl:m:p")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(slot, 0, "the slot is released once, never twice");
 }
 
 /// Two concurrent settles of one lease must release its counters once:

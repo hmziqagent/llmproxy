@@ -33,6 +33,7 @@ pub struct TestRedis {
 struct Db {
     strings: Mutex<HashMap<String, (String, Option<u64>)>>,
     sets: Mutex<HashMap<String, Vec<String>>>,
+    zsets: Mutex<HashMap<String, Vec<(f64, String)>>>,
     streams: Mutex<HashMap<String, Vec<String>>>,
     stream_seq: Mutex<u64>,
     trace: Mutex<Option<Vec<KeySnapshot>>>,
@@ -66,6 +67,7 @@ impl TestRedis {
         let db = Arc::new(Db {
             strings: Mutex::new(HashMap::new()),
             sets: Mutex::new(HashMap::new()),
+            zsets: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             stream_seq: Mutex::new(0),
             trace: Mutex::new(None),
@@ -283,6 +285,112 @@ fn handle_set(db: &Arc<Db>, rest: &[String]) -> String {
     simple("OK")
 }
 
+fn score_bound(raw: &str) -> Option<f64> {
+    match raw.to_ascii_lowercase().as_str() {
+        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
+        other => other.parse().ok(),
+    }
+}
+
+fn zadd(db: &Arc<Db>, rest: &[String]) -> String {
+    // ZADD key score member
+    let (Some(key), Some(score), Some(member)) = (rest.first(), rest.get(1), rest.get(2)) else {
+        return error("ZADD needs a key, a score and a member");
+    };
+    let Ok(score) = score.parse::<f64>() else {
+        return error("ZADD score is not a number");
+    };
+    let mut zsets = db
+        .zsets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bucket = zsets.entry(key.clone()).or_default();
+    let mut added = 0_i64;
+    match bucket.iter_mut().find(|(_, existing)| existing == member) {
+        Some(entry) => entry.0 = score,
+        None => {
+            bucket.push((score, member.clone()));
+            added = 1;
+        }
+    }
+    bucket.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    integer(added)
+}
+
+fn zrem(db: &Arc<Db>, rest: &[String]) -> String {
+    // ZREM key member [member ...]
+    let (Some(key), members) = (rest.first(), rest.get(1..).unwrap_or(&[])) else {
+        return error("ZREM needs a key and a member");
+    };
+    if members.is_empty() {
+        return error("ZREM needs a member");
+    }
+    let mut zsets = db
+        .zsets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let removed = match zsets.get_mut(key) {
+        Some(bucket) => {
+            let before = bucket.len();
+            bucket.retain(|(_, member)| !members.contains(member));
+            before - bucket.len()
+        }
+        None => 0,
+    };
+    integer(i64::try_from(removed).unwrap_or(0))
+}
+
+fn zrangebyscore(db: &Arc<Db>, rest: &[String]) -> String {
+    // ZRANGEBYSCORE key min max [LIMIT offset count], inclusive bounds,
+    // -inf/+inf accepted like plain numbers.
+    let (Some(key), Some(min), Some(max)) = (rest.first(), rest.get(1), rest.get(2)) else {
+        return error("ZRANGEBYSCORE needs a key and a score range");
+    };
+    let (Some(min), Some(max)) = (score_bound(min), score_bound(max)) else {
+        return error("ZRANGEBYSCORE bound is not a number");
+    };
+    let mut offset = 0_usize;
+    let mut count = usize::MAX;
+    let mut index = 3;
+    while let Some(option) = rest.get(index) {
+        if option.eq_ignore_ascii_case("LIMIT") {
+            offset = rest
+                .get(index + 1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            count = rest
+                .get(index + 2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            index += 3;
+        } else {
+            return error(&format!("unsupported ZRANGEBYSCORE option {option}"));
+        }
+    }
+    let zsets = db
+        .zsets
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let selected: Vec<&String> = zsets
+        .get(key)
+        .map(|bucket| {
+            bucket
+                .iter()
+                .filter(|(score, _)| *score >= min && *score <= max)
+                .map(|(_, member)| member)
+                .skip(offset)
+                .take(count)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut payload = format!("*{}\r\n", selected.len());
+    for member in &selected {
+        payload.push_str(&bulk(Some(member)));
+    }
+    payload
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one match over the supported command set; each arm is a line or three"
@@ -408,6 +516,9 @@ fn handle(args: &[String], db: &Arc<Db>) -> String {
             }
             payload
         }
+        "ZADD" => zadd(db, rest),
+        "ZREM" => zrem(db, rest),
+        "ZRANGEBYSCORE" => zrangebyscore(db, rest),
         "XADD" => {
             // XADD key id field value [field value ...] — the store sends
             // `*` for the id; any id is accepted.

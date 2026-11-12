@@ -50,9 +50,11 @@ unless real use says otherwise.
   (`AdmissionBackend`), the cooldown view behind `Cooldowns` (now
   wall-clock), so the replica stores implement engine seams instead of
   their own copy of the rules. Redis: every counter move is one atomic
-  `INCR`, refusals roll back, unsettled leases expire on a TTL; two
-  instances over one store enforce one budget between them,
-  concurrently, and a refund on one releases budget for the other.
+  `INCR`, refusals roll back; unsettled leases are reaped past their
+  deadline (a deadline index plus a 60 s reaper on every replica,
+  exactly one release per lease); two instances over one store enforce
+  one budget between them, concurrently, and a refund on one releases
+  budget for the other.
   Settlement charges spend before releasing the reservation (settle-vs-
   admit is ordering, not a transaction), and one lease settles its
   counters exactly once.
