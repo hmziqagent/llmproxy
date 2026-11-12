@@ -643,6 +643,7 @@ fn edit_raw_anthropic_request(
         &sampling,
         &target.upstream_model,
         sampling.max_tokens,
+        target.lossy,
     )? {
         obj.insert("thinking".to_owned(), thinking);
     }
@@ -748,6 +749,7 @@ fn encode_normalized_request(
                 .max_tokens
                 .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
         ),
+        target.lossy,
     )? {
         obj.insert("thinking".to_owned(), thinking);
     }
@@ -2372,6 +2374,39 @@ mod tests {
             body["thinking"]["budget_tokens"], 4_095,
             "budget must stay under the emitted max_tokens"
         );
+    }
+
+    #[test]
+    fn cross_format_thinking_that_cannot_fit_under_max_tokens_errors() {
+        // A Chat client asking for reasoning with a `max_tokens` below the
+        // model's minimum thinking budget gets a request error naming the
+        // limit instead of a silently non-thinking answer (02-4).
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.reasoning_effort = Some("low".into());
+        core.sampling.max_tokens = Some(512);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 512,
+                "messages": [],
+                "reasoning_effort": "low",
+            }),
+        );
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let err = adapter
+            .encode_request(&core, &target, &client)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot fit under max_tokens"), "{err}");
+        assert!(err.contains("1024"), "{err}");
     }
 
     #[test]

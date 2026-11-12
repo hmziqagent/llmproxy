@@ -186,13 +186,16 @@ impl ReasoningIntent {
 
 /// Builds the Anthropic `thinking` object for a request: translated and
 /// clamped, never forwarded raw. Returns `None` when the request carries no
-/// reasoning intent, or when it cannot be represented (budget would have to
-/// exceed `max_tokens`); the latter drops thinking with a warning instead of
-/// failing the request.
+/// reasoning intent, or — on a `lossy` route — when the requested budget
+/// cannot fit under `max_tokens`, dropped with a warning. On a strict route a
+/// fit failure is a [`ProviderError::InvalidRequest`] naming the limit, so a
+/// client that asked for reasoning never silently receives a non-thinking
+/// answer.
 pub fn anthropic_thinking(
     sampling: &SamplingOptions,
     upstream_model: &str,
     max_tokens: Option<i32>,
+    lossy: bool,
 ) -> Result<Option<Value>, ProviderError> {
     let intent = intent_from_sampling(sampling)?;
     let Some(budget) = intent.budget_for(upstream_model) else {
@@ -204,12 +207,21 @@ pub fn anthropic_thinking(
         // Anthropic requires budget_tokens < max_tokens.
         let headroom = i64::from(max_tokens) - 1;
         if headroom < limits.min {
-            tracing::warn!(
-                max_tokens,
-                upstream_model,
-                "thinking budget cannot fit under max_tokens; dropping thinking"
-            );
-            return Ok(None);
+            if lossy {
+                tracing::warn!(
+                    max_tokens,
+                    upstream_model,
+                    "thinking budget cannot fit under max_tokens; dropping thinking"
+                );
+                return Ok(None);
+            }
+            let min = limits.min;
+            let min_plus_one = limits.min + 1;
+            return Err(ProviderError::InvalidRequest(format!(
+                "thinking budget {budget} cannot fit under max_tokens {max_tokens} \
+                 (minimum thinking budget for {upstream_model} is {min}); raise max_tokens \
+                 above {min_plus_one} or remove thinking/reasoning_effort"
+            )));
         }
         if budget > headroom {
             tracing::warn!(budget, headroom, "thinking budget clamped below max_tokens");
@@ -287,7 +299,7 @@ mod tests {
             None,
             Some(serde_json::json!({"type": "enabled", "budget_tokens": 50_000})),
         );
-        let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(8_192))
+        let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(8_192), false)
             .unwrap()
             .expect("thinking must be representable");
         assert_eq!(thinking["budget_tokens"], serde_json::json!(8_191));
@@ -297,7 +309,7 @@ mod tests {
     #[test]
     fn anthropic_thinking_from_effort_honours_the_model_minimum() {
         let sampling = sampling(Some("minimal"), None);
-        let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(100_000))
+        let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(100_000), false)
             .unwrap()
             .expect("thinking must be representable");
         assert_eq!(thinking["budget_tokens"], serde_json::json!(1_024));
@@ -306,8 +318,41 @@ mod tests {
     #[test]
     fn anthropic_thinking_dropped_when_max_tokens_leaves_no_room() {
         let sampling = sampling(Some("high"), None);
-        let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(1_024)).unwrap();
+        let thinking =
+            anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(1_024), true).unwrap();
         assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn thinking_that_cannot_fit_is_an_error_naming_the_limit() {
+        let sampling = sampling(Some("high"), None);
+        let err = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(1_000), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_tokens"), "{err}");
+        assert!(err.contains("1024"), "{err}");
+    }
+
+    #[test]
+    fn thinking_that_cannot_fit_is_dropped_when_lossy() {
+        let sampling = sampling(Some("high"), None);
+        let thinking =
+            anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(1_000), true).unwrap();
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn thinking_that_fits_is_unchanged() {
+        let sampling = sampling(Some("high"), None);
+        let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(8_000), false)
+            .unwrap()
+            .expect("thinking must be representable");
+        assert!(
+            thinking["budget_tokens"]
+                .as_i64()
+                .is_some_and(|budget| budget < 8_000),
+            "{thinking}"
+        );
     }
 
     #[test]
@@ -322,7 +367,7 @@ mod tests {
                     "type": "enabled", "budget_tokens": 31_999, "display": "omitted"
                 })),
             );
-            let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(32_000))
+            let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(32_000), false)
                 .unwrap()
                 .expect("thinking must be representable");
             assert_eq!(thinking["display"], serde_json::json!("omitted"));
@@ -336,7 +381,7 @@ mod tests {
                     "type": "enabled", "budget_tokens": 50_000, "display": "omitted"
                 })),
             );
-            let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(8_192))
+            let thinking = anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(8_192), false)
                 .unwrap()
                 .expect("thinking must be representable");
             assert_eq!(thinking["budget_tokens"], serde_json::json!(8_191));
@@ -406,7 +451,7 @@ mod tests {
         let sampling = SamplingOptions::default();
         assert_eq!(gemini_budget(&sampling, "gemini-2.5-pro").unwrap(), None);
         assert!(
-            anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(2_048))
+            anthropic_thinking(&sampling, "claude-sonnet-4-5", Some(2_048), false)
                 .unwrap()
                 .is_none()
         );
