@@ -1483,6 +1483,13 @@ mod tests {
         let app = build_router(state);
         let mut body = responses_request(false);
         body["store"] = json!(false);
+        // Conversation continuity (`previous_response_id`) and the codex
+        // knobs (`prompt_cache_key`, `include`) have no typed decode: they
+        // are extras, and the same-format passthrough must still forward
+        // them untouched.
+        body["previous_response_id"] = json!("resp_prev_01");
+        body["prompt_cache_key"] = json!("k1");
+        body["include"] = json!(["reasoning.encrypted_content"]);
         let response = app
             .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
             .await
@@ -1498,6 +1505,10 @@ mod tests {
         assert_eq!(
             upstream_body, body,
             "same-format Responses must forward byte-identical modulo nothing"
+        );
+        assert_eq!(
+            upstream_body["previous_response_id"], "resp_prev_01",
+            "conversation continuity must survive passthrough"
         );
     }
 
@@ -1594,6 +1605,32 @@ mod tests {
         assert!(
             text.contains("store"),
             "the rejection must name store: {text}"
+        );
+    }
+
+    // Conversation continuity lives in `previous_response_id`; the Anthropic
+    // API has no equivalent, so crossing formats must reject it by name,
+    // never silently break what the client thinks is a continuing thread.
+    #[tokio::test]
+    async fn responses_previous_response_id_is_rejected_by_name_cross_format() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let mut body = responses_request(false);
+        body["previous_response_id"] = json!("resp_prev_01");
+        let response = build_router(state)
+            .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("previous_response_id"),
+            "the rejection must name previous_response_id: {text}"
         );
     }
 
