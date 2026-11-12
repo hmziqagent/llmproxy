@@ -21,8 +21,8 @@ use llm_proxy_core::{
     ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
 };
 use llm_proxy_engine::{
-    ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest, EngineResponse, Guard,
-    InboundRequest,
+    Cache, ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest, EngineResponse, Guard,
+    GuardDecision, InboundRequest, MemoryCache,
 };
 use llm_proxy_protocol::core::{
     CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole, ModelRef, SamplingOptions,
@@ -53,6 +53,68 @@ impl Guard for ResponseMaskingGuard {
                 *text = text.replace(SECRET, PLACEHOLDER);
             }
         }
+        Ok(())
+    }
+}
+
+/// The request-side secret: a masking guard rewrites it before egress, but
+/// the rejecting guard must see it first (slot 7 before slot 8).
+const REQUEST_SECRET: &str = "sk-requestsecret42";
+
+/// A Buffered request-masking guard: it replaces [`REQUEST_SECRET`] in the
+/// request's words.
+#[derive(Debug)]
+struct RequestMaskingGuard;
+
+#[async_trait]
+impl Guard for RequestMaskingGuard {
+    async fn transform_request(&self, request: &mut CoreRequest) -> Result<(), EngineError> {
+        for message in &mut request.messages {
+            for content in &mut message.content {
+                if let CoreContent::Text { text, .. } = content {
+                    *text = text.replace(REQUEST_SECRET, PLACEHOLDER);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A pre-call guard that rejects any request whose words still carry
+/// [`REQUEST_SECRET`]: its rule cannot hold once the text has been
+/// rewritten, so it refuses instead of trusting a masker.
+#[derive(Debug)]
+struct RejectSecretRequestGuard;
+
+#[async_trait]
+impl Guard for RejectSecretRequestGuard {
+    async fn inspect_request(&self, request: &CoreRequest) -> Result<GuardDecision, EngineError> {
+        for message in &request.messages {
+            for content in &message.content {
+                if let CoreContent::Text { text, .. } = content
+                    && text.contains(REQUEST_SECRET)
+                {
+                    return Ok(GuardDecision::Reject(
+                        "request still carries a secret".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(GuardDecision::Allow)
+    }
+}
+
+/// A request-rewriting guard that only counts how many times the engine
+/// asked it to rewrite; it changes nothing itself.
+#[derive(Debug)]
+struct CountingRequestTransformGuard {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Guard for CountingRequestTransformGuard {
+    async fn transform_request(&self, _request: &mut CoreRequest) -> Result<(), EngineError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -171,6 +233,27 @@ fn build_engine(endpoint: String, guard: Option<Arc<dyn Guard>>, idempotency: bo
         .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>);
     if let Some(guard) = guard {
         builder = builder.guard(guard);
+    }
+    builder.build().expect("engine builds")
+}
+
+/// Like [`build_engine`], but with several guards in the given order and an
+/// optional cache (the engine defaults to [`NoCache`]).
+fn build_engine_with_guards_and_cache(
+    endpoint: String,
+    guards: Vec<Arc<dyn Guard>>,
+    cache: Option<Arc<dyn Cache>>,
+) -> Engine {
+    let config = test_config();
+    let registry = ProviderRegistry::from_providers(vec![provider(endpoint)]).expect("registry");
+    let mut builder = EngineBuilder::new(config)
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>);
+    for guard in guards {
+        builder = builder.guard(guard);
+    }
+    if let Some(cache) = cache {
+        builder = builder.cache(cache);
     }
     builder.build().expect("engine builds")
 }
@@ -348,5 +431,78 @@ async fn without_a_guard_the_same_format_fast_path_stays_byte_identical() {
         response.raw_body.as_deref(),
         Some(UPSTREAM_BODY.as_bytes()),
         "no response transform ran: the client must receive the upstream bytes verbatim"
+    );
+}
+
+/// A rejecting guard judges the client's words, not an earlier masker's
+/// output: the pre-call guard pass (slot 7) runs before any request rewrite
+/// (slot 8), so a secret the rejector blocks is refused — before routing,
+/// admission or any upstream attempt — even though the masking guard
+/// installed before it would have redacted it.
+#[tokio::test]
+async fn a_rejecting_guard_sees_the_unmasked_request() {
+    let (endpoint, calls) = spawn_secret_upstream().await;
+    let engine = build_engine_with_guards_and_cache(
+        endpoint,
+        vec![
+            Arc::new(RequestMaskingGuard) as Arc<dyn Guard>,
+            Arc::new(RejectSecretRequestGuard) as Arc<dyn Guard>,
+        ],
+        None,
+    );
+
+    let outcome = engine
+        .execute(engine_request(&format!("echo {REQUEST_SECRET} back"), None))
+        .await;
+
+    let error = outcome.expect_err("the rejecting guard refuses the request");
+    assert!(
+        matches!(&error, EngineError::InvalidRequest(message) if message.contains("secret")),
+        "expected the pre-call guard rejection, got {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the request must be refused before any upstream attempt"
+    );
+}
+
+/// The guards' request rewrite (slot 8) runs on the ladder path only: an
+/// identical retry answered from the cache (slot 5) never re-runs it, and
+/// cache identity is what the client sent — not what a guard rewrote.
+#[tokio::test]
+async fn a_cache_hit_is_served_without_running_request_transforms() {
+    let (endpoint, calls) = spawn_secret_upstream().await;
+    let transforms = Arc::new(AtomicUsize::new(0));
+    let engine = build_engine_with_guards_and_cache(
+        endpoint,
+        vec![Arc::new(CountingRequestTransformGuard {
+            calls: Arc::clone(&transforms),
+        }) as Arc<dyn Guard>],
+        Some(Arc::new(MemoryCache::new(Duration::from_secs(60), 16)) as Arc<dyn Cache>),
+    );
+
+    let first = engine
+        .execute(engine_request("cache identity prompt", None))
+        .await
+        .expect("first request serves");
+    let second = engine
+        .execute(engine_request("cache identity prompt", None))
+        .await
+        .expect("second request serves");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the second request must be a cache hit, not a second upstream call"
+    );
+    assert_eq!(
+        transforms.load(Ordering::SeqCst),
+        1,
+        "only the cache-missing request runs the guards' request rewrite"
+    );
+    assert_eq!(
+        first.core.content, second.core.content,
+        "the cache hit serves the first request's stored response"
     );
 }

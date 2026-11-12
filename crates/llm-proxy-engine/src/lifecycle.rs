@@ -422,7 +422,7 @@ async fn authorize_step(
         .await
 }
 
-/// Slots 6 and 8 for one request: the token estimate, the context-window
+/// Slot 6 for one request: the token estimate, the context-window
 /// preflight (plan 05 step 8) and the admission reservation against the
 /// member the ladder will try first — cooldown reorder included, so the
 /// concurrency slot starts on the member that will actually serve (plan 05
@@ -1033,8 +1033,6 @@ pub(crate) async fn execute(
 
     emit_request_received(&inner, &req, false);
 
-    let mut req = req;
-    apply_request_transforms(&inner, &mut req).await?;
     let outcome = run_once(&inner, &req).await;
     match outcome {
         Ok(response) => Ok(response),
@@ -1053,29 +1051,34 @@ pub(crate) async fn execute(
     }
 }
 
-/// Slot 7.5 for non-streaming and streaming alike: the guards' request
-/// rewrites (masking, plan 09 step 4), applied once before the ladder so
-/// every attempt encodes the same redacted core. With no guards
-/// configured this is a no-op.
+/// Slot 8 for non-streaming and streaming alike: the guards' request
+/// rewrites (masking, plan 09 step 4), applied once per request after the
+/// pre-call guards judged the client's original words (slot 7) and after the
+/// reservation (slot 6), so every attempt encodes the same redacted core
+/// while the cache, idempotency and single-flight identity stays what the
+/// client sent. Returns the rewritten request, or `None` when no guard
+/// changed the text. With no guards configured this is a no-op.
 async fn apply_request_transforms(
     inner: &Arc<EngineInner>,
-    req: &mut EngineRequest,
-) -> Result<(), EngineError> {
+    req: &EngineRequest,
+) -> Result<Option<EngineRequest>, EngineError> {
     if inner.guards.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let before: Vec<String> = crate::guard_texts(&req.core).collect();
+    let mut rewritten = req.clone();
     for guard in &inner.guards {
-        guard.transform_request(&mut req.core).await?;
+        guard.transform_request(&mut rewritten.core).await?;
     }
-    let after: Vec<String> = crate::guard_texts(&req.core).collect();
-    if before != after {
-        // A guard rewrote the request's words. The client's raw bytes are
-        // no longer the truth: the same-format passthrough shortcut must
-        // not carry the un-redacted text to the upstream.
-        req.inbound.wire.force_core_encode = true;
+    let after: Vec<String> = crate::guard_texts(&rewritten.core).collect();
+    if before == after {
+        return Ok(None);
     }
-    Ok(())
+    // A guard rewrote the request's words. The client's raw bytes are
+    // no longer the truth: the same-format passthrough shortcut must
+    // not carry the un-redacted text to the upstream.
+    rewritten.inbound.wire.force_core_encode = true;
+    Ok(Some(rewritten))
 }
 
 async fn resolve_plan(
@@ -1336,7 +1339,7 @@ async fn run_once_attempt(
         }
     }
 
-    // Slots 6 and 8: preflight, then one reservation for the whole ladder;
+    // Slot 6: preflight, then one reservation for the whole ladder;
     // settlement happens exactly once at the end. A failure that the
     // provider still billed (a guard-rejected response) charges its usage.
     // An admission refusal reaches the followers as itself (402/429/…), not
@@ -1419,6 +1422,15 @@ async fn run_ladder_once(
             }
         }
     }
+
+    // Slot 8: the guards' request rewrites. They follow the pre-call guards,
+    // so a rejecting guard judges the client's original words, and follow the
+    // reservation: routing, idempotency, cache and single-flight above keyed
+    // the original request (`cache_key` borrows it) — identity is what the
+    // client sent, and a rewrite failure refunds through the ladder's
+    // failure path like any other attempt error.
+    let rewritten = apply_request_transforms(inner, req).await?;
+    let req = rewritten.as_ref().unwrap_or(req);
 
     let mut ladder = Ladder {
         session_id: session_id_of(req),
@@ -1765,14 +1777,13 @@ type ByteStream = std::pin::Pin<
 /// internal error for a request it never ran.
 pub(crate) async fn execute_stream(
     inner: Arc<EngineInner>,
-    mut req: EngineRequest,
+    req: EngineRequest,
 ) -> Result<EngineStream, EngineError> {
     let start = req.start;
     crate::validate_provider_name(&req.provider_name)?;
     inner.metrics.record_request(true);
 
     emit_request_received(&inner, &req, true);
-    apply_request_transforms(&inner, &mut req).await?;
 
     let mut leader_losses_left = 1;
     loop {
@@ -1929,7 +1940,7 @@ async fn execute_stream_attempt(
         }
     }
 
-    // Slots 6 and 8: preflight, then one reservation for the whole ladder.
+    // Slot 6: preflight, then one reservation for the whole ladder.
     // An admission refusal reaches the joiners as itself (402/429/…), not
     // through the lead drop backstop's internal error — same rule as the
     // non-streaming path.
@@ -1976,6 +1987,31 @@ async fn execute_stream_attempt(
         }
         return Err(refusal);
     }
+
+    // Slot 8: the guards' request rewrites, after the pre-call guards judged
+    // the client's original words and the reservation. Routing, idempotency
+    // and the stream shares above keyed the original request — identity is
+    // what the client sent. A rewrite failure reserves and refunds like a
+    // guard refusal and reaches the joiners through the lead as itself.
+    let req = match apply_request_transforms(&inner, &req).await {
+        Ok(Some(rewritten)) => rewritten,
+        Ok(None) => req,
+        Err(error) => {
+            settle(&inner, &ticket, false, None, None);
+            emit_response_failed(
+                &inner,
+                &req.request_id,
+                Some(&req.provider_name),
+                Some(&req.core.model),
+                &error,
+                start,
+            );
+            if let Some(lead) = stream_lead.take() {
+                lead.publish(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
 
     let request_id = req.request_id.clone();
     let route_name = req.provider_name.clone();

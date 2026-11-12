@@ -21,8 +21,9 @@
 //!    [`Cache`], [`SingleFlight`], [`StreamShares`].
 //! 6. Reserve budget — [`Admission`].
 //! 7. Pre-call guards — [`Guard`].
-//! 8. Request mutations in fixed phases — adapter encode (same-format
-//!    passthrough or the cross-format field policy).
+//! 8. Apply request mutations in their fixed phases — the guards' request
+//!    rewrites (after slot 7 judged the client's words), then adapter encode
+//!    (same-format passthrough or the cross-format field policy).
 //! 9. The attempt loop — pick credential ([`CredentialSource`]), encode, send
 //!    via the transport, retry or fail over (later plan).
 //! 10. Hold the stream until it can be committed — the first-byte window of
