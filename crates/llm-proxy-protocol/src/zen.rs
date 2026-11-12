@@ -221,6 +221,15 @@ pub struct GeminiRequest {
     pub generation_config: Option<GeminiGenerationConfig>,
     /// Tools available to the model.
     pub tools: Vec<GeminiTool>,
+    /// Tool-calling control, carried from the core `tool_choice` as
+    /// `toolConfig.functionCallingConfig`; emitted only when the request
+    /// carries `tools`.
+    #[serde(
+        rename = "toolConfig",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tool_config: Option<serde_json::Value>,
     /// Streaming control for the adapter only; the Gemini wire format has no
     /// body field for it — streaming is selected by calling
     /// `:streamGenerateContent?alt=sse` instead of `:generateContent`, which
@@ -600,6 +609,7 @@ mod tests {
             contents: vec![],
             generation_config: None,
             tools: vec![],
+            tool_config: None,
             stream: Some(true),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -622,6 +632,7 @@ mod tests {
                 thinking_config: None,
             }),
             tools: vec![],
+            tool_config: None,
             stream: Some(true),
         };
         let json = serde_json::to_string(&req).unwrap();

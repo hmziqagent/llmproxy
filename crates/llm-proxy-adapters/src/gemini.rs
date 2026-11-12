@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use llm_proxy_protocol::core::{
-    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, ModelRef, StopReason,
-    Usage, UsageProvenance,
+    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
+    ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_protocol::zen::{
     GeminiFunctionCall, GeminiFunctionDeclaration, GeminiGenerationConfig, GeminiPart,
@@ -346,6 +346,53 @@ fn encode_tool_result_payload(
     serde_json::json!({ key: texts.join("\n") })
 }
 
+/// Maps the core tool choice onto Gemini's `toolConfig.functionCallingConfig`.
+/// The config is emitted only when the request carries function declarations
+/// (Gemini rejects `toolConfig` in ANY mode without `tools`), so `None`/`Auto`
+/// with no tools are omitted entirely. A `Raw` choice (or any future core
+/// variant) has no Gemini representation: strict routes fail with the field
+/// named, lossy routes warn and drop it.
+fn encode_tool_choice(
+    choice: Option<&CoreToolChoice>,
+    has_tools: bool,
+    lossy: bool,
+) -> Result<Option<serde_json::Value>, ProviderError> {
+    let Some(choice) = choice else {
+        return Ok(None);
+    };
+    let config = match choice {
+        CoreToolChoice::Auto => serde_json::json!({"functionCallingConfig": {"mode": "AUTO"}}),
+        CoreToolChoice::Any => serde_json::json!({"functionCallingConfig": {"mode": "ANY"}}),
+        CoreToolChoice::None => serde_json::json!({"functionCallingConfig": {"mode": "NONE"}}),
+        // The forced name must be the same string the `functionDeclarations`
+        // entry uses, which is the core tool's `name` verbatim.
+        CoreToolChoice::Tool { name } => serde_json::json!({
+            "functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": [name],
+            }
+        }),
+        CoreToolChoice::Raw(_) | _ => {
+            if lossy {
+                tracing::warn!(
+                    tool_choice = ?choice,
+                    "Gemini: tool_choice has no Gemini equivalent; \
+                     dropping because the route allows lossy conversion"
+                );
+                return Ok(None);
+            }
+            return Err(ProviderError::InvalidRequest(format!(
+                "tool_choice {choice:?} has no gemini equivalent; \
+                 remove it or enable the route's lossy mode"
+            )));
+        }
+    };
+    if !has_tools {
+        return Ok(None);
+    }
+    Ok(Some(config))
+}
+
 impl GeminiAdapter {
     /// Encode a core request into a Gemini GenerateContent request.
     #[expect(
@@ -520,13 +567,8 @@ impl GeminiAdapter {
             thinking_config,
         };
 
-        if core.tool_choice.is_some() {
-            tracing::warn!(
-                tool_choice = ?core.tool_choice,
-                "Gemini: tool_choice specified but not yet forwarded to upstream; \
-                 the model will use its default tool calling behavior"
-            );
-        }
+        let tool_config =
+            encode_tool_choice(core.tool_choice.as_ref(), !tools.is_empty(), target.lossy)?;
 
         if core.metadata.user_id.is_some() {
             tracing::warn!(
@@ -539,6 +581,7 @@ impl GeminiAdapter {
             contents,
             generation_config: Some(generation_config),
             tools,
+            tool_config,
             stream: if core.stream { Some(true) } else { None },
         };
 
@@ -769,6 +812,128 @@ mod tests {
             metadata: Default::default(),
             provider_hints: Default::default(),
         }
+    }
+
+    /// Encodes a core request with the given tool choice through the
+    /// cross-format path and returns the parsed Gemini wire body.
+    fn encode_body_with_tool_choice(
+        tool_choice: Option<CoreToolChoice>,
+        tools: Vec<CoreTool>,
+        lossy: bool,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "What is the weather?".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = tools;
+        core.tool_choice = tool_choice;
+        let mut target = make_target();
+        target.lossy = lossy;
+        let adapter = GeminiAdapter;
+        let proxy_req = adapter.encode_request(&core, &target, &client_wire(&core))?;
+        Ok(serde_json::from_slice(&proxy_req.body)?)
+    }
+
+    fn weather_tool() -> CoreTool {
+        CoreTool {
+            name: "get_weather".into(),
+            description: Some("Get current weather".into()),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn encode_tool_choice_maps_to_tool_config() {
+        let cases = [
+            (
+                CoreToolChoice::Auto,
+                serde_json::json!({"functionCallingConfig": {"mode": "AUTO"}}),
+            ),
+            (
+                CoreToolChoice::Any,
+                serde_json::json!({"functionCallingConfig": {"mode": "ANY"}}),
+            ),
+            (
+                CoreToolChoice::None,
+                serde_json::json!({"functionCallingConfig": {"mode": "NONE"}}),
+            ),
+            (
+                CoreToolChoice::Tool {
+                    name: "get_weather".into(),
+                },
+                serde_json::json!({
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": ["get_weather"],
+                    }
+                }),
+            ),
+        ];
+        for (choice, expected_config) in cases {
+            let body =
+                encode_body_with_tool_choice(Some(choice.clone()), vec![weather_tool()], false)
+                    .unwrap();
+            assert_eq!(
+                body.get("toolConfig"),
+                Some(&expected_config),
+                "tool_choice {choice:?} must map onto toolConfig.functionCallingConfig; body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_tool_choice_none_without_tools_omits_tool_config() {
+        let body = encode_body_with_tool_choice(Some(CoreToolChoice::None), vec![], false).unwrap();
+        assert!(
+            body.get("toolConfig").is_none(),
+            "toolConfig must be omitted when the request carries no tools: {body}"
+        );
+    }
+
+    #[test]
+    fn encode_raw_tool_choice_is_rejected_by_name() {
+        let raw = CoreToolChoice::Raw(serde_json::json!({"type": "custom"}));
+        let err = encode_body_with_tool_choice(Some(raw), vec![weather_tool()], false)
+            .expect_err("Raw tool_choice must be rejected when the route is not lossy");
+        assert!(
+            err.to_string().contains("tool_choice"),
+            "the rejection must name tool_choice, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encode_raw_tool_choice_lossy_is_omitted() {
+        let raw = CoreToolChoice::Raw(serde_json::json!({"type": "custom"}));
+        let body = encode_body_with_tool_choice(Some(raw), vec![weather_tool()], true).unwrap();
+        assert!(
+            body.get("toolConfig").is_none(),
+            "a lossy route drops the unmappable tool_choice instead of failing: {body}"
+        );
+    }
+
+    #[test]
+    fn encode_tool_choice_round_trips_through_client_decode() {
+        let body = encode_body_with_tool_choice(
+            Some(CoreToolChoice::Tool {
+                name: "get_weather".into(),
+            }),
+            vec![weather_tool()],
+            false,
+        )
+        .unwrap();
+        let decoded =
+            llm_proxy_protocol::client::gemini::decode_request(&body, "gemini-2.5-pro", false)
+                .unwrap();
+        assert_eq!(
+            decoded.tool_choice,
+            Some(CoreToolChoice::Tool {
+                name: "get_weather".into(),
+            }),
+            "a forced named tool must survive the Gemini wire round trip"
+        );
     }
 
     #[test]
