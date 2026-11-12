@@ -79,8 +79,9 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   `Opaque` blocks and reach the upstream verbatim. Non-streaming
   same-format responses are returned verbatim — usage and the stop reason are
   read for the ledger without rewriting the body.
-- **Cross-format field policy (step 3).** One disposition table per provider
-  protocol (`adapter/client_wire.rs`): each leftover client field is **carried**
+- **Cross-format field policy (step 3).** One disposition table per (client
+  dialect, provider protocol) pair (`adapter/client_wire.rs`): each leftover
+  client field is **carried**
   verbatim (e.g. `service_tier`, `top_k` to Anthropic; `store`,
   `prompt_cache_key`, `parallel_tool_calls` to Responses and Chat), **mapped**
   (`parallel_tool_calls` → `tool_choice.disable_parallel_tool_use`;
@@ -105,8 +106,9 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   `generationConfig.responseMimeType` (+ `responseJsonSchema` for a schema);
   unknown types are rejected naming `response_format.type`, and Anthropic
   keeps rejecting the field by name. Cross-format, `seed` maps onto Gemini
-  `generationConfig.seed` (a non-integer seed is rejected naming the field,
-  dropped under lossy); Responses and Anthropic keep rejecting it by name.
+  `generationConfig.seed` from Chat-dialect clients only (a non-integer seed
+  is rejected naming the field, dropped under lossy); other client dialects
+  and non-Gemini targets keep rejecting it by name.
 - **Reasoning translation (step 5, BUG-20, backlog 13).**
   `adapter/reasoning.rs` converts between `reasoning_effort`,
   `thinking.budget_tokens` and Gemini's `thinkingConfig.thinkingBudget` with a

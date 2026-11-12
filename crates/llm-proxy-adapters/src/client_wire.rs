@@ -230,24 +230,44 @@ pub enum FieldDisposition {
     Rejected,
 }
 
-/// The cross-format field policy: one disposition per (client field, provider
-/// protocol) pair. Fields the typed decode already consumed into the core
-/// (messages, sampling, tools, ...) are mapped by the adapters and are not
-/// named here; this table answers for the leftover client fields.
+/// The cross-format field policy: one disposition per (client dialect,
+/// provider protocol, client field) combination. Fields the typed decode
+/// already consumed into the core (messages, sampling, tools, ...) are mapped
+/// by the adapters and are not named here; this table answers for the
+/// leftover client fields.
+///
+/// The per-provider arms below are the fallback for every client dialect; the
+/// grid lists only the cells that differ (rows = provider protocol, columns =
+/// client dialect):
+///
+/// | provider protocol | client dialect                       | field | disposition |
+/// |-------------------|--------------------------------------|-------|-------------|
+/// | Gemini            | OpenAI Responses, Anthropic Messages | seed  | Rejected    |
 #[must_use]
-pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDisposition {
+pub fn field_disposition(
+    client: ClientWireFormat,
+    provider: &ProtocolName,
+    field: &str,
+) -> FieldDisposition {
     // The table covers the built-in protocols; a protocol added by an SDK
     // user has no policy table, so leftover client fields are rejected by
     // name unless the custom adapter's own same-format path handles them.
-    match provider.as_str() {
-        protocols::ANTHROPIC_MESSAGES => match field {
+    match (client, provider.as_str()) {
+        // `seed` maps only from the OpenAI Chat dialect (the Responses and
+        // Anthropic APIs have no seed): their clients keep the named
+        // rejection even on a Gemini target.
+        (
+            ClientWireFormat::OpenAiResponses | ClientWireFormat::AnthropicMessages,
+            protocols::GEMINI_GENERATE_CONTENT,
+        ) if field == "seed" => FieldDisposition::Rejected,
+        (_, protocols::ANTHROPIC_MESSAGES) => match field {
             // Anthropic accepts these OpenAI Chat fields with the same shape.
             "service_tier" | "top_k" => FieldDisposition::Carried,
             // Mapped by the Anthropic adapter from the raw client body.
             "parallel_tool_calls" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
-        protocols::OPENAI_CHAT_COMPLETIONS => match field {
+        (_, protocols::OPENAI_CHAT_COMPLETIONS) => match field {
             // The Chat Completions API accepts these with the same shape.
             "service_tier" | "parallel_tool_calls" | "store" | "prompt_cache_key" => {
                 FieldDisposition::Carried
@@ -256,7 +276,7 @@ pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDispositi
             "output_config" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
-        protocols::OPENAI_RESPONSES => match field {
+        (_, protocols::OPENAI_RESPONSES) => match field {
             // The Responses API accepts these with the same shape.
             "service_tier" | "parallel_tool_calls" | "store" | "prompt_cache_key" => {
                 FieldDisposition::Carried
@@ -267,7 +287,7 @@ pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDispositi
             "output_config" | "response_format" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
-        protocols::GEMINI_GENERATE_CONTENT => match field {
+        (_, protocols::GEMINI_GENERATE_CONTENT) => match field {
             // Mapped by the Gemini adapter into generationConfig.topK.
             "top_k" => FieldDisposition::Mapped,
             // Mapped by the Gemini adapter from the raw client body:
@@ -299,7 +319,7 @@ pub fn apply_field_policy(
     let body_obj = client.body.as_object();
 
     for field in extras {
-        match field_disposition(provider, field) {
+        match field_disposition(client.format, provider, field) {
             FieldDisposition::Carried => {
                 if let Some(value) = body_obj.and_then(|obj| obj.get(field)) {
                     carried.insert(field.to_owned(), value.clone());
@@ -528,7 +548,7 @@ fn check_output_config_subkeys(
     provider: &ProtocolName,
     lossy: bool,
 ) -> Result<(), ProviderError> {
-    if field_disposition(provider, "output_config") != FieldDisposition::Mapped {
+    if field_disposition(client.format, provider, "output_config") != FieldDisposition::Mapped {
         return Ok(());
     }
     let Some(config) = client
@@ -1053,6 +1073,49 @@ mod tests {
             true,
         )
         .expect("lossy drops uncarried blocks instead of rejecting");
+    }
+
+    #[test]
+    fn disposition_is_per_format_pair() {
+        let cases = [
+            (
+                ClientWireFormat::OpenAiResponses,
+                protocols::OPENAI_CHAT_COMPLETIONS,
+                "parallel_tool_calls",
+                FieldDisposition::Carried,
+            ),
+            (
+                ClientWireFormat::OpenAiChatCompletions,
+                protocols::GEMINI_GENERATE_CONTENT,
+                "seed",
+                FieldDisposition::Mapped,
+            ),
+            (
+                ClientWireFormat::OpenAiResponses,
+                protocols::GEMINI_GENERATE_CONTENT,
+                "seed",
+                FieldDisposition::Rejected,
+            ),
+            (
+                ClientWireFormat::AnthropicMessages,
+                protocols::GEMINI_GENERATE_CONTENT,
+                "seed",
+                FieldDisposition::Rejected,
+            ),
+            (
+                ClientWireFormat::OpenAiChatCompletions,
+                protocols::ANTHROPIC_MESSAGES,
+                "response_format",
+                FieldDisposition::Rejected,
+            ),
+        ];
+        for (client, provider, field, want) in cases {
+            assert_eq!(
+                field_disposition(client, &ProtocolName::new(provider), field),
+                want,
+                "{client:?} client -> {provider} must dispose of {field} as {want:?}"
+            );
+        }
     }
 
     #[test]
