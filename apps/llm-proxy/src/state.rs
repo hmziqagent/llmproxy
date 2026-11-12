@@ -1426,6 +1426,61 @@ server_name = "t"
         .expect("an upstream on another port is not a loop");
     }
 
+    /// A `passthrough_auth` provider under client-keys auth forwards the
+    /// caller's client key to the upstream, so startup refuses, exactly
+    /// like `llm-proxy validate` (same `load_registry_with_checks` path).
+    #[tokio::test]
+    async fn startup_refuses_passthrough_provider_with_client_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/pt.toml"),
+            r#"[provider]
+name = "pt"
+api_key = "unused"
+passthrough_auth = true
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/chat/completions"
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "0.0.0.0:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$eEnjdfBL8hfvU2QuGOpow8Yq2Jyrr8GXKYgtAAsscSs"
+"#,
+        )
+        .unwrap();
+        let err = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect_err("startup must refuse client-keys with a passthrough_auth provider");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("pt") && message.contains("client key"),
+            "the refusal names the provider and the client key it would leak: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn family_routes_need_the_endpoint_families_feature() {
         let dir = tempfile::tempdir().unwrap();

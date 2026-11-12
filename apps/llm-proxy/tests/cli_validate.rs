@@ -105,6 +105,94 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$eEnjdfBL8hfvU2QuGOpo
     }
 
     #[test]
+    fn validate_rejects_passthrough_provider_with_client_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/pt.toml"),
+            r#"[provider]
+name = "pt"
+api_key = "unused"
+passthrough_auth = true
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/chat/completions"
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[server]
+bind = "0.0.0.0:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$eEnjdfBL8hfvU2QuGOpow8Yq2Jyrr8GXKYgtAAsscSs"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let err = result.expect_err("client-keys with a passthrough_auth provider must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("pt") && message.contains("client key"),
+            "the refusal names the provider and the client key it would leak: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_passthrough_provider_with_anonymous_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/pt.toml"),
+            r#"[provider]
+name = "pt"
+api_key = "unused"
+passthrough_auth = true
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/chat/completions"
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        assert!(
+            result.is_ok(),
+            "passthrough_auth under anonymous auth must still validate: {result:?}"
+        );
+    }
+
+    #[test]
     fn validate_accepts_admin_api_with_storage() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
