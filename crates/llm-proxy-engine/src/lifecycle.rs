@@ -17,7 +17,8 @@ use llm_proxy_adapters::sse::SseFramer;
 use llm_proxy_adapters::{ProtocolName, ProviderStreamDecoder};
 use llm_proxy_core::{AffinityConflictPolicy, ModelPricing, ProviderRouteKind};
 use llm_proxy_protocol::core::{
-    CoreEvent, CoreRequest, CoreStreamErrorKind, Cost, ModelRef, StopReason, Usage, UsageProvenance,
+    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, CoreStreamErrorKind, Cost,
+    ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_storage::{
     AttemptOutcome, ProxyEvent, RequestReceived, ResponseCompleted, ResponseFailed,
@@ -414,12 +415,52 @@ async fn admit(
     inner.admission.reserve(&claim).await
 }
 
+/// The result of [`strip_provider_bound_state`]: the core request to encode
+/// for the failover member, and whether any provider-bound state was removed
+/// (which forces the adapter to re-encode from the stripped core instead of
+/// passing the client's raw body through).
+struct StripOutcome {
+    core: CoreRequest,
+    changed: bool,
+}
+
 /// Strips provider-bound request state for a failover target (plan 04 step
-/// 10, conflict 6): everything in `provider_hints` except the dialect-neutral
-/// keys the ladder keeps. The client's own words never change.
-fn strip_provider_bound_state(core: &CoreRequest) -> CoreRequest {
+/// 10, conflict 6, fix brief 04-1): everything in `provider_hints` except the
+/// dialect-neutral keys the ladder keeps, tool-call signatures, and thinking
+/// blocks from earlier assistant turns. Pool members are always distinct
+/// providers, so a provider-issued signature or file id is foreign to the
+/// next member. Refuses the switch when the request carries state no other
+/// provider can honour: a media block referencing a provider file, or signed
+/// thinking in an open tool loop (the provider requires that block back
+/// unmodified while thinking is on, so it can be neither stripped nor sent
+/// elsewhere). The client's own words never change.
+fn strip_provider_bound_state(core: &CoreRequest) -> Result<StripOutcome, EngineError> {
+    for content in std::iter::once(core.system.as_slice())
+        .chain(core.messages.iter().map(|m| m.content.as_slice()))
+    {
+        refuse_provider_file_references(content)?;
+    }
+    let loop_turn = open_tool_loop_turn(&core.messages);
+    if let Some(index) = loop_turn {
+        let open_loop_thinks = core.messages.get(index).is_some_and(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    CoreContent::Thinking { .. } | CoreContent::RedactedThinking { .. }
+                )
+            })
+        });
+        if open_loop_thinks {
+            return Err(EngineError::FailoverRefused {
+                reason: "signed thinking in an open tool loop cannot move between providers"
+                    .to_owned(),
+            });
+        }
+    }
+
     let mut stripped = core.clone();
-    stripped.provider_hints.raw = stripped
+    let mut changed = false;
+    let kept_hints = stripped
         .provider_hints
         .raw
         .iter()
@@ -429,8 +470,124 @@ fn strip_provider_bound_state(core: &CoreRequest) -> CoreRequest {
                 .any(|kept| key.eq_ignore_ascii_case(kept))
         })
         .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    changed |= kept_hints.len() != stripped.provider_hints.raw.len();
+    stripped.provider_hints.raw = kept_hints;
+
+    for (index, message) in stripped.messages.iter_mut().enumerate() {
+        if message.role == CoreRole::Assistant
+            && Some(index) != loop_turn
+            && remove_thinking_blocks(&mut message.content)
+        {
+            changed = true;
+        }
+        changed |= clear_tool_signatures(&mut message.content);
+    }
+
+    Ok(StripOutcome {
+        core: stripped,
+        changed,
+    })
+}
+
+/// Refuses media blocks whose `source` references a provider file, recursing
+/// into `ToolResult` content (a tool result can embed images).
+fn refuse_provider_file_references(content: &[CoreContent]) -> Result<(), EngineError> {
+    for block in content {
+        match block {
+            CoreContent::Image { source }
+            | CoreContent::Document { source }
+            | CoreContent::Audio { source }
+            | CoreContent::Video { source } => {
+                if source_references_provider_file(source) {
+                    return Err(EngineError::FailoverRefused {
+                        reason: "file reference cannot move between providers".to_owned(),
+                    });
+                }
+            }
+            CoreContent::ToolResult {
+                content: nested, ..
+            } => refuse_provider_file_references(nested)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether a JSON `source` value references a provider file at any depth: a
+/// `file_id` key, a `file_uri` key, or a `"type": "file"` marker (the Files
+/// API source shape). A provider-issued id cannot be resolved by another
+/// provider.
+fn source_references_provider_file(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, inner)| {
+            if key == "file_id" || key == "file_uri" {
+                return true;
+            }
+            if key == "type" && inner.as_str() == Some("file") {
+                return true;
+            }
+            source_references_provider_file(inner)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(source_references_provider_file),
+        _ => false,
+    }
+}
+
+/// The assistant turn an open tool loop continues: the last assistant message
+/// whose `ToolUse` is answered by a `ToolResult` in the final user message.
+/// `None` when no tool loop is open.
+fn open_tool_loop_turn(messages: &[CoreMessage]) -> Option<usize> {
+    let final_user = messages.iter().rposition(|m| m.role == CoreRole::User)?;
+    let answered_ids: Vec<&str> = messages
+        .get(final_user)?
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            CoreContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
         .collect();
-    stripped
+    if answered_ids.is_empty() {
+        return None;
+    }
+    messages.iter().rposition(|message| {
+        message.role == CoreRole::Assistant
+            && message.content.iter().any(|block| {
+                matches!(block, CoreContent::ToolUse { id, .. } if answered_ids.contains(&id.as_str()))
+            })
+    })
+}
+
+/// Removes `Thinking` and `RedactedThinking` blocks; true when it removed any.
+fn remove_thinking_blocks(content: &mut Vec<CoreContent>) -> bool {
+    let before = content.len();
+    content.retain(|block| {
+        !matches!(
+            block,
+            CoreContent::Thinking { .. } | CoreContent::RedactedThinking { .. }
+        )
+    });
+    content.len() != before
+}
+
+/// Clears tool-call signatures (a provider-issued token replayed for another
+/// provider), recursing into tool results; true when it cleared any.
+fn clear_tool_signatures(content: &mut [CoreContent]) -> bool {
+    let mut changed = false;
+    for block in content {
+        match block {
+            CoreContent::ToolUse { signature, .. } if signature.is_some() => {
+                *signature = None;
+                changed = true;
+            }
+            CoreContent::ToolResult {
+                content: nested, ..
+            } => changed |= clear_tool_signatures(nested),
+            _ => {}
+        }
+    }
+    changed
 }
 
 /// A failed non-streaming ladder: the error, plus the usage and cost the
@@ -503,12 +660,18 @@ impl Ladder {
             .is_some_and(|candidate| candidate.target.provider_name == member)
     }
 
-    /// The core request to encode for this member: stripped when the ladder
-    /// switched providers (plan 04 step 10).
-    fn core_for(&self, req: &EngineRequest, member: &str) -> CoreRequest {
+    /// The strip outcome for this member: the first member is the provider
+    /// that issued the request's provider-bound state, so it is never
+    /// stripped or refused; every failover target is a distinct provider
+    /// (pool members reject duplicates), so it gets the stripped core — or a
+    /// refusal naming the state that cannot move (plan 04 step 10).
+    fn strip_for(&self, req: &EngineRequest, member: &str) -> Result<StripOutcome, EngineError> {
         match &self.first_member {
             Some(first) if first != member => strip_provider_bound_state(&req.core),
-            _ => req.core.clone(),
+            _ => Ok(StripOutcome {
+                core: req.core.clone(),
+                changed: false,
+            }),
         }
     }
 }
@@ -1204,6 +1367,16 @@ async fn run_ladder_once(
         if ladder.first_member.is_none() {
             ladder.first_member = Some(member.clone());
         }
+        // Provider-bound state this member cannot honour: skip the candidate
+        // and keep the ladder going; the refusal becomes the ladder's last
+        // error when no member remains (plan 04 step 10, fix brief 04-1).
+        let strip = match ladder.strip_for(req, &member) {
+            Ok(strip) => strip,
+            Err(refusal) => {
+                last_error = Some(refusal);
+                continue 'ladder;
+            }
+        };
         // Pool credential ids are positional (`key-<i>`): an id that failed
         // against the previous member names a different secret here, so the
         // avoid hint lives and dies with one member's attempts.
@@ -1229,15 +1402,22 @@ async fn run_ladder_once(
             ladder.current_credential = attempt.credential_id.clone();
             avoid_credential = attempt.credential_id.clone();
 
-            let core_for_member = ladder.core_for(req, &member);
             let mut wire: ClientWireRequest = req.inbound.wire.clone();
             wire.forwarded_headers = select_forwarded_headers(
                 &req.inbound.headers,
                 &attempt.target.forward_inbound_headers,
             );
+            // The strip removed provider-bound state: the client's raw bytes
+            // are no longer the truth for this member, so the adapter must
+            // re-encode from the stripped core instead of passing the raw
+            // body through. When nothing was stripped, keep the passthrough
+            // (byte-for-byte fidelity on the happy path).
+            if strip.changed {
+                wire.force_core_encode = true;
+            }
             let proxy_req: ProxyRequest = attempt
                 .adapter
-                .encode_request(&core_for_member, &attempt.target, &wire)
+                .encode_request(&strip.core, &attempt.target, &wire)
                 .map_err(map_encode_error)?;
 
             let sent = inner.transport.client_for(&member).send(proxy_req).await;
@@ -2210,6 +2390,16 @@ async fn stream_attempt(
     if stream.ladder.first_member.is_none() {
         stream.ladder.first_member = Some(member.clone());
     }
+    // Provider-bound state this member cannot honour: keep the ladder going;
+    // when no member remains the refusal surfaces through `stop_with` (plan
+    // 04 step 10, fix brief 04-1).
+    let strip = match stream.ladder.strip_for(req, &member) {
+        Ok(strip) => strip,
+        Err(refusal) => {
+            stream.last_error = Some(refusal);
+            return true;
+        }
+    };
     // Same boundary rule as the non-streaming ladder: `current_credential`
     // doubles as the avoid hint, and a positional id from another member
     // must not skip this member's key at the same index. It is re-set right
@@ -2245,35 +2435,39 @@ async fn stream_attempt(
         };
         stream.ladder.current_credential = attempt.credential_id.clone();
 
-        let core_for_member = stream.ladder.core_for(req, &member);
         let mut wire: ClientWireRequest = req.inbound.wire.clone();
         wire.forwarded_headers = select_forwarded_headers(
             &req.inbound.headers,
             &attempt.target.forward_inbound_headers,
         );
-        let proxy_req =
-            match attempt
-                .adapter
-                .encode_request(&core_for_member, &attempt.target, &wire)
-            {
-                Ok(proxy_req) => proxy_req,
-                Err(error) => {
-                    let engine_error = map_encode_error(error);
-                    record_failed_attempt(
-                        inner,
-                        &stream.ladder.request_id,
-                        stream.ladder.seq - 1,
-                        &stream.ladder.plan.route,
-                        &member,
-                        &stream.ladder.member_model(&member),
-                        stream.ladder.current_credential.as_deref(),
-                        &engine_error,
-                        attempt_start.elapsed(),
-                    );
-                    stop_with(inner, stream, engine_error, false).await;
-                    return false;
-                }
-            };
+        // Same rule as the non-streaming ladder: a strip that removed
+        // provider-bound state forces the adapter to re-encode from the
+        // stripped core; an unchanged strip keeps the raw-body passthrough.
+        if strip.changed {
+            wire.force_core_encode = true;
+        }
+        let proxy_req = match attempt
+            .adapter
+            .encode_request(&strip.core, &attempt.target, &wire)
+        {
+            Ok(proxy_req) => proxy_req,
+            Err(error) => {
+                let engine_error = map_encode_error(error);
+                record_failed_attempt(
+                    inner,
+                    &stream.ladder.request_id,
+                    stream.ladder.seq - 1,
+                    &stream.ladder.plan.route,
+                    &member,
+                    &stream.ladder.member_model(&member),
+                    stream.ladder.current_credential.as_deref(),
+                    &engine_error,
+                    attempt_start.elapsed(),
+                );
+                stop_with(inner, stream, engine_error, false).await;
+                return false;
+            }
+        };
 
         let sent = inner
             .transport
@@ -3348,5 +3542,49 @@ mod tests {
                 "with no spare key the member cannot serve: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn strip_removes_provider_hints_but_keeps_stream_options() {
+        use llm_proxy_protocol::core::{ProviderHints, SamplingOptions};
+        let mut raw = serde_json::Map::new();
+        raw.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({"include_usage": true}),
+        );
+        raw.insert(
+            "anthropic_beta".to_owned(),
+            serde_json::json!("prompt-caching-2024"),
+        );
+        let core = CoreRequest {
+            model: ModelRef {
+                requested: "m".to_owned(),
+                upstream: None,
+            },
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            sampling: SamplingOptions::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: ProviderHints { raw },
+        };
+
+        let outcome = strip_provider_bound_state(&core).expect("a hints-only strip never refuses");
+        assert!(outcome.changed, "dropping provider-bound hints is a change");
+        assert_eq!(
+            outcome.core.provider_hints.raw.get("stream_options"),
+            Some(&serde_json::json!({"include_usage": true})),
+            "the dialect-neutral hint survives the failover"
+        );
+        assert!(
+            !outcome
+                .core
+                .provider_hints
+                .raw
+                .contains_key("anthropic_beta"),
+            "provider-bound hints do not cross the failover"
+        );
     }
 }

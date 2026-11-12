@@ -76,9 +76,9 @@ pub fn classify(error: &EngineError) -> ErrorClass {
         | EngineError::IdempotencyInFlight
         | EngineError::Forbidden(_)
         | EngineError::InvalidRequest(_) => ErrorClass::Terminal,
-        EngineError::RetryExhausted { .. } | EngineError::AffinityRefused { .. } => {
-            ErrorClass::Terminal
-        }
+        EngineError::RetryExhausted { .. }
+        | EngineError::AffinityRefused { .. }
+        | EngineError::FailoverRefused { .. } => ErrorClass::Terminal,
     }
 }
 

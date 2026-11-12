@@ -97,7 +97,16 @@ Add pools, retries and failover on top of the routing decision in the
   (`sticky_affinity_pins_a_session_to_the_member_that_served_it`,
   `a_direct_route_does_not_pin_the_session`,
   `refuse_policy_holds_when_the_pinned_member_is_already_cooling`). A
-  provider switch strips provider-bound state (`strip_provider_bound_state`).
+  provider switch strips provider-bound state (`strip_provider_bound_state`):
+  provider hints outside the kept allowlist, tool-call signatures, and
+  thinking blocks from earlier assistant turns, and re-encodes from the
+  stripped core instead of passing the raw body through. It refuses the
+  switch when the request carries state no other provider can honour — a
+  media block referencing a provider file, or signed thinking in an open
+  tool loop (`failover_drops_earlier_turn_thinking_and_tool_signatures`,
+  `failover_refuses_signed_thinking_in_an_open_tool_loop`,
+  `failover_refuses_to_move_a_file_reference_between_members`,
+  `a_request_with_nothing_to_strip_keeps_same_format_passthrough`).
 - Bare `/v1/*` is off by default and 404s while off
   (`bare_v1_routes_return_404_when_left_off`); enabled it resolves a model
   to a provider or pool and runs the same failover

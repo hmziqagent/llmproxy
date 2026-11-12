@@ -165,6 +165,9 @@ mod tests {
                 pinned: "p".to_owned(),
                 session: "s".to_owned(),
             },
+            EngineError::FailoverRefused {
+                reason: "x".to_owned(),
+            },
             EngineError::Internal("x".to_owned()),
             upstream_passthrough(400, AuthOwner::Operator),
             upstream_passthrough(401, AuthOwner::Client),

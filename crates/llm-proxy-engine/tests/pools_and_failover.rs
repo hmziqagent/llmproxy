@@ -1674,3 +1674,344 @@ fn probed_upstream() -> Router {
 
 const PROBED_OK_BODY: &str = r#"{"id":"msg_p","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
 const SPARE_OK_BODY: &str = r#"{"id":"msg_s","type":"message","role":"assistant","content":[{"type":"text","text":"spare"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#;
+
+// ---- Plan 04-1: the failover strip (provider-bound state) ----
+
+type CapturedBodies = Arc<std::sync::Mutex<Vec<String>>>;
+
+fn captured_bodies() -> CapturedBodies {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn bodies_of(captured: &CapturedBodies) -> Vec<String> {
+    captured.lock().expect("capture lock").clone()
+}
+
+/// An upstream that records every request body it receives, then answers
+/// with the fixed status/body (modelled on [`upstream_key_check`], which
+/// records headers the same way).
+fn upstream_body_capture(
+    status: StatusCode,
+    body: &'static str,
+    captured: CapturedBodies,
+) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move |raw: axum::body::Bytes| async move {
+            captured
+                .lock()
+                .expect("capture lock")
+                .push(String::from_utf8_lossy(&raw).into_owned());
+            (status, [(header::CONTENT_TYPE, "application/json")], body)
+        }),
+    )
+}
+
+/// An `EngineRequest` whose raw client body is the same-format Anthropic
+/// mirror of the core, so same-format passthrough is possible.
+fn engine_request_with_wire(
+    route: &str,
+    core: CoreRequest,
+    wire_body: serde_json::Value,
+) -> EngineRequest {
+    EngineRequest::new(
+        route,
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core,
+        llm_proxy_engine::InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(ClientWireFormat::AnthropicMessages, wire_body),
+        },
+    )
+    .with_request_id("req-plan04-1")
+    .with_body_hash("hash")
+}
+
+fn text_block(text: &str) -> CoreContent {
+    CoreContent::Text {
+        text: text.to_owned(),
+        cache: None,
+    }
+}
+
+fn plain_core(messages: Vec<CoreMessage>) -> CoreRequest {
+    CoreRequest {
+        model: ModelRef {
+            requested: "claude-sonnet-4-6".to_owned(),
+            upstream: None,
+        },
+        system: Vec::new(),
+        messages,
+        tools: Vec::new(),
+        tool_choice: None,
+        sampling: SamplingOptions::default(),
+        stream: false,
+        metadata: Default::default(),
+        provider_hints: Default::default(),
+    }
+}
+
+async fn failing_then_serving_pair() -> (Engine, CapturedBodies, CapturedBodies) {
+    let failing = captured_bodies();
+    let serving = captured_bodies();
+    let a = spawn_upstream(upstream_body_capture(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#,
+        Arc::clone(&failing),
+    ))
+    .await;
+    let b = spawn_upstream(upstream_body_capture(
+        StatusCode::OK,
+        ANTHROPIC_OK_BODY,
+        Arc::clone(&serving),
+    ))
+    .await;
+    let (engine, _bus) = build_engine(
+        vec![member("a", a, None), member("b", b, None)],
+        vec![pool(
+            "pair",
+            vec!["a", "b"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+    (engine, failing, serving)
+}
+
+#[tokio::test]
+async fn failover_drops_earlier_turn_thinking_and_tool_signatures() {
+    let (engine, served_to_a, served_to_b) = failing_then_serving_pair().await;
+    // Two assistant turns. The first carries signed thinking plus a signed
+    // tool_use, answered by a user tool_result; the second is plain text and
+    // the request ends with a user text message, so no tool loop is open.
+    let core = plain_core(vec![
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![text_block("find the weather")],
+        },
+        CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![
+                CoreContent::Thinking {
+                    text: "pondering".to_owned(),
+                    signature: Some("sig-1".to_owned()),
+                },
+                CoreContent::ToolUse {
+                    id: "toolu_1".to_owned(),
+                    name: "get_weather".to_owned(),
+                    input: serde_json::json!({"city": "sf"}),
+                    signature: Some("tsig-1".to_owned()),
+                },
+            ],
+        },
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "toolu_1".to_owned(),
+                content: vec![text_block("sunny")],
+                is_error: false,
+                cache: None,
+            }],
+        },
+        CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![text_block("It is sunny.")],
+        },
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![text_block("thanks")],
+        },
+    ]);
+    let wire_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "find the weather"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "pondering", "signature": "sig-1"},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                 "input": {"city": "sf"}, "signature": "tsig-1"}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": [{"type": "text", "text": "sunny"}]}
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "It is sunny."}]},
+            {"role": "user", "content": [{"type": "text", "text": "thanks"}]}
+        ],
+    });
+
+    engine
+        .execute(engine_request_with_wire("pair", core, wire_body))
+        .await
+        .expect("the pool fails over to member b");
+
+    let to_a = bodies_of(&served_to_a);
+    assert_eq!(to_a.len(), 2, "member a serves both ladder attempts");
+    for body in &to_a {
+        assert!(
+            body.contains(r#""signature":"sig-1""#) && body.contains(r#""type":"thinking""#),
+            "member a issued the signed thinking, so its raw body carries it: {body}"
+        );
+    }
+    let to_b = bodies_of(&served_to_b);
+    assert_eq!(to_b.len(), 1, "member b serves the failover once");
+    assert!(
+        !to_b[0].contains("signature"),
+        "member b must not receive any provider signature: {}",
+        to_b[0]
+    );
+    assert!(
+        !to_b[0].contains("thinking"),
+        "member b must not receive thinking blocks: {}",
+        to_b[0]
+    );
+}
+
+#[tokio::test]
+async fn failover_refuses_signed_thinking_in_an_open_tool_loop() {
+    let (engine, _served_to_a, served_to_b) = failing_then_serving_pair().await;
+
+    // The last assistant turn carries signed thinking plus a tool_use, and
+    // the final user message answers it: the tool loop is open, so the
+    // thinking block must go back unmodified to its own provider.
+    let core = plain_core(vec![
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![text_block("find the weather")],
+        },
+        CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![
+                CoreContent::Thinking {
+                    text: "pondering".to_owned(),
+                    signature: Some("sig-1".to_owned()),
+                },
+                CoreContent::ToolUse {
+                    id: "toolu_1".to_owned(),
+                    name: "get_weather".to_owned(),
+                    input: serde_json::json!({"city": "sf"}),
+                    signature: Some("tsig-1".to_owned()),
+                },
+            ],
+        },
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "toolu_1".to_owned(),
+                content: vec![text_block("sunny")],
+                is_error: false,
+                cache: None,
+            }],
+        },
+    ]);
+    let wire_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "find the weather"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "pondering", "signature": "sig-1"},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                 "input": {"city": "sf"}, "signature": "tsig-1"}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": [{"type": "text", "text": "sunny"}]}
+            ]}
+        ],
+    });
+
+    let error = engine
+        .execute(engine_request_with_wire("pair", core, wire_body))
+        .await
+        .expect_err("signed thinking in an open tool loop cannot fail over");
+    assert!(
+        error.to_string().contains("signed thinking"),
+        "the error must name the cause: {error}"
+    );
+    assert!(
+        bodies_of(&served_to_b).is_empty(),
+        "member b must receive zero calls"
+    );
+}
+
+#[tokio::test]
+async fn failover_refuses_to_move_a_file_reference_between_members() {
+    let (engine, _served_to_a, served_to_b) = failing_then_serving_pair().await;
+
+    let core = plain_core(vec![CoreMessage {
+        role: CoreRole::User,
+        content: vec![CoreContent::Image {
+            source: serde_json::json!({"type": "file", "file_id": "file_123"}),
+        }],
+    }]);
+    let wire_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "file", "file_id": "file_123"}}
+            ]}
+        ],
+    });
+
+    let error = engine
+        .execute(engine_request_with_wire("pair", core, wire_body))
+        .await
+        .expect_err("a provider file reference cannot move between members");
+    assert!(
+        error.to_string().contains("file reference"),
+        "the error must name the cause: {error}"
+    );
+    assert!(
+        bodies_of(&served_to_b).is_empty(),
+        "member b must receive zero calls"
+    );
+}
+
+#[tokio::test]
+async fn a_request_with_nothing_to_strip_keeps_same_format_passthrough() {
+    let (engine, _served_to_a, served_to_b) = failing_then_serving_pair().await;
+
+    let core = plain_core(vec![
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![text_block("hello")],
+        },
+        CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![text_block("hi there")],
+        },
+        CoreMessage {
+            role: CoreRole::User,
+            content: vec![text_block("thanks")],
+        },
+    ]);
+    let wire_body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi there"}]},
+            {"role": "user", "content": [{"type": "text", "text": "thanks"}]}
+        ],
+        // Not modelled by the core: only same-format passthrough carries it.
+        "seed": 7,
+    });
+    let expected_on_the_wire = serde_json::to_string(&wire_body).expect("serialize client body");
+
+    engine
+        .execute(engine_request_with_wire("pair", core, wire_body))
+        .await
+        .expect("the pool fails over with the raw body");
+
+    let to_b = bodies_of(&served_to_b);
+    assert_eq!(to_b.len(), 1, "member b serves the failover once");
+    assert_eq!(
+        to_b[0], expected_on_the_wire,
+        "with nothing to strip the client's raw body must reach member b byte-for-byte"
+    );
+}

@@ -123,6 +123,15 @@ pub enum EngineError {
         /// The session id.
         session: String,
     },
+    /// The failover strip refused the switch (plan 04 step 10, fix brief
+    /// 04-1): the request carries provider-bound state the next member can
+    /// neither honour nor strip — a provider file reference, or signed
+    /// thinking in an open tool loop — so no remaining member can serve it.
+    #[error("the request cannot fail over: {reason}")]
+    FailoverRefused {
+        /// Why the switch is impossible, naming the state that cannot move.
+        reason: String,
+    },
     /// An internal invariant broke.
     #[error("internal error: {0}")]
     Internal(String),
@@ -163,6 +172,7 @@ impl EngineError {
             Self::UpstreamTimeout(_) => "UpstreamTimeout",
             Self::RetryExhausted { .. } => "RetryExhausted",
             Self::AffinityRefused { .. } => "AffinityRefused",
+            Self::FailoverRefused { .. } => "FailoverRefused",
             Self::Internal(_) => "Internal",
         }
     }
@@ -189,6 +199,7 @@ impl EngineError {
             Self::UpstreamTimeout(_) => 504,
             Self::RetryExhausted { last, .. } => last.status_code(),
             Self::AffinityRefused { .. } => 503,
+            Self::FailoverRefused { .. } => 400,
             Self::Internal(_) => 500,
         }
     }
