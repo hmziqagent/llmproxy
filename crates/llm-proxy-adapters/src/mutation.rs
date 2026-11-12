@@ -101,11 +101,12 @@ fn has_invalid_escape(token: &str) -> bool {
 }
 
 /// Phase 3, markers (Anthropic Messages): place `cache_control` breakpoints
-/// on the stable prefix within the four-marker budget — the last tool, the
-/// last system block, then the last content block of earlier messages,
-/// walking backwards; the newest message is never marked (it changes every
-/// turn). Markers the client already set count against the budget and are
-/// kept where they are.
+/// on the stable prefix within the four-marker budget — the last markable
+/// tool, the last markable system block, then the last markable content
+/// block of each earlier message, walking backwards; the newest message is
+/// never marked (it changes every turn), and each earlier message carries
+/// at most one new marker. Markers the client already set count against
+/// the budget and are kept where they are.
 pub(crate) fn inject_anthropic_markers(request: &mut Value) {
     // A client may carry more markers than the provider's budget allows:
     // its own markers all stay (the budget for new ones is simply spent).
@@ -113,21 +114,21 @@ pub(crate) fn inject_anthropic_markers(request: &mut Value) {
 
     if budget > 0
         && let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut)
-        && let Some(last_tool) = tools.last_mut()
+        && let Some(last_tool) = last_markable_mut(tools)
     {
         budget -= mark_block(last_tool, budget);
     }
     if budget > 0
         && let Some(system) = request.get_mut("system").and_then(Value::as_array_mut)
-        && let Some(last_block) = system.last_mut()
+        && let Some(last_block) = last_markable_mut(system)
     {
         budget -= mark_block(last_block, budget);
     }
     if budget > 0
         && let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut)
     {
-        // Newest message excluded: mark the last content block of each
-        // earlier message, backwards, until the budget is spent.
+        // Newest message excluded: mark only the last markable block of
+        // each earlier message, backwards, until the budget is spent.
         for message in messages.iter_mut().rev().skip(1) {
             if budget == 0 {
                 break;
@@ -135,14 +136,44 @@ pub(crate) fn inject_anthropic_markers(request: &mut Value) {
             let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
                 continue;
             };
-            for block in blocks.iter_mut().rev() {
-                if budget == 0 {
-                    break;
-                }
-                budget -= mark_block(block, budget);
+            let Some(block) = last_markable_mut(blocks) else {
+                continue;
+            };
+            if has_marker(block) {
+                // The client already placed this message's breakpoint;
+                // a second marker inside the same message would spend the
+                // budget without moving the cache boundary.
+                continue;
             }
+            budget -= mark_block(block, budget);
         }
     }
+}
+
+/// Whether Anthropic accepts a `cache_control` breakpoint on this block:
+/// objects only; never `thinking` or `redacted_thinking` (they cannot
+/// carry `cache_control` directly); a `text` block only when its `text`
+/// is a non-whitespace string (Anthropic rejects markers on empty text).
+/// Tool definitions carry no `type` and are markable.
+fn markable(block: &Value) -> bool {
+    let Some(map) = block.as_object() else {
+        return false;
+    };
+    match map.get("type").and_then(Value::as_str) {
+        Some("thinking") | Some("redacted_thinking") => false,
+        Some("text") => map
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        _ => true,
+    }
+}
+
+/// The last element of `items` that may carry a marker, scanning back —
+/// so an ineligible tail (an empty text block, a trailing thinking block)
+/// falls back to the previous eligible element.
+fn last_markable_mut(items: &mut [Value]) -> Option<&mut Value> {
+    items.iter_mut().rev().find(|block| markable(block))
 }
 
 /// Counts the `cache_control` markers the request already carries: client
@@ -314,6 +345,104 @@ mod tests {
             "no marker is injected once the client spent the budget and more"
         );
         assert_eq!(existing_markers(&request), 5);
+    }
+
+    #[test]
+    fn empty_and_thinking_blocks_are_never_marked() {
+        // Anthropic rejects `cache_control` on empty text blocks and on
+        // `thinking` / `redacted_thinking` blocks — a marker there would
+        // turn an opted-in request into an upstream 400.
+        let mut request = json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+                    {"type": "text", "text": "answer"},
+                    {"type": "text", "text": ""}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "opaque"}
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "newest"}]}
+            ]
+        });
+        inject_anthropic_markers(&mut request);
+        assert!(
+            request["messages"][0]["content"][0]["cache_control"].is_null(),
+            "a thinking block is never marked"
+        );
+        assert!(
+            request["messages"][0]["content"][1]["cache_control"].is_object(),
+            "the marker lands on the last eligible text block"
+        );
+        assert!(
+            request["messages"][0]["content"][2]["cache_control"].is_null(),
+            "an empty text block is never marked"
+        );
+        assert!(
+            request["messages"][1]["content"][0]["cache_control"].is_null(),
+            "a redacted_thinking-only message gets no marker"
+        );
+    }
+
+    #[test]
+    fn at_most_one_marker_lands_in_each_message() {
+        let mut request = json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "older turn"}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"},
+                    {"type": "text", "text": "third"}
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "newest"}]}
+            ]
+        });
+        inject_anthropic_markers(&mut request);
+        let markers_in_multi_block = request["messages"][1]["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("cache_control").is_some())
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            markers_in_multi_block, 1,
+            "one marker per message, however many blocks it has"
+        );
+        assert!(
+            request["messages"][1]["content"][2]["cache_control"].is_object(),
+            "the message's marker sits on its last block"
+        );
+        assert!(
+            request["messages"][0]["content"][0]["cache_control"].is_object(),
+            "the next-older message still gets its own marker"
+        );
+    }
+
+    #[test]
+    fn an_ineligible_last_system_block_falls_back_to_the_previous_one() {
+        let mut request = json!({
+            "system": [
+                {"type": "text", "text": "stable instructions"},
+                {"type": "text", "text": "   "}
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "newest"}]}
+            ]
+        });
+        inject_anthropic_markers(&mut request);
+        assert!(
+            request["system"][0]["cache_control"].is_object(),
+            "the last eligible system block is marked"
+        );
+        assert!(
+            request["system"][1]["cache_control"].is_null(),
+            "a whitespace-only system block is never marked"
+        );
     }
 
     #[test]
