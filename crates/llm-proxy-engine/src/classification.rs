@@ -5,10 +5,7 @@
 //! the same classification covers failures inside the streaming pre-commit
 //! window, where nothing has been sent to the client yet.
 
-use std::sync::LazyLock;
 use std::time::Duration;
-
-use regex::Regex;
 
 use crate::error::EngineError;
 
@@ -118,82 +115,135 @@ fn clamp_advised(wait: Duration) -> Option<Duration> {
 }
 
 /// Extracts the best reset signal from an error response's headers
-/// (lowercased names), covering the three rate-limit dialects the audit
-/// found in the wild:
+/// (lowercased names). A header only counts when its name is `retry-after`,
+/// or contains both `ratelimit` and `reset` — the names the rate-limit
+/// dialects in the wild use:
 ///
 /// - plain `retry-after` (seconds or HTTP-date);
-/// - Anthropic-style duration suffixes (`x-ratelimit-*-reset`,
-///   `anthropic-ratelimit-*-reset`: `21s`, `1m20s`);
+/// - Anthropic resets as RFC 3339 timestamps (`anthropic-ratelimit-*-reset`:
+///   `2026-01-01T00:01:30Z`) or Go-style durations (`x-ratelimit-*-reset`:
+///   `21s`, `1m20s`);
 /// - OpenAI/OpenRouter-style resets (`x-ratelimit-reset-requests`,
 ///   `x-ratelimit-reset`, `x-ratelimit-reset-tokens`: `1ms`, `6m0s`,
 ///   `0.403s`).
 ///
-/// The longest advertised reset wins: the tokens window usually renews later
-/// than the requests window, and honouring the shorter one would send the
-/// next attempt into the same wall.
+/// Any other header is ignored, so an unrelated value like `x-trace-id: 5s`
+/// cannot extend a cooldown. The longest advertised reset wins: the tokens
+/// window usually renews later than the requests window, and honouring the
+/// shorter one would send the next attempt into the same wall.
 #[must_use]
 pub fn rate_limit_reset(headers: &[(String, String)]) -> Option<Duration> {
+    rate_limit_reset_at(headers, time::OffsetDateTime::now_utc())
+}
+
+/// [`rate_limit_reset`] with the clock injected: a pure function for callers
+/// that already hold the response time.
+#[must_use]
+pub fn rate_limit_reset_at(
+    headers: &[(String, String)],
+    now: time::OffsetDateTime,
+) -> Option<Duration> {
     let mut best: Option<Duration> = None;
     for (name, value) in headers {
-        let reset = if name.eq_ignore_ascii_case("retry-after") {
+        let name = name.to_ascii_lowercase();
+        let reset = if name == "retry-after" {
             parse_retry_after(value)
+        } else if name.contains("ratelimit") && name.contains("reset") {
+            parse_duration_suffix(value).or_else(|| rfc3339_reset_after(value, now))
         } else {
-            parse_duration_suffix(value)
+            None
         };
-        if let Some(reset) = reset
-            && reset > best.unwrap_or(Duration::ZERO)
-        {
-            best = Some(reset);
+        let wins_over_current = match best {
+            Some(current) => reset.is_some_and(|reset| reset > current),
+            None => reset.is_some(),
+        };
+        if wins_over_current {
+            best = reset;
         }
     }
     best
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
-              error caught the moment this static is first used, not a runtime input"
-)]
-static DURATION_PAIR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)").expect("valid duration regex")
-});
+/// Converts one RFC 3339 reset timestamp into the remaining wait from `now`.
+/// A timestamp that already passed is `Some(ZERO)` (the window is open);
+/// anything unparseable is `None` rather than a guess.
+fn rfc3339_reset_after(value: &str, now: time::OffsetDateTime) -> Option<Duration> {
+    let reset =
+        time::OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc3339)
+            .ok()?;
+    if reset <= now {
+        return Some(Duration::ZERO);
+    }
+    clamp_advised((reset - now).unsigned_abs())
+}
 
-/// Parses one Go-style `time.Duration` unit (`21s`, `1m`, `6m0s` handled by
-/// callers as separate pairs, `2ms`, `0.403s`, `1h`) — the shape both
-/// Anthropic and OpenAI emit in their rate-limit reset headers. Zero parses
-/// to `Some(ZERO)` (a window that already passed); a bare number without a
-/// unit or any other shape yields `None`.
+/// One Go `time.Duration` unit in nanoseconds. Longest first, so a two-byte
+/// unit (`ms`) wins over its one-byte prefix (`m`) and `5ms` is not read as
+/// five minutes plus an orphan `s`.
+const DURATION_UNITS: [(&str, f64); 7] = [
+    ("ns", 1.0),
+    ("us", 1e3),
+    ("µs", 1e3),
+    ("ms", 1e6),
+    ("s", 1e9),
+    ("m", 6e10),
+    ("h", 3.6e12),
+];
+
+/// Splits `s` at the first non-digit character into `(digit run, remainder)`.
+fn split_digits(s: &str) -> (&str, &str) {
+    match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(end) => (s.get(..end).unwrap_or(""), s.get(end..).unwrap_or("")),
+        None => (s, ""),
+    }
+}
+
+/// Consumes one `(number)(unit)` pair from the start of `rest`: digits with
+/// an optional fractional part (`0.403`), then one of [`DURATION_UNITS`] —
+/// the multi-byte `µs` included, matched on `str` prefixes.
+fn parse_duration_pair(rest: &str) -> Option<(f64, f64, &str)> {
+    let (whole, rest) = split_digits(rest);
+    if whole.is_empty() {
+        return None;
+    }
+    let mut number: f64 = whole.parse().ok()?;
+    let rest = match rest.strip_prefix('.') {
+        Some(after_dot) => {
+            let (fraction, rest) = split_digits(after_dot);
+            if fraction.is_empty() {
+                return None;
+            }
+            let places = i32::try_from(fraction.len()).ok()?;
+            number += fraction.parse::<f64>().ok()? / 10f64.powi(places);
+            rest
+        }
+        None => rest,
+    };
+    for (unit, multiplier) in DURATION_UNITS {
+        if let Some(remainder) = rest.strip_prefix(unit) {
+            return Some((number, multiplier, remainder));
+        }
+    }
+    None
+}
+
+/// Parses one Go-style `time.Duration` value (`21s`, `1m20s`, `6m0s`, `2ms`,
+/// `0.403s`, `1h`) — the shape both Anthropic and OpenAI emit in their
+/// rate-limit reset headers. Compound values are consumed left to right as
+/// number/unit pairs. Zero parses to `Some(ZERO)` (a window that already
+/// passed); a bare number without a unit or any other shape yields `None`.
 #[must_use]
 pub fn parse_duration_suffix(value: &str) -> Option<Duration> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
-    // Compound values ("1m20s"): consume number/unit pairs left to right.
     let mut total_ns: f64 = 0.0;
     let mut rest = value;
-    let mut progressed = false;
     while !rest.is_empty() {
-        let captures = DURATION_PAIR.captures(rest)?;
-        let number_raw = captures.get(1)?.as_str();
-        let unit = captures.get(2)?.as_str();
-        let whole_end = captures.get(0)?.end();
-        let number: f64 = number_raw.parse().ok()?;
-        let mult = match unit {
-            "ns" => 1.0,
-            "us" | "µs" => 1e3,
-            "ms" => 1e6,
-            "s" => 1e9,
-            "m" => 6e10,
-            "h" => 3.6e12,
-            _ => return None,
-        };
-        total_ns += number * mult;
-        progressed = true;
-        rest = rest.get(whole_end..)?;
-    }
-    if !progressed {
-        return None;
+        let (number, multiplier, remainder) = parse_duration_pair(rest)?;
+        total_ns += number * multiplier;
+        rest = remainder;
     }
     let secs = total_ns / 1e9;
     if !secs.is_finite() || secs < 0.0 {
@@ -355,6 +405,66 @@ mod tests {
             ("content-type".to_owned(), "application/json".to_owned()),
         ];
         assert_eq!(rate_limit_reset(&headers), Some(Duration::from_secs(360)));
+    }
+
+    fn test_now() -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap()
+    }
+
+    fn rfc3339_reset_in(now: time::OffsetDateTime, seconds: i64) -> String {
+        (now + time::Duration::seconds(seconds))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn an_rfc3339_reset_header_becomes_the_remaining_duration() {
+        let now = test_now();
+        let headers = vec![(
+            "anthropic-ratelimit-requests-reset".to_owned(),
+            rfc3339_reset_in(now, 90),
+        )];
+        let reset = rate_limit_reset_at(&headers, now).unwrap_or_default();
+        assert!(
+            reset >= Duration::from_secs(89) && reset <= Duration::from_secs(91),
+            "a reset 90s ahead parsed to {reset:?}"
+        );
+    }
+
+    #[test]
+    fn a_past_rfc3339_reset_is_zero() {
+        let now = test_now();
+        let headers = vec![(
+            "anthropic-ratelimit-tokens-reset".to_owned(),
+            rfc3339_reset_in(now, -60),
+        )];
+        assert_eq!(rate_limit_reset_at(&headers, now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn unrelated_headers_never_extend_a_cooldown() {
+        let headers = vec![
+            ("x-trace-id".to_owned(), "5s".to_owned()),
+            ("x-ratelimit-remaining".to_owned(), "5s".to_owned()),
+            ("content-type".to_owned(), "application/json".to_owned()),
+        ];
+        assert_eq!(rate_limit_reset_at(&headers, test_now()), None);
+    }
+
+    #[test]
+    fn the_longest_ratelimit_reset_still_wins() {
+        let now = test_now();
+        let headers = vec![
+            (
+                "anthropic-ratelimit-requests-reset".to_owned(),
+                rfc3339_reset_in(now, 120),
+            ),
+            ("x-ratelimit-reset-tokens".to_owned(), "1m20s".to_owned()),
+        ];
+        assert_eq!(
+            rate_limit_reset_at(&headers, now),
+            Some(Duration::from_secs(120))
+        );
     }
 
     #[test]

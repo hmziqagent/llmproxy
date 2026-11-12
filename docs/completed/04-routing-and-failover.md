@@ -57,8 +57,10 @@ Add pools, retries and failover on top of the routing decision in the
 ## Done
 
 - `llm_proxy_engine::classification` is the one transient/terminal sort,
-  with `Retry-After` parsing for both header spellings and Go-style
-  durations; the ladder consumes it through `next_wait` for backoff and
+  with `Retry-After` parsing for both header spellings, Go-style durations
+  and RFC 3339 reset timestamps — scoped by header name (`retry-after`, or
+  names containing both `ratelimit` and `reset`), longest advertised reset
+  wins; the ladder consumes it through `next_wait` for backoff and
   cooldown decisions.
 - Pools live in `[pool.*]` config and serve `/providers/{pool}/v1/...`:
   config validation rejects a duplicate member, an empty member list and a
