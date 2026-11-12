@@ -37,7 +37,9 @@ the engine and add no logic of their own, so they start once its API has stopped
   the caller's dialect decoded in and encoded back out, same-format
   passthrough included), and streaming events (`execute_stream` → an
   `EventStream` of tagged core-event JSON with `next`, `next_blocking` and
-  `cancel`; dropping or cancelling settles the request as `ClientCancelled`).
+  `cancel`; dropping it before it ends, or calling `cancel`, settles the
+  request as `ClientCancelled`, while a stream read to its end stays
+  completed).
   Failures surface as `BridgeError` carrying `kind`, `status`, `message`,
   `retry_after` and `should_retry`. One process-wide tokio runtime is shared
   by every bridge (a per-bridge runtime panics when dropped from an async

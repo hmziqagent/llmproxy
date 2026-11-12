@@ -880,3 +880,127 @@ async fn cancel_unblocks_a_blocked_next_blocking_reader_thread() {
 
     assert_settles_client_cancelled(&bridge).await;
 }
+
+/// Polls the recorded usage rows until the request settled as a completion,
+/// then asserts no client-cancellation failure row was recorded at all: a
+/// stream the consumer read to its end (or past its terminal event) must
+/// stay `Completed`, never become `ClientCancelled` by a drop.
+async fn assert_completed_without_client_cancel(bridge: &Bridge) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = bridge.usage_events();
+        let completed = events
+            .iter()
+            .any(|event| event.get("kind").and_then(Value::as_str) == Some("response_completed"));
+        if completed {
+            assert!(
+                !events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("response_failed")
+                        && event.get("error_kind").and_then(Value::as_str)
+                            == Some("ClientCancelled")
+                }),
+                "a consumed stream must not settle as ClientCancelled: {events:?}"
+            );
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the completion row must land after the stream ends, got: {:?}",
+            bridge.usage_events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Dropping the stream without an explicit `cancel()` must still cancel the
+/// upstream request: the engine settles `ClientCancelled` promptly, well
+/// under the 60 s idle default, instead of letting a stalled upstream keep
+/// the request running.
+#[tokio::test]
+async fn dropping_a_stream_settles_client_cancelled_without_waiting_for_the_upstream() {
+    let bridge = streaming_bridge(&spawn_stalling_sse_upstream().await);
+
+    let stream = bridge
+        .execute_stream(
+            "streamco",
+            "anthropic_messages",
+            &stream_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("stream starts");
+    let first = stream.next().await.expect("first event arrives");
+    assert!(first.get("MessageStart").is_some(), "got: {first}");
+
+    drop(stream);
+    let started = tokio::time::Instant::now();
+    assert_settles_client_cancelled(&bridge).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the drop must settle promptly (the idle default is 60 s), took {elapsed:?}"
+    );
+}
+
+/// The same settlement must hold when the consumer never reads a single
+/// event: dropping the stream right after `execute_stream` cancels too.
+#[tokio::test]
+async fn a_stream_dropped_before_the_first_read_is_cancelled() {
+    let bridge = streaming_bridge(&spawn_stalling_sse_upstream().await);
+
+    let stream = bridge
+        .execute_stream(
+            "streamco",
+            "anthropic_messages",
+            &stream_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("stream starts");
+    drop(stream);
+
+    assert_settles_client_cancelled(&bridge).await;
+}
+
+/// A stream the consumer read to the end must stay `Completed` when dropped:
+/// both the fully drained form (polled to `None`) and the drop right after
+/// the terminal event (before the pump observed the end itself).
+#[tokio::test]
+async fn a_fully_consumed_stream_that_is_dropped_stays_completed() {
+    // Drained to `None`, then dropped.
+    let bridge = streaming_bridge(&spawn_slow_sse_upstream().await);
+    let stream = bridge
+        .execute_stream(
+            "streamco",
+            "anthropic_messages",
+            &stream_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("stream starts");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_completed_without_client_cancel(&bridge).await;
+
+    // Dropped right after the terminal event, without polling to `None`.
+    let bridge = streaming_bridge(&spawn_slow_sse_upstream().await);
+    let stream = bridge
+        .execute_stream(
+            "streamco",
+            "anthropic_messages",
+            &stream_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("stream starts");
+    loop {
+        let Some(event) = stream.next().await else {
+            panic!("the stream ended before the terminal event");
+        };
+        if event.get("MessageStop").is_some() {
+            break;
+        }
+    }
+    drop(stream);
+    assert_completed_without_client_cancel(&bridge).await;
+}

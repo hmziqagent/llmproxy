@@ -542,6 +542,7 @@ impl Bridge {
                 wake: cancel.wake.subscribe(),
             }),
             cancel,
+            ended: AtomicBool::new(false),
         })
     }
 
@@ -832,9 +833,11 @@ struct ConsumerEnd {
     wake: watch::Receiver<bool>,
 }
 
-/// A streaming response as an iterator of JSON events. Dropping it, or
-/// calling [`EventStream::cancel`], cancels the upstream request; the engine
-/// then settles it as `ClientCancelled`.
+/// A streaming response as an iterator of JSON events. Dropping it before it
+/// ends, or calling [`EventStream::cancel`], cancels the upstream request;
+/// the engine then settles it as `ClientCancelled`. A stream the consumer
+/// has read to its end — the terminal event or `None` — does not cancel on
+/// drop; the engine settles that request as completed on its own.
 ///
 /// Every method takes `&self`, so a cancel from any thread (a watchdog, a
 /// Python thread) works while another thread is blocked in
@@ -842,6 +845,12 @@ struct ConsumerEnd {
 pub struct EventStream {
     consumer: tokio::sync::Mutex<ConsumerEnd>,
     cancel: Arc<StreamCancel>,
+    /// The stream ended of its own accord — the pump closed the channel after
+    /// a normal end, or the consumer saw the terminal `MessageStop` event —
+    /// so dropping it must not cancel a request that finished cleanly. Only
+    /// the consumer knows this, which is why it lives here and not on
+    /// [`StreamCancel`].
+    ended: AtomicBool,
 }
 
 impl std::fmt::Debug for EventStream {
@@ -874,7 +883,16 @@ impl EventStream {
                 event = rx.recv() => {
                     return match event {
                         // An event that raced with a cancel is not delivered.
-                        Some(event) if !self.cancel.is_cancelled() => Some(event),
+                        Some(event) if !self.cancel.is_cancelled() => {
+                            self.mark_ended_if_terminal(&event);
+                            Some(event)
+                        }
+                        // The pump closed the channel after a normal end: a
+                        // later drop must not cancel the finished request.
+                        None if !self.cancel.is_cancelled() => {
+                            self.ended.store(true, Ordering::Release);
+                            None
+                        }
                         _ => None,
                     };
                 }
@@ -900,7 +918,16 @@ impl EventStream {
         }
         match consumer.rx.blocking_recv() {
             // An event that raced with a cancel is not delivered.
-            Some(event) if !self.cancel.is_cancelled() => Some(event),
+            Some(event) if !self.cancel.is_cancelled() => {
+                self.mark_ended_if_terminal(&event);
+                Some(event)
+            }
+            // The pump closed the channel after a normal end: a later drop
+            // must not cancel the finished request.
+            None if !self.cancel.is_cancelled() => {
+                self.ended.store(true, Ordering::Release);
+                None
+            }
             _ => None,
         }
     }
@@ -920,5 +947,32 @@ impl EventStream {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Marks the stream ended when `event` is the engine's terminal event.
+    ///
+    /// Core events serialize as single-key tagged objects (`{"MessageStop":
+    /// …}`), so the key's presence identifies the terminal variant. The pump
+    /// may not yet have observed the engine stream's own end when the
+    /// consumer sees it, and a drop at that point must not cancel a request
+    /// that is about to settle as completed.
+    fn mark_ended_if_terminal(&self, event: &Value) {
+        if event.get("MessageStop").is_some() {
+            self.ended.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        // A stream that did not end of its own accord still has a live
+        // upstream request behind the pump task; cancel it, or the request
+        // runs until the engine's idle timeout instead of settling as
+        // `ClientCancelled`. `cancel` only touches an `AtomicBool` and a
+        // `watch` sender, so it is safe from any dropping thread, including
+        // a tokio worker or a language runtime's finalizer.
+        if !self.ended.load(Ordering::Acquire) {
+            self.cancel();
+        }
     }
 }
