@@ -39,7 +39,7 @@ use crate::headers::select_forwarded_headers;
 use crate::traits::{
     AdmissionClaim, AdmissionOutcome, AdmissionTicket, CacheEntry, CacheKey, CredentialFeedback,
     CredentialPick, CredentialQuery, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery,
-    UnsettledLeaseGuard, UsageSink,
+    UnsettledLeaseGuard,
 };
 use crate::types::{ClientDialect, EngineRequest, EngineResponse, EngineStream};
 use crate::{EngineInner, ProviderAdapterTarget};

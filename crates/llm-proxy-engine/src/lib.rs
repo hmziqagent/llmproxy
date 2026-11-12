@@ -151,7 +151,7 @@ pub(crate) struct EngineInner {
     pub(crate) cache: Arc<dyn Cache>,
     pub(crate) guards: Vec<Arc<dyn Guard>>,
     pub(crate) credentials: Arc<dyn CredentialSource>,
-    pub(crate) usage: EventBusSink,
+    pub(crate) usage: Arc<dyn UsageSink>,
     pub(crate) catalogs: Arc<ModelCatalogService>,
     pub(crate) metrics: Arc<Metrics>,
     /// Passive upstream health (plan 04 steps 3, 9): provider and
@@ -305,9 +305,10 @@ impl Engine {
         &self.inner.metrics
     }
 
-    /// The usage sink (wrap of the configured event bus).
+    /// The usage sink (default: an [`EventBusSink`] over the configured
+    /// event bus).
     #[must_use]
-    pub fn usage_sink(&self) -> &EventBusSink {
+    pub fn usage_sink(&self) -> &Arc<dyn UsageSink> {
         &self.inner.usage
     }
 
@@ -342,7 +343,7 @@ pub struct EngineBuilder {
     cache: Option<Arc<dyn Cache>>,
     guards: Vec<Arc<dyn Guard>>,
     credentials: Option<Arc<dyn CredentialSource>>,
-    usage: Option<EventBusSink>,
+    usage: Option<Arc<dyn UsageSink>>,
     catalogs: Option<Arc<ModelCatalogService>>,
     metrics: Option<Arc<Metrics>>,
     counter: Option<Counter>,
@@ -488,7 +489,16 @@ impl EngineBuilder {
     /// Send usage rows to this event bus (default: [`NoopBus`]).
     #[must_use]
     pub fn event_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
-        self.usage = Some(EventBusSink::new(bus));
+        self.usage = Some(Arc::new(EventBusSink::new(bus)));
+        self
+    }
+
+    /// Replace the usage sink (default: an [`EventBusSink`] over
+    /// [`NoopBus`]). The last setter wins: installing a sink after
+    /// [`Self::event_bus`] replaces the bus-backed sink.
+    #[must_use]
+    pub fn usage_sink(mut self, sink: Arc<dyn UsageSink>) -> Self {
+        self.usage = Some(sink);
         self
     }
 
@@ -549,8 +559,10 @@ impl EngineBuilder {
         self.providers
             .validate_protocols(known_protocols.iter().map(String::as_str))
             .map_err(|error| EngineError::Internal(error.to_string()))?;
-        let usage = self.usage.unwrap_or_else(|| {
-            EventBusSink::new(Arc::new(llm_proxy_storage::NoopBus) as Arc<dyn EventBus>)
+        let usage: Arc<dyn UsageSink> = self.usage.unwrap_or_else(|| {
+            Arc::new(EventBusSink::new(
+                Arc::new(llm_proxy_storage::NoopBus) as Arc<dyn EventBus>
+            ))
         });
         let health = self
             .cooldowns

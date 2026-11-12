@@ -22,13 +22,13 @@ use llm_proxy_core::{
 use llm_proxy_engine::error::EngineError;
 use llm_proxy_engine::traits::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, Cache, CacheEntry, CacheKey,
-    CredentialSource, Guard, GuardDecision,
+    CredentialSource, Guard, GuardDecision, UsageSink,
 };
 use llm_proxy_engine::{
     ClientDialect, EngineBuilder, EngineRequest, EngineResponse, InboundRequest,
 };
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest, CoreResponse};
-use llm_proxy_storage::{EventBus, NoopBus};
+use llm_proxy_storage::{EventBus, NoopBus, ProxyEvent, RecordingBus};
 use secrecy::SecretString;
 
 const ECHO_PROTOCOL: &str = "echo_v1";
@@ -638,4 +638,109 @@ async fn a_custom_cache_serves_the_second_request_without_egress() {
     );
     assert_eq!(cache.hits.load(Ordering::SeqCst), 1);
     assert_eq!(first.core.id, second.core.id, "the cached response replays");
+}
+
+/// A user-supplied [`UsageSink`]: captures every ledger event the engine
+/// emits, exactly as an SDK user would.
+#[derive(Debug, Default)]
+struct CollectingSink {
+    events: std::sync::Mutex<Vec<ProxyEvent>>,
+}
+
+impl UsageSink for CollectingSink {
+    fn record(&self, event: &ProxyEvent) {
+        self.events
+            .lock()
+            .expect("usage sink lock")
+            .push(event.clone());
+    }
+}
+
+fn event_kind(event: &ProxyEvent) -> &'static str {
+    match event {
+        ProxyEvent::RequestReceived(_) => "request_received",
+        ProxyEvent::AttemptCompleted(_) => "attempt_completed",
+        ProxyEvent::ResponseCompleted(_) => "response_completed",
+        ProxyEvent::ResponseFailed(_) => "response_failed",
+    }
+}
+
+fn event_request_id(event: &ProxyEvent) -> String {
+    match event {
+        ProxyEvent::RequestReceived(row) => row.request_id.clone(),
+        ProxyEvent::AttemptCompleted(row) => row.request_id.clone(),
+        ProxyEvent::ResponseCompleted(row) => row.request_id.clone(),
+        ProxyEvent::ResponseFailed(row) => row.request_id.clone(),
+    }
+}
+
+#[tokio::test]
+async fn a_custom_usage_sink_receives_the_ledger_events() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn(upstream_app(Arc::clone(&seen))).await;
+    let registry =
+        ProviderRegistry::from_providers(vec![echo_provider(endpoint.clone())]).expect("registry");
+    let sink = Arc::new(CollectingSink::default());
+
+    let engine = EngineBuilder::new(config())
+        .register_adapter(Arc::new(EchoAdapter))
+        .expect("adapter registers")
+        .providers(Arc::new(registry))
+        .usage_sink(Arc::clone(&sink) as Arc<dyn UsageSink>)
+        .build()
+        .expect("engine builds");
+
+    let req = request("hello");
+    let request_id = req.request_id.clone();
+    engine.execute(req).await.expect("execute");
+
+    let events = sink.events.lock().expect("usage sink lock").clone();
+    let kinds: Vec<&'static str> = events.iter().map(event_kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            "request_received",
+            "attempt_completed",
+            "response_completed"
+        ],
+        "one successful non-streaming request writes its ledger rows in order"
+    );
+    let ids: Vec<String> = events.iter().map(event_request_id).collect();
+    assert_eq!(
+        ids,
+        [request_id.clone(), request_id.clone(), request_id],
+        "every row carries the request's id"
+    );
+
+    // Last setter wins: a builder that installs `.event_bus(recording)` and
+    // then `.usage_sink(custom)` delivers to the custom sink only.
+    let later_sink = Arc::new(CollectingSink::default());
+    let bus = Arc::new(RecordingBus::new());
+    let registry =
+        ProviderRegistry::from_providers(vec![echo_provider(endpoint)]).expect("registry");
+    let engine = EngineBuilder::new(config())
+        .register_adapter(Arc::new(EchoAdapter))
+        .expect("adapter registers")
+        .providers(Arc::new(registry))
+        .event_bus(Arc::clone(&bus) as Arc<dyn EventBus>)
+        .usage_sink(Arc::clone(&later_sink) as Arc<dyn UsageSink>)
+        .build()
+        .expect("engine builds");
+    engine.execute(request("hello")).await.expect("execute");
+    assert!(
+        bus.snapshot().is_empty(),
+        "a later usage_sink replaces an earlier event_bus: got {:?}",
+        bus.snapshot()
+    );
+    let later_events = later_sink.events.lock().expect("usage sink lock").clone();
+    let later_kinds: Vec<&'static str> = later_events.iter().map(event_kind).collect();
+    assert_eq!(
+        later_kinds,
+        [
+            "request_received",
+            "attempt_completed",
+            "response_completed"
+        ],
+        "the later-set sink receives the ledger rows"
+    );
 }
