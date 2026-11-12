@@ -550,6 +550,107 @@ async fn a_cache_hit_answers_where_the_dedup_window_used_to_409() {
 }
 
 #[tokio::test]
+async fn a_cache_hit_a_single_flight_join_and_a_replay_each_bump_the_hit_metric() {
+    // The `llm_proxy_cache_hits_total` counter is bumped by
+    // `record_served_copy` for every request answered without a fresh
+    // upstream attempt: a response-cache hit, a single-flight join, or an
+    // idempotent replay (plan 06 item 4). Fresh engines per case.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let cache_engine = build_engine(
+        endpoint,
+        Arc::new(RecordingBus::new()),
+        Some(MemoryCache::new(Duration::from_secs(60), 16)),
+    );
+    cache_engine
+        .execute(engine_request(false, "hit metric", "caller-a", None))
+        .await
+        .expect("cache first");
+    assert_eq!(
+        cache_engine.metrics().get_snapshot().cache_hits,
+        0,
+        "the first request ran upstream, so it is not a hit"
+    );
+    cache_engine
+        .execute(engine_request(false, "hit metric", "caller-a", None))
+        .await
+        .expect("cache second");
+    assert_eq!(
+        cache_engine.metrics().get_snapshot().cache_hits,
+        1,
+        "the cached second request must bump the hit metric"
+    );
+
+    let upstream = CountingUpstream::new(Duration::from_millis(150));
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let flight_engine = build_engine(endpoint, Arc::new(RecordingBus::new()), None);
+    let mut requests = Vec::new();
+    for i in 0..4 {
+        let engine = flight_engine.clone();
+        requests.push(async move {
+            engine
+                .execute(
+                    engine_request(false, "flight metric", "caller-a", None)
+                        .with_request_id(format!("req-{i}")),
+                )
+                .await
+        });
+    }
+    let results = futures::future::join_all(requests).await;
+    for result in results {
+        result.expect("every joiner is served");
+    }
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        1,
+        "the four concurrent requests shared one upstream call"
+    );
+    assert_eq!(
+        flight_engine.metrics().get_snapshot().cache_hits,
+        3,
+        "the three single-flight joiners must bump the hit metric"
+    );
+
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let idem_engine = build_idempotent_engine(endpoint, Arc::new(RecordingBus::new()));
+    idem_engine
+        .execute(engine_request(
+            false,
+            "replay metric",
+            "caller-a",
+            Some("key-metric"),
+        ))
+        .await
+        .expect("idempotency first");
+    assert_eq!(
+        idem_engine.metrics().get_snapshot().cache_hits,
+        0,
+        "the executing request is not a hit"
+    );
+    let replay = idem_engine
+        .execute(engine_request(
+            false,
+            "replay metric",
+            "caller-a",
+            Some("key-metric"),
+        ))
+        .await
+        .expect("idempotency replay");
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        response_text(&replay),
+        "hello from upstream",
+        "the replay answers the stored response"
+    );
+    assert_eq!(
+        idem_engine.metrics().get_snapshot().cache_hits,
+        1,
+        "the idempotent replay must bump the hit metric"
+    );
+}
+
+#[tokio::test]
 async fn one_callers_cached_response_is_never_returned_to_another() {
     // Done-when 3: the cache key is caller-scoped.
     let upstream = CountingUpstream::new(Duration::ZERO);
