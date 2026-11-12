@@ -96,21 +96,39 @@ mod tests {
         .expect("serialize chat fixture response")
     }
 
+    fn gemini_success_response() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "fixture reply" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 25,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 32
+            }
+        }))
+        .expect("serialize gemini fixture response")
+    }
+
     async fn spawn_fake_upstream(anthropic: bool, stream: bool) -> FakeUpstream {
-        spawn_fake_upstream_dialect(anthropic, stream, false).await
+        spawn_fake_upstream_dialect(anthropic, stream, false, openai_chat_success_response()).await
     }
 
     async fn spawn_fake_upstream_dialect(
         anthropic: bool,
         stream: bool,
         chat_stream: bool,
+        chat_response: Vec<u8>,
     ) -> FakeUpstream {
         let capture: Capture = Arc::new(tokio::sync::Mutex::new(None));
         let capture_for_handler = Arc::clone(&capture);
         let is_stream = stream;
+        let chat_response = Arc::new(chat_response);
 
         let handler = Arc::new(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
             let capture = Arc::clone(&capture_for_handler);
+            let chat_response = Arc::clone(&chat_response);
             async move {
                 *capture.lock().await = Some((headers, body));
                 if is_stream {
@@ -135,7 +153,7 @@ mod tests {
                     (
                         StatusCode::OK,
                         [(header::CONTENT_TYPE, "application/json")],
-                        openai_chat_success_response(),
+                        (*chat_response).clone(),
                     )
                         .into_response()
                 }
@@ -467,6 +485,15 @@ mod tests {
             .expect("body")
     }
 
+    fn post_chat_completions(body: &Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/fixture-provider/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("body")
+    }
+
     #[tokio::test]
     async fn anthropic_media_blocks_reach_a_same_format_upstream_unchanged() {
         let upstream = spawn_fake_upstream(true, false).await;
@@ -689,7 +716,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_sdk_stream_request_gets_usage_injection_only() {
-        let upstream = spawn_fake_upstream_dialect(false, true, true).await;
+        let upstream =
+            spawn_fake_upstream_dialect(false, true, true, openai_chat_success_response()).await;
         let state = state_with_provider(
             &upstream,
             "openai_chat_completions",
@@ -735,14 +763,7 @@ mod tests {
         let state = state_with_provider(&upstream, "anthropic_messages", "chat_completions", false);
         let app = build_router(state);
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/providers/fixture-provider/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .expect("body"),
-            )
+            .oneshot(post_chat_completions(&body))
             .await
             .expect("request served");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -764,14 +785,7 @@ mod tests {
         let state = state_with_provider(&upstream, "anthropic_messages", "chat_completions", true);
         let app = build_router(state);
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/providers/fixture-provider/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .expect("body"),
-            )
+            .oneshot(post_chat_completions(&body))
             .await
             .expect("request served");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -819,6 +833,83 @@ mod tests {
         assert_eq!(
             upstream_body["messages"][0]["content"][1]["source"],
             serde_json::json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="})
+        );
+    }
+
+    #[tokio::test]
+    async fn response_format_maps_cross_format_to_responses_and_gemini() {
+        // `response_format` is MAPPED, not rejected, where the provider
+        // supports structured output natively (plan step 4): it must reach
+        // those upstreams in their own shapes, never verbatim. Anthropic
+        // stays rejected (see the rejection test above).
+        let chat_body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Return JSON."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "invoice_total",
+                    "schema": {"type": "object", "properties": {"total": {"type": "number"}}}
+                }
+            }
+        });
+
+        // Chat -> Responses: the schema flattens onto text.format.
+        let upstream =
+            spawn_fake_upstream_dialect(false, false, false, openai_chat_success_response()).await;
+        let app = build_router(state_with_provider(
+            &upstream,
+            "openai_responses",
+            "chat_completions",
+            false,
+        ));
+        let resp = app
+            .oneshot(post_chat_completions(&chat_body))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, upstream_body) = captured(&upstream).await;
+        assert_eq!(
+            upstream_body["text"]["format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "name": "invoice_total",
+                "schema": {"type": "object", "properties": {"total": {"type": "number"}}}
+            }),
+            "the schema must flatten onto the Responses text.format: {upstream_body}"
+        );
+        assert!(
+            upstream_body.get("response_format").is_none(),
+            "the OpenAI field name must not reach the Responses upstream: {upstream_body}"
+        );
+
+        // Chat -> Gemini: JSON mode plus the standard JSON Schema.
+        let upstream =
+            spawn_fake_upstream_dialect(false, false, false, gemini_success_response()).await;
+        let app = build_router(state_with_provider(
+            &upstream,
+            "gemini_generate_content",
+            "chat_completions",
+            false,
+        ));
+        let resp = app
+            .oneshot(post_chat_completions(&chat_body))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, upstream_body) = captured(&upstream).await;
+        assert_eq!(
+            upstream_body["generation_config"]["responseMimeType"], "application/json",
+            "json_schema must select Gemini JSON mode: {upstream_body}"
+        );
+        assert_eq!(
+            upstream_body["generation_config"]["responseJsonSchema"],
+            serde_json::json!({"type": "object", "properties": {"total": {"type": "number"}}}),
+            "the schema must ride responseJsonSchema: {upstream_body}"
+        );
+        assert!(
+            upstream_body.get("response_format").is_none(),
+            "the OpenAI field name must not reach the Gemini upstream: {upstream_body}"
         );
     }
 
@@ -1065,7 +1156,8 @@ mod tests {
         // The SDK's streaming shape: no usage-injection edit exists on the
         // Anthropic wire, so the captured body must pass completely unedited
         // apart from the model alias.
-        let upstream = spawn_fake_upstream_dialect(true, true, false).await;
+        let upstream =
+            spawn_fake_upstream_dialect(true, true, false, openai_chat_success_response()).await;
         let state = state_with_provider(&upstream, "anthropic_messages", "messages", false);
         let app = build_router(state);
 
@@ -1171,7 +1263,8 @@ mod tests {
     async fn captured_openai_sdk_stream_request_keeps_usage_injection_only() {
         // The SDK already asked for usage; the proxy must keep it on and make
         // no other edit to the captured streaming body.
-        let upstream = spawn_fake_upstream_dialect(false, true, true).await;
+        let upstream =
+            spawn_fake_upstream_dialect(false, true, true, openai_chat_success_response()).await;
         let state = state_with_provider(
             &upstream,
             "openai_chat_completions",

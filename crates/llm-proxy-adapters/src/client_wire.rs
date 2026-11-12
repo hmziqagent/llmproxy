@@ -259,13 +259,19 @@ pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDispositi
             "service_tier" | "parallel_tool_calls" | "store" | "prompt_cache_key" => {
                 FieldDisposition::Carried
             }
-            // Mapped by the Responses adapter from the raw client body.
-            "output_config" => FieldDisposition::Mapped,
+            // Mapped by the Responses adapter from the raw client body:
+            // `response_format` becomes the `text.format` structured-output
+            // surface.
+            "output_config" | "response_format" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
         protocols::GEMINI_GENERATE_CONTENT => match field {
             // Mapped by the Gemini adapter into generationConfig.topK.
             "top_k" => FieldDisposition::Mapped,
+            // Mapped by the Gemini adapter from the raw client body:
+            // `response_format` becomes generationConfig.responseMimeType
+            // (plus responseJsonSchema for a schema).
+            "response_format" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
         _ => FieldDisposition::Rejected,
@@ -569,6 +575,86 @@ fn check_output_config_subkeys(
     )))
 }
 
+/// The cross-format reading of a client `response_format` object for a
+/// provider the disposition table marks [`FieldDisposition::Mapped`]
+/// (Responses `text.format`, Gemini `generationConfig.responseMimeType`).
+pub(crate) enum ResponseFormat<'a> {
+    /// `{"type": "text"}`: plain text is the provider default, so nothing is
+    /// written to the wire.
+    Text,
+    /// `{"type": "json_object"}`: JSON mode without a schema.
+    JsonObject,
+    /// `{"type": "json_schema", ...}`: structured output. `spec` is the
+    /// client's `json_schema` object (`name`, `schema`, `strict`,
+    /// `description`), which each adapter flattens into its own shape.
+    JsonSchema {
+        /// The client's `json_schema` spec object.
+        spec: &'a serde_json::Map<String, Value>,
+    },
+}
+
+/// Reads the client's raw `response_format` for an adapter whose disposition
+/// table marks the field `Mapped`. `Ok(None)` when the field is absent or
+/// null. A shape no mapping can read (a non-object, a `json_schema` without a
+/// spec object, an unknown `type`) is rejected naming the offending path — or,
+/// under the per-route `lossy` opt-in, dropped with a logged warning instead
+/// of being forwarded or silently lost.
+pub(crate) fn parse_response_format<'a>(
+    client: &'a ClientWireRequest,
+    protocol: &str,
+    lossy: bool,
+) -> Result<Option<ResponseFormat<'a>>, ProviderError> {
+    let Some(format) = client
+        .body
+        .as_object()
+        .and_then(|obj| obj.get("response_format"))
+    else {
+        return Ok(None);
+    };
+    if format.is_null() {
+        // `response_format: null` means absent, mirroring the `thinking` decode.
+        return Ok(None);
+    }
+    let Some(spec) = format.as_object() else {
+        return reject_unmappable_response_format("response_format", protocol, lossy)
+            .map(|()| None);
+    };
+    match spec.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(Some(ResponseFormat::Text)),
+        Some("json_object") => Ok(Some(ResponseFormat::JsonObject)),
+        Some("json_schema") => match spec.get("json_schema").and_then(Value::as_object) {
+            Some(schema_spec) => Ok(Some(ResponseFormat::JsonSchema { spec: schema_spec })),
+            None => {
+                reject_unmappable_response_format("response_format.json_schema", protocol, lossy)
+                    .map(|()| None)
+            }
+        },
+        _ => reject_unmappable_response_format("response_format.type", protocol, lossy)
+            .map(|()| None),
+    }
+}
+
+/// Rejects a `response_format` shape the target provider cannot carry,
+/// naming the offending path; a lossy route drops it with a logged warning
+/// instead of failing the request.
+pub(crate) fn reject_unmappable_response_format(
+    name: &str,
+    protocol: &str,
+    lossy: bool,
+) -> Result<(), ProviderError> {
+    if lossy {
+        tracing::warn!(
+            field = name,
+            provider = protocol,
+            "lossy route: dropping client field with no provider equivalent"
+        );
+        return Ok(());
+    }
+    Err(ProviderError::InvalidRequest(format!(
+        "{name} has no {protocol} equivalent; remove it or enable the route's lossy mode"
+    )))
+}
+
 /// Whether the raw Anthropic client body contains at least one server tool;
 /// the Anthropic adapter drops those tools from the normalized `tools` list on
 /// lossy cross-format routes (they cannot be represented as functions).
@@ -677,6 +763,38 @@ mod tests {
         )
         .expect("parallel_tool_calls is mapped, not rejected");
         assert!(carried.is_empty());
+    }
+
+    #[test]
+    fn response_format_maps_cross_format_for_responses_and_gemini() {
+        let client = wire(
+            ClientWireFormat::OpenAiChatCompletions,
+            json!({
+                "model": "m", "messages": [],
+                "response_format": {"type": "json_object"}
+            }),
+        );
+        for provider in [
+            protocols::OPENAI_RESPONSES,
+            protocols::GEMINI_GENERATE_CONTENT,
+        ] {
+            let carried = apply_field_policy(&client, &ProtocolName::new(provider), false)
+                .expect("response_format is mapped, not rejected, for these providers");
+            assert!(
+                !carried.contains_key("response_format"),
+                "mapped response_format must not also be carried verbatim: {carried:?}"
+            );
+        }
+        let err = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            false,
+        )
+        .expect_err("Anthropic has no structured-output mapping for response_format");
+        assert!(
+            err.to_string().contains("response_format"),
+            "error must name response_format: {err}"
+        );
     }
 
     #[test]

@@ -497,7 +497,7 @@ impl ResponsesAdapter {
 
         // Every other client dialect is cross-format here: settle the
         // leftover client fields first.
-        let carried = super::client_wire::apply_field_policy(
+        let mut carried = super::client_wire::apply_field_policy(
             client,
             &ProtocolName::new(protocols::OPENAI_RESPONSES),
             target.lossy,
@@ -507,6 +507,38 @@ impl ResponsesAdapter {
             &ProtocolName::new(protocols::OPENAI_RESPONSES),
             target.lossy,
         )?;
+        // `response_format` maps onto the `text.format` structured-output
+        // surface (plan step 4: carry response_format wherever the provider
+        // supports it); `{"type": "text"}` maps to omission.
+        use super::client_wire::ResponseFormat;
+        match super::client_wire::parse_response_format(
+            client,
+            protocols::OPENAI_RESPONSES,
+            target.lossy,
+        )? {
+            None | Some(ResponseFormat::Text) => {}
+            Some(ResponseFormat::JsonObject) => {
+                carried.insert(
+                    "text".to_owned(),
+                    serde_json::json!({"format": {"type": "json_object"}}),
+                );
+            }
+            Some(ResponseFormat::JsonSchema { spec }) => {
+                // Flatten one level: `json_schema.{name,schema,strict,
+                // description}` become `text.format` members.
+                let mut format = serde_json::Map::new();
+                format.insert("type".to_owned(), serde_json::json!("json_schema"));
+                for key in ["name", "schema", "strict", "description"] {
+                    if let Some(value) = spec.get(key) {
+                        format.insert(key.to_owned(), value.clone());
+                    }
+                }
+                carried.insert(
+                    "text".to_owned(),
+                    serde_json::json!({"format": serde_json::Value::Object(format)}),
+                );
+            }
+        }
         let mut input = Vec::new();
 
         if !core.system.is_empty() {
@@ -1505,6 +1537,104 @@ mod tests {
         assert!(
             body.get("max_output_tokens").is_none(),
             "unset max_output_tokens must be absent"
+        );
+    }
+
+    /// A Chat-dialect client wire carrying `response_format`: never the same
+    /// format as the Responses adapter, so these tests exercise the
+    /// cross-format structured-output mapping.
+    fn chat_client_with_response_format(response_format: &serde_json::Value) -> ClientWireRequest {
+        ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [],
+                "response_format": response_format,
+            }),
+        )
+    }
+
+    #[test]
+    fn chat_json_schema_response_format_maps_to_text_format() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "Return JSON.".into(),
+                cache: None,
+            }],
+        }]);
+        let client = chat_client_with_response_format(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "invoice_total",
+                "strict": true,
+                "schema": {"type": "object", "properties": {"total": {"type": "number"}}}
+            }
+        }));
+        let adapter = ResponsesAdapter;
+        let proxy_req = adapter
+            .encode_request(&core, &make_target(), &client)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["text"]["format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "name": "invoice_total",
+                "schema": {"type": "object", "properties": {"total": {"type": "number"}}},
+                "strict": true,
+            }),
+            "the json_schema spec must flatten one level onto text.format: {body}"
+        );
+        assert!(
+            body.get("response_format").is_none(),
+            "the client field must not ride the wire verbatim: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_json_object_maps() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "Return JSON.".into(),
+                cache: None,
+            }],
+        }]);
+        let client = chat_client_with_response_format(&serde_json::json!({"type": "json_object"}));
+        let adapter = ResponsesAdapter;
+        let proxy_req = adapter
+            .encode_request(&core, &make_target(), &client)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["text"]["format"],
+            serde_json::json!({"type": "json_object"}),
+            "json_object must map onto text.format: {body}"
+        );
+        assert!(
+            body.get("response_format").is_none(),
+            "the client field must not ride the wire verbatim: {body}"
+        );
+    }
+
+    #[test]
+    fn unknown_response_format_type_is_rejected_by_name() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = chat_client_with_response_format(&serde_json::json!({"type": "yaml"}));
+        let adapter = ResponsesAdapter;
+        let err = adapter
+            .encode_request(&core, &make_target(), &client)
+            .expect_err("an unknown response_format type must be rejected");
+        assert!(
+            err.to_string().contains("response_format.type"),
+            "error must name response_format.type: {err}"
         );
     }
 

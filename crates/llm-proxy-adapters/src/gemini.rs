@@ -629,6 +629,28 @@ impl GeminiAdapter {
                 .and_then(|v| i32::try_from(v).ok())
         });
 
+        // `response_format` maps onto generationConfig.responseMimeType
+        // (plus responseJsonSchema for a schema) — structured output is a
+        // native Gemini capability (plan step 4); `{"type": "text"}` maps to
+        // omission.
+        use super::client_wire::ResponseFormat;
+        let mut response_mime_type = None;
+        let mut response_json_schema = None;
+        match super::client_wire::parse_response_format(
+            client,
+            protocols::GEMINI_GENERATE_CONTENT,
+            target.lossy,
+        )? {
+            None | Some(ResponseFormat::Text) => {}
+            Some(ResponseFormat::JsonObject) => {
+                response_mime_type = Some("application/json".to_owned());
+            }
+            Some(ResponseFormat::JsonSchema { spec }) => {
+                response_mime_type = Some("application/json".to_owned());
+                response_json_schema = spec.get("schema").cloned();
+            }
+        }
+
         let generation_config = GeminiGenerationConfig {
             temperature: core.sampling.temperature,
             top_p: core.sampling.top_p,
@@ -640,6 +662,8 @@ impl GeminiAdapter {
                 .as_ref()
                 .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) }),
             thinking_config,
+            response_mime_type,
+            response_json_schema,
         };
 
         let tool_config =
@@ -1124,6 +1148,82 @@ mod tests {
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.tools.len(), 1);
         assert_eq!(body.tools[0].function_declarations[0].name, "get_weather");
+    }
+
+    /// A Chat-dialect client wire carrying `response_format`: never the same
+    /// format as the Gemini adapter, so these tests exercise the cross-format
+    /// structured-output mapping.
+    fn chat_client_with_response_format(response_format: &serde_json::Value) -> ClientWireRequest {
+        ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": "gemini-2.5-pro",
+                "messages": [],
+                "response_format": response_format,
+            }),
+        )
+    }
+
+    #[test]
+    fn chat_json_object_sets_response_mime_type() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "Return JSON.".into(),
+                cache: None,
+            }],
+        }]);
+        let client = chat_client_with_response_format(&serde_json::json!({"type": "json_object"}));
+        let adapter = GeminiAdapter;
+        let proxy_req = adapter
+            .encode_request(&core, &make_target(), &client)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["generation_config"]["responseMimeType"], "application/json",
+            "json_object must select Gemini JSON mode via responseMimeType: {body}"
+        );
+        assert!(
+            body.get("response_format").is_none(),
+            "the client field must not ride the wire verbatim: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_json_schema_sets_response_json_schema() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "Return JSON.".into(),
+                cache: None,
+            }],
+        }]);
+        let client = chat_client_with_response_format(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "invoice_total",
+                "strict": true,
+                "schema": {"type": "object", "properties": {"total": {"type": "number"}}}
+            }
+        }));
+        let adapter = GeminiAdapter;
+        let proxy_req = adapter
+            .encode_request(&core, &make_target(), &client)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["generation_config"]["responseMimeType"], "application/json",
+            "json_schema must also select JSON mode: {body}"
+        );
+        assert_eq!(
+            body["generation_config"]["responseJsonSchema"],
+            serde_json::json!({"type": "object", "properties": {"total": {"type": "number"}}}),
+            "the standard JSON Schema must ride responseJsonSchema: {body}"
+        );
+        assert!(
+            body.get("response_format").is_none(),
+            "the client field must not ride the wire verbatim: {body}"
+        );
     }
 
     #[test]

@@ -429,6 +429,22 @@ pub struct GeminiGenerationConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub thinking_config: Option<GeminiThinkingConfig>,
+    /// Output MIME type (`responseMimeType` on the wire); `application/json`
+    /// selects JSON-mode structured output.
+    #[serde(
+        rename = "responseMimeType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_mime_type: Option<String>,
+    /// Standard JSON Schema constraining the output (`responseJsonSchema` on
+    /// the wire), carried from a client `response_format.json_schema.schema`.
+    #[serde(
+        rename = "responseJsonSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_json_schema: Option<serde_json::Value>,
 }
 
 /// Thinking configuration for a Gemini request (`generationConfig.thinkingConfig`).
@@ -630,6 +646,8 @@ mod tests {
                 max_output_tokens: Some(1024),
                 stop_sequences: None,
                 thinking_config: None,
+                response_mime_type: None,
+                response_json_schema: None,
             }),
             tools: vec![],
             tool_config: None,
