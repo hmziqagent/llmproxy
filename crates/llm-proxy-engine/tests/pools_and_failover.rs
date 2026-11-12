@@ -487,34 +487,107 @@ async fn pool_survives_a_429_from_its_first_member_and_the_ledger_shows_every_at
 }
 
 #[tokio::test]
-async fn pool_survives_a_5xx_then_a_connect_error_from_its_first_members() {
-    // Three members: a 500, an unreachable port (connect error), a good one.
+async fn pool_survives_a_5xx_from_its_first_member_and_the_ledger_shows_every_attempt() {
     let broken = spawn_upstream(upstream_json(
         StatusCode::INTERNAL_SERVER_ERROR,
         r#"{"error":"boom"}"#,
     ))
     .await;
-    let dead_endpoint = "http://127.0.0.1:9/v1/messages".to_owned(); // port 9: refuse
     let good = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
-    let (engine, _bus) = build_engine(
-        vec![
-            member("broken", broken, None),
-            member("dead", dead_endpoint, None),
-            member("good", good, None),
-        ],
+    let (engine, bus) = build_engine(
+        vec![member("broken", broken, None), member("good", good, None)],
         vec![pool(
-            "all",
-            vec!["broken", "dead", "good"],
+            "pair",
+            vec!["broken", "good"],
             ladder_retry(),
             Default::default(),
         )],
     );
 
     let response = engine
-        .execute(engine_request("all", false))
+        .execute(engine_request("pair", false))
         .await
-        .expect("the pool survives 5xx and connect errors");
+        .expect("the pool fails over past the 500");
     assert_eq!(response.core.usage.input_tokens, 10);
+
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        3,
+        "two attempts against the broken member (max_attempts=2), then the failover"
+    );
+    assert_eq!(rows[0].provider, "broken");
+    assert_eq!(rows[0].attempt, 0);
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[0].http_status, Some(500));
+    assert_eq!(rows[1].provider, "broken");
+    assert_eq!(rows[1].attempt, 1);
+    assert_eq!(rows[1].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[1].http_status, Some(500));
+    assert_eq!(rows[2].provider, "good");
+    assert_eq!(rows[2].attempt, 2);
+    assert_eq!(rows[2].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(rows[2].http_status, None);
+    assert!(
+        rows.iter().all(|row| row.route == "pair"),
+        "every attempt row names the pool route"
+    );
+}
+
+#[tokio::test]
+async fn pool_survives_a_connect_error_from_its_first_member_and_the_ledger_shows_every_attempt() {
+    // Bind a listener, take its port, drop it: a reliably closed port whose
+    // connect is refused immediately (never a hard-coded port).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a throwaway listener");
+    let closed_port = listener.local_addr().expect("listener addr").port();
+    drop(listener);
+    let dead = format!("http://127.0.0.1:{closed_port}/v1/messages");
+    let good = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let (engine, bus) = build_engine(
+        vec![member("dead", dead, None), member("good", good, None)],
+        vec![pool(
+            "pair",
+            vec!["dead", "good"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let response = engine
+        .execute(engine_request("pair", false))
+        .await
+        .expect("the pool fails over past the connect error");
+    assert_eq!(response.core.usage.input_tokens, 10);
+
+    // A refused connect is a transport failure, not an `Api` error and not a
+    // timeout: `map_provider_error` surfaces it as `Upstream` with the
+    // generic 502 on every failed attempt row.
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        3,
+        "two connect errors against the dead member (max_attempts=2), then the failover"
+    );
+    assert_eq!(rows[0].provider, "dead");
+    assert_eq!(rows[0].attempt, 0);
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[0].http_status, Some(502));
+    assert_eq!(rows[0].error_kind.as_deref(), Some("Upstream"));
+    assert_eq!(rows[1].provider, "dead");
+    assert_eq!(rows[1].attempt, 1);
+    assert_eq!(rows[1].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[1].http_status, Some(502));
+    assert_eq!(rows[1].error_kind.as_deref(), Some("Upstream"));
+    assert_eq!(rows[2].provider, "good");
+    assert_eq!(rows[2].attempt, 2);
+    assert_eq!(rows[2].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(rows[2].http_status, None);
+    assert!(
+        rows.iter().all(|row| row.route == "pair"),
+        "every attempt row names the pool route"
+    );
 }
 
 #[tokio::test]
