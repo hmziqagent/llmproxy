@@ -261,13 +261,7 @@ fn encode_content_part(
             is_error,
             ..
         } => {
-            if *is_error {
-                tracing::warn!(
-                    tool_use_id,
-                    "Gemini: is_error flag in ToolResult is not representable in Gemini wire format and will be dropped"
-                );
-            }
-            let response_val = encode_tool_result_payload(tool_use_id, result_content);
+            let response_val = encode_tool_result_payload(tool_use_id, result_content, *is_error);
 
             let Some(fn_name) = tool_name_map.get(tool_use_id) else {
                 return Err(ProviderError::InvalidConfig(format!(
@@ -328,9 +322,13 @@ fn neutral_image_to_gemini_part(source: &serde_json::Value) -> Option<GeminiPart
 fn encode_tool_result_payload(
     tool_use_id: &str,
     result_content: &[CoreContent],
+    is_error: bool,
 ) -> serde_json::Value {
+    // A `functionResponse` reports a failed call under an `error` key, where
+    // the Gemini API reads the error details for the model.
+    let key = if is_error { "error" } else { "result" };
     if result_content.is_empty() {
-        return serde_json::json!({"result": ""});
+        return serde_json::json!({ key: "" });
     }
     let texts: Vec<&str> = result_content
         .iter()
@@ -345,7 +343,7 @@ fn encode_tool_result_payload(
             "Gemini: dropping non-text content in tool result"
         );
     }
-    serde_json::json!({"result": texts.join("\n")})
+    serde_json::json!({ key: texts.join("\n") })
 }
 
 impl GeminiAdapter {
@@ -1309,6 +1307,81 @@ mod tests {
             .find_map(|c| c.parts.iter().find_map(|p| p.function_response.clone()))
             .expect("ToolResult must be encoded as a functionResponse");
         assert_eq!(fr.name, "get_weather");
+    }
+
+    /// Encodes a tool call followed by its result and returns the raw wire
+    /// `functionResponse` payload object.
+    fn encode_tool_result_response(
+        result_content: Vec<CoreContent>,
+        is_error: bool,
+    ) -> serde_json::Value {
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![CoreContent::ToolUse {
+                    id: "gemini_call_0".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "/tmp/out"}),
+                    signature: None,
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::Tool,
+                content: vec![CoreContent::ToolResult {
+                    tool_use_id: "gemini_call_0".into(),
+                    content: result_content,
+                    is_error,
+                    cache: None,
+                }],
+            },
+        ]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let response_part = &body["contents"][1]["parts"][0];
+        assert_eq!(response_part["functionResponse"]["name"], "write_file");
+        response_part["functionResponse"]["response"].clone()
+    }
+
+    #[test]
+    fn encode_failed_tool_result_uses_the_error_key() {
+        let response = encode_tool_result_response(
+            vec![CoreContent::Text {
+                text: "disk full".into(),
+                cache: None,
+            }],
+            true,
+        );
+        assert_eq!(response, serde_json::json!({"error": "disk full"}));
+        assert!(
+            response.get("result").is_none(),
+            "a failed tool result must not be sent as a success payload: {response}"
+        );
+    }
+
+    #[test]
+    fn encode_successful_tool_result_uses_the_result_key() {
+        let response = encode_tool_result_response(
+            vec![CoreContent::Text {
+                text: "disk full".into(),
+                cache: None,
+            }],
+            false,
+        );
+        assert_eq!(response, serde_json::json!({"result": "disk full"}));
+        assert!(
+            response.get("error").is_none(),
+            "a successful tool result must not be marked failed: {response}"
+        );
+    }
+
+    #[test]
+    fn encode_failed_tool_result_without_output_still_uses_the_error_key() {
+        let response = encode_tool_result_response(Vec::new(), true);
+        assert_eq!(response, serde_json::json!({"error": ""}));
     }
 
     #[test]

@@ -482,6 +482,23 @@ pub(crate) fn map_gemini_finish_reason(reason: &str) -> StopReason {
     }
 }
 
+/// Model-visible marker put in front of a failed tool result's text on wire
+/// formats whose tool-result item has no error flag (Chat Completions `tool`
+/// messages, Responses `function_call_output` items).
+pub(crate) const TOOL_ERROR_PREFIX: &str = "[tool error] ";
+
+/// Marks `text` as a failed tool result when `is_error` is set; a failed
+/// result with no text becomes the bare marker.
+pub(crate) fn mark_tool_error(text: String, is_error: bool) -> String {
+    if !is_error {
+        return text;
+    }
+    if text.is_empty() {
+        return TOOL_ERROR_PREFIX.trim_end().to_owned();
+    }
+    format!("{TOOL_ERROR_PREFIX}{text}")
+}
+
 /// Builds core usage from the OpenAI/DeepSeek chat usage shape.
 ///
 /// `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are DeepSeek fields

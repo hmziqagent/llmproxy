@@ -14,7 +14,7 @@ use llm_proxy_protocol::openai::{
 
 use super::{
     ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, build_usage_from_openai,
-    expand_url_template, map_openai_finish_reason, response_model_ref,
+    expand_url_template, map_openai_finish_reason, mark_tool_error, response_model_ref,
 };
 use crate::ProtocolName;
 use crate::error::ProviderError;
@@ -404,6 +404,7 @@ fn push_tool_result_messages(content: &[CoreContent], messages: &mut Vec<ChatMes
         let CoreContent::ToolResult {
             tool_use_id,
             content: result_content,
+            is_error,
             ..
         } = c
         else {
@@ -411,13 +412,18 @@ fn push_tool_result_messages(content: &[CoreContent], messages: &mut Vec<ChatMes
         };
         messages.push(ChatMessage {
             role: "tool".to_owned(),
-            content: serde_json::Value::String(collect_text(result_content)),
+            content: serde_json::Value::String(mark_tool_error(
+                collect_text(result_content),
+                *is_error,
+            )),
             reasoning_content: None,
             tool_calls: Vec::new(),
             name: None,
             tool_call_id: Some(tool_use_id.clone()),
             cache_control: None,
             refusal: None,
+            // Not a Chat Completions field: a failure rides the content as
+            // the tool-error marker instead.
             is_error: None,
         });
     }
@@ -1123,6 +1129,79 @@ mod tests {
             body.messages[2].content,
             serde_json::Value::String("72F sunny".into())
         );
+    }
+
+    /// Encodes the tool replay turn an Anthropic-dialect client sends after a
+    /// tool ran: the assistant's `tool_use`, then a user turn carrying its
+    /// `tool_result`. Returns the encoded wire body.
+    fn encode_tool_result_turn(result_text: &str, is_error: bool) -> serde_json::Value {
+        let result_content = if result_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![CoreContent::Text {
+                text: result_text.into(),
+                cache: None,
+            }]
+        };
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![CoreContent::ToolUse {
+                    id: "call_1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({"path": "/tmp/out"}),
+                    signature: None,
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: result_content,
+                    is_error,
+                    cache: None,
+                }],
+            },
+        ]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        serde_json::from_slice(&proxy_req.body).unwrap()
+    }
+
+    #[test]
+    fn encode_failed_tool_result_marks_the_tool_message() {
+        let body = encode_tool_result_turn("disk full", true);
+        let tool_message = &body["messages"][1];
+        assert_eq!(tool_message["role"], "tool");
+        assert_eq!(tool_message["tool_call_id"], "call_1");
+        let content = tool_message["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("[tool error] "),
+            "a failed tool result must reach the model marked as failed: {content:?}"
+        );
+        assert!(
+            content.contains("disk full"),
+            "the tool's own output must survive: {content:?}"
+        );
+        assert!(
+            tool_message.get("is_error").is_none(),
+            "`is_error` is not a Chat Completions field and must not be invented on the wire: {tool_message}"
+        );
+    }
+
+    #[test]
+    fn encode_successful_tool_result_has_no_error_marker() {
+        let body = encode_tool_result_turn("disk full", false);
+        assert_eq!(body["messages"][1]["content"], "disk full");
+    }
+
+    #[test]
+    fn encode_failed_tool_result_without_output_still_says_it_failed() {
+        let body = encode_tool_result_turn("", true);
+        assert_eq!(body["messages"][1]["content"], "[tool error]");
     }
 
     #[test]

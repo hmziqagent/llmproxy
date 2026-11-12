@@ -14,7 +14,7 @@ use llm_proxy_protocol::zen::{
 
 use super::{
     ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, expand_url_template,
-    response_model_ref,
+    mark_tool_error, response_model_ref,
 };
 use crate::ProtocolName;
 use crate::error::ProviderError;
@@ -402,6 +402,7 @@ fn encode_content_item<'a>(
         CoreContent::ToolResult {
             tool_use_id,
             content: result_content,
+            is_error,
             ..
         } => {
             let result_text: String = result_content
@@ -418,10 +419,12 @@ fn encode_content_item<'a>(
                     }
                 })
                 .collect();
+            // `function_call_output` has no error flag: a failure rides the
+            // output as the tool-error marker.
             input.push(ResponsesInput::FunctionCallOutput {
                 r#type: "function_call_output".to_owned(),
                 call_id: tool_use_id.clone(),
-                output: result_text,
+                output: mark_tool_error(result_text, *is_error),
             });
         }
         _ => {
@@ -1471,6 +1474,68 @@ mod tests {
             }
             other => panic!("expected FunctionCallOutput input item, got {other:?}"),
         }
+    }
+
+    /// Encodes a tool result and returns the `function_call_output` item's
+    /// `output` string.
+    fn encode_tool_result_output(result_text: &str, is_error: bool) -> String {
+        let result_content = if result_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![CoreContent::Text {
+                text: result_text.into(),
+                cache: None,
+            }]
+        };
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Tool,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: result_content,
+                is_error,
+                cache: None,
+            }],
+        }]);
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        match &body.input[..] {
+            [
+                ResponsesInput::FunctionCallOutput {
+                    call_id, output, ..
+                },
+            ] => {
+                assert_eq!(call_id, "call_1");
+                output.clone()
+            }
+            other => panic!("expected one FunctionCallOutput input item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_failed_tool_result_marks_the_function_call_output() {
+        let output = encode_tool_result_output("disk full", true);
+        assert!(
+            output.starts_with("[tool error] "),
+            "a failed tool result must reach the model marked as failed: {output:?}"
+        );
+        assert!(
+            output.contains("disk full"),
+            "the tool's own output must survive: {output:?}"
+        );
+    }
+
+    #[test]
+    fn encode_successful_tool_result_output_has_no_error_marker() {
+        assert_eq!(encode_tool_result_output("disk full", false), "disk full");
+    }
+
+    #[test]
+    fn encode_failed_tool_result_without_output_still_says_it_failed() {
+        assert_eq!(encode_tool_result_output("", true), "[tool error]");
     }
 
     #[test]

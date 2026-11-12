@@ -89,7 +89,10 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   per-adapter `lossy` TOML flag turns rejections into drops with logged
   warnings. Server tools are rejected by name cross-format (dropped under
   lossy), never mis-encoded as functions. `Opaque` blocks, document blocks and
-  images without a `base64`/`url` source are handled the same way.
+  images without a `base64`/`url` source are handled the same way. A failed
+  tool result (`tool_result.is_error`) crosses formats marked as failed: its
+  text is prefixed `[tool error] ` for Chat and Responses upstreams and sent
+  under `functionResponse.response.error` for Gemini.
 - **Missing fields (step 4).** `stop_sequences`/`top_k` decode into core
   sampling and re-encode on Anthropic and Gemini (`topK`); `image_url` parts
   decode into a neutral image source that maps onto Anthropic `base64`/`url`
