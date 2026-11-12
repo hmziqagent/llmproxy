@@ -3,6 +3,9 @@
 //! JSON. The counters themselves are unchanged — every instrument below is
 //! an observable that reads a fresh [`Metrics::get_snapshot`] at collection
 //! time, so nothing on the request path gains a lock.
+//!
+//! The OTLP endpoint must be `http://`: this exporter's reqwest 0.13 client
+//! carries no TLS stack (see [`start_otlp_metrics`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,15 +19,33 @@ use opentelemetry_otlp::WithExportConfig;
 /// one last export) when dropped — the serve path holds it until the server
 /// stops.
 ///
+/// The OTLP endpoint must be an `http://` URL: the exporter's blocking
+/// reqwest 0.13 client is built without a TLS stack (enabling rustls would
+/// pull `aws-lc-sys`, whose C build the musl release targets cannot do), so
+/// an `https://` endpoint would silently fail at connect time. TLS lives in
+/// the single transport-crate reqwest 0.12 rustls stack only (BUG-23).
+///
 /// # Errors
 ///
-/// `anyhow` when the OTLP exporter cannot be built (the endpoint rejected by
-/// the HTTP client builder).
+/// `anyhow` when the endpoint is `https://` (rejected up front, above) or
+/// when the OTLP exporter cannot be built (the endpoint rejected by the HTTP
+/// client builder).
 pub fn start_otlp_metrics(
     metrics: &Arc<Metrics>,
     endpoint: &str,
     interval: Duration,
 ) -> Result<OtlpMetricsGuard> {
+    if endpoint
+        .trim()
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    {
+        return Err(anyhow::anyhow!(
+            "the OTLP metric exporter runs without a TLS stack and cannot connect \
+             to an https:// endpoint: server.metrics.otlp.endpoint must be an \
+             http:// URL, got {endpoint:?}"
+        ));
+    }
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
@@ -159,6 +180,31 @@ mod tests {
     use super::*;
     use axum::{Router, routing::post};
     use std::time::Instant;
+
+    /// The exporter's blocking reqwest 0.13 client is built without a TLS
+    /// stack (enabling rustls would pull aws-lc-sys, which the musl release
+    /// targets cannot build), so an `https://` endpoint must be rejected at
+    /// startup with a message naming the http:// requirement instead of
+    /// failing later at first handshake.
+    #[test]
+    fn an_https_endpoint_is_rejected_with_a_clear_http_only_message() {
+        let metrics = Arc::new(Metrics::new());
+        let error = start_otlp_metrics(
+            &metrics,
+            "https://127.0.0.1:1/v1/metrics",
+            Duration::from_millis(100),
+        )
+        .expect_err("an https:// endpoint cannot work without a TLS stack");
+        let message = error.to_string();
+        assert!(
+            message.contains("http://"),
+            "the rejection must name the required http:// scheme: {message}"
+        );
+        assert!(
+            message.to_ascii_lowercase().contains("https"),
+            "the rejection must name the offending https scheme: {message}"
+        );
+    }
 
     /// The observable end-to-end property: a configured exporter pushes the
     /// existing counters, as OTLP JSON, to the configured endpoint.
