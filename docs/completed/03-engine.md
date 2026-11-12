@@ -80,7 +80,8 @@ Every feature takes one of these places, in this order:
   port.
 - An axum app mounts the proxy router in a test.
 - `llm-proxy-protocol` and `llm-proxy-adapters` build with no network dependencies.
-- The contract tests from plan 02 pass unchanged through the binary.
+- The contract tests from plan 02 pass unchanged through the real router
+  in-process; two fixtures additionally through the spawned binary.
 - `cargo publish --dry-run` passes for every published crate.
 
 ## Done
@@ -152,7 +153,12 @@ loopback fake upstream with the proxy binding no port
 network dependency for `llm-proxy-protocol` or `llm-proxy-adapters`; the
 plan-02 contract fixtures replay unchanged (their assertions and fixtures
 untouched; import paths updated from `llm_proxy_provider` to the split
-crate names, which the split itself forces).
+crate names, which the split itself forces). Additionally, one
+non-streaming and one streaming contract fixture replay through the
+spawned binary against a loopback fake upstream
+(`apps/llm-proxy/tests/cli_contract.rs`:
+`contract_fixture_replays_through_the_spawned_binary` and
+`contract_fixture_replays_streaming_through_the_spawned_binary`).
 
 **Known behavior deltas** (in paths unreachable before the refactor):
 client re-encode failure after a completed non-streaming response
