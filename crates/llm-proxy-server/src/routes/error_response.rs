@@ -1258,6 +1258,39 @@ mod tests {
         assert_ne!(ClientProtocol::Anthropic, ClientProtocol::OpenAiChat);
     }
 
+    /// One unique slot per `RouteError` variant, declared in enum order. The
+    /// exhaustive match (no wildcard arm) breaks the build when a variant is
+    /// added without updating it, and [`VARIANT_COUNT`] plus
+    /// `every_route_error_covers_every_variant` then refuse to pass until the
+    /// new variant also has a representative (fix brief 05-2).
+    fn variant_slot(error: &RouteError) -> usize {
+        match error {
+            RouteError::InvalidRequest(_) => 0,
+            RouteError::ModelNotAllowed(_) => 1,
+            RouteError::UnknownProvider(_) => 2,
+            RouteError::UnsupportedRoute(_) => 3,
+            RouteError::InvalidProviderName(_) => 4,
+            RouteError::Upstream { .. } => 5,
+            RouteError::UpstreamTimeout(_) => 6,
+            RouteError::RetryExhausted { .. } => 7,
+            RouteError::AffinityRefused => 8,
+            RouteError::ProviderDecode(_) => 9,
+            RouteError::Internal(_) => 10,
+            RouteError::RateLimited { .. } => 11,
+            RouteError::BudgetExhausted { .. } => 12,
+            RouteError::Overloaded { .. } => 13,
+            RouteError::Forbidden(_) => 14,
+            RouteError::IdempotencyInFlight => 15,
+            RouteError::NotFound => 16,
+            RouteError::RequestTimeout => 17,
+            RouteError::PayloadTooLarge => 18,
+            RouteError::MethodNotAllowed => 19,
+            RouteError::Unauthorized => 20,
+        }
+    }
+
+    const VARIANT_COUNT: usize = 21;
+
     /// One representative per `RouteError` variant: the status table the
     /// server renders is exactly the engine's policy table (plan 05 step 1).
     fn every_route_error() -> Vec<RouteError> {
@@ -1307,6 +1340,20 @@ mod tests {
             RouteError::MethodNotAllowed,
             RouteError::Unauthorized,
         ]
+    }
+
+    #[test]
+    fn every_route_error_covers_every_variant() {
+        let mut slots: Vec<usize> = every_route_error().iter().map(variant_slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let expected: Vec<usize> = (0..VARIANT_COUNT).collect();
+        assert_eq!(
+            slots, expected,
+            "every_route_error() must carry at least one representative for \
+             every RouteError variant; missing slots name the variants no \
+             representative covers"
+        );
     }
 
     #[test]

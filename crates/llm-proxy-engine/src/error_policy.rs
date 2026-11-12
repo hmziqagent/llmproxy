@@ -152,6 +152,36 @@ mod tests {
     use crate::error::AuthOwner;
     use std::time::Duration;
 
+    /// One unique slot per `EngineError` variant, declared in enum order. The
+    /// exhaustive match (no wildcard arm) breaks the build when a variant is
+    /// added without updating it, and [`VARIANT_COUNT`] plus
+    /// `representative_errors_cover_every_variant` then refuse to pass until
+    /// the new variant also has a representative (fix brief 05-2).
+    fn variant_slot(error: &EngineError) -> usize {
+        match error {
+            EngineError::InvalidProviderName(_) => 0,
+            EngineError::UnknownProvider(_) => 1,
+            EngineError::UnsupportedRoute(_) => 2,
+            EngineError::ModelNotAllowed(_) => 3,
+            EngineError::Unauthorized => 4,
+            EngineError::RateLimited { .. } => 5,
+            EngineError::BudgetExhausted { .. } => 6,
+            EngineError::Overloaded { .. } => 7,
+            EngineError::Forbidden(_) => 8,
+            EngineError::IdempotencyInFlight => 9,
+            EngineError::InvalidRequest(_) => 10,
+            EngineError::ProviderDecode(_) => 11,
+            EngineError::Upstream { .. } => 12,
+            EngineError::UpstreamTimeout(_) => 13,
+            EngineError::RetryExhausted { .. } => 14,
+            EngineError::AffinityRefused { .. } => 15,
+            EngineError::FailoverRefused { .. } => 16,
+            EngineError::Internal(_) => 17,
+        }
+    }
+
+    const VARIANT_COUNT: usize = 18;
+
     fn representative_errors() -> Vec<EngineError> {
         let upstream_passthrough = |status: u16, owner: AuthOwner| EngineError::Upstream {
             status,
@@ -165,6 +195,26 @@ mod tests {
             EngineError::UnsupportedRoute("x".to_owned()),
             EngineError::ModelNotAllowed("x".to_owned()),
             EngineError::Unauthorized,
+            EngineError::RateLimited {
+                message: "rpm".to_owned(),
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            EngineError::BudgetExhausted {
+                message: "usd".to_owned(),
+                retry_after: None,
+            },
+            EngineError::Overloaded {
+                message: "cap".to_owned(),
+                retry_after: Some(Duration::from_secs(1)),
+            },
+            EngineError::Forbidden("no".to_owned()),
+            // A ladder exhausted on a status whose own row says false agrees
+            // with both the row and the ladder override.
+            EngineError::RetryExhausted {
+                attempts: 2,
+                last: Box::new(EngineError::Unauthorized),
+                retry_after: Some(Duration::from_secs(1)),
+            },
             EngineError::InvalidRequest("x".to_owned()),
             EngineError::IdempotencyInFlight,
             EngineError::ProviderDecode("x".to_owned()),
@@ -195,6 +245,20 @@ mod tests {
                 "status {code} from {error:?} has no policy row"
             );
         }
+    }
+
+    #[test]
+    fn representative_errors_cover_every_variant() {
+        let mut slots: Vec<usize> = representative_errors().iter().map(variant_slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let expected: Vec<usize> = (0..VARIANT_COUNT).collect();
+        assert_eq!(
+            slots, expected,
+            "representative_errors() must carry at least one representative \
+             for every EngineError variant; missing slots name the variants \
+             no representative covers"
+        );
     }
 
     #[test]
