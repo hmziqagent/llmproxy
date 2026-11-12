@@ -1578,15 +1578,31 @@ async fn run_ladder_once(
             let cost = billed_cost(&core_resp.usage, pricing.as_ref());
 
             // Slot 11: post-call guards. A guard rejection is proxy policy,
-            // not an upstream fault: no retry, no failover — but the
-            // provider billed this attempt, so its usage still reaches
-            // settlement (plan 05 step 6).
+            // not an upstream fault: no retry, no failover, no cooldown and
+            // no credential penalty — but the provider called and billed
+            // this attempt, so its row is a Failed one (plan 04 step 1, fix
+            // brief 04-6) and its usage still reaches settlement (plan 05
+            // step 6).
             for guard in &inner.guards {
                 let error = match guard.inspect_response(&core_resp).await {
                     Ok(GuardDecision::Allow) => continue,
                     Ok(GuardDecision::Reject(message)) => EngineError::InvalidRequest(message),
                     Err(error) => error,
                 };
+                emit_attempt(
+                    inner,
+                    &AttemptRecord {
+                        request_id: &req.request_id,
+                        seq: ladder.seq - 1,
+                        route: &ladder.plan.route,
+                        provider: &member,
+                        model: &attempt.target.upstream_model,
+                        credential_id: attempt.credential_id.as_deref(),
+                        outcome: AttemptOutcome::Failed,
+                        error: Some(&error),
+                        latency: attempt_start.elapsed(),
+                    },
+                );
                 return Err(LadderFailure {
                     error,
                     usage: Some(core_resp.usage.clone()),
@@ -1599,7 +1615,25 @@ async fn run_ladder_once(
             let content_before_guards =
                 (!inner.guards.is_empty()).then(|| core_resp.content.clone());
             for guard in &inner.guards {
-                guard.transform_response(&mut core_resp).await?;
+                if let Err(error) = guard.transform_response(&mut core_resp).await {
+                    // Same billed-attempt rule as the `inspect_response`
+                    // rejection above (fix brief 04-6).
+                    emit_attempt(
+                        inner,
+                        &AttemptRecord {
+                            request_id: &req.request_id,
+                            seq: ladder.seq - 1,
+                            route: &ladder.plan.route,
+                            provider: &member,
+                            model: &attempt.target.upstream_model,
+                            credential_id: attempt.credential_id.as_deref(),
+                            outcome: AttemptOutcome::Failed,
+                            error: Some(&error),
+                            latency: attempt_start.elapsed(),
+                        },
+                    );
+                    return Err(error.into());
+                }
             }
             let guards_rewrote_response =
                 content_before_guards.is_some_and(|before| before != core_resp.content);
@@ -2397,6 +2431,21 @@ async fn commit_and_stream(
         capture_lifecycle(&mut committed.ctx, core_event);
     }
     if let Some(error) = vet_prefix(inner, &head).await {
+        // A guard rejection is proxy policy, not an upstream fault: no
+        // failover, no cooldown, no credential penalty — but the upstream
+        // streamed a billed prefix, so the attempt's failed row exists even
+        // though it never committed as `Streaming` (fix brief 04-6).
+        record_failed_attempt(
+            inner,
+            &req.request_id,
+            ladder.seq - 1,
+            &ladder.plan.route,
+            &member,
+            &committed.ctx.upstream_model,
+            ladder.current_credential.as_deref(),
+            &error,
+            attempt_start.elapsed(),
+        );
         inner.metrics.record_failure();
         signal_pre_stream_error(inner, stream, error.clone());
         committed.ctx.settle(inner, false);

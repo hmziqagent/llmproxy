@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -22,9 +23,11 @@ use llm_proxy_core::{
 };
 use llm_proxy_engine::{
     ClientDialect, CooldownStore, Cooldowns, Engine, EngineBuilder, EngineError, EngineRequest,
+    Guard, GuardDecision,
 };
 use llm_proxy_protocol::core::{
-    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
+    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreResponse, CoreRole, ModelRef,
+    SamplingOptions,
 };
 use llm_proxy_storage::{
     AttemptCompleted, AttemptOutcome, EventBus, ProxyEvent, RecordingBus, RequestReceived,
@@ -2373,5 +2376,152 @@ async fn a_request_with_nothing_to_strip_keeps_same_format_passthrough() {
     assert_eq!(
         to_b[0], expected_on_the_wire,
         "with nothing to strip the client's raw body must reach member b byte-for-byte"
+    );
+}
+
+/// A guard whose `inspect_response` refuses every completed response.
+#[derive(Debug)]
+struct RejectingResponseGuard;
+
+#[async_trait]
+impl Guard for RejectingResponseGuard {
+    async fn inspect_response(
+        &self,
+        _response: &CoreResponse,
+    ) -> Result<GuardDecision, EngineError> {
+        Ok(GuardDecision::Reject(
+            "refused by the response guard".to_owned(),
+        ))
+    }
+}
+
+/// A guard whose `inspect_event` refuses every streamed event.
+#[derive(Debug)]
+struct RejectingStreamGuard;
+
+#[async_trait]
+impl Guard for RejectingStreamGuard {
+    async fn inspect_event(&self, _event: &CoreEvent) -> Result<GuardDecision, EngineError> {
+        Ok(GuardDecision::Reject(
+            "refused by the stream guard".to_owned(),
+        ))
+    }
+}
+
+/// An ok-everywhere `[primary, secondary]` pool wired to the test's own
+/// cooldown store and ledger bus, with `guard` installed: the shape the
+/// guard-rejection tests need to observe both the ledger and the cooldowns.
+fn build_guarded_engine(
+    guard: Arc<dyn Guard>,
+    cooldowns: &Arc<CooldownStore>,
+    bus: &Arc<RecordingBus>,
+    endpoints: &[String; 2],
+) -> Engine {
+    let registry = ProviderRegistry::from_parts(
+        vec![
+            member("primary", endpoints[0].clone(), None),
+            member("secondary", endpoints[1].clone(), None),
+        ],
+        vec![pool(
+            "both",
+            vec!["primary", "secondary"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    )
+    .expect("registry with pools");
+    EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .cooldowns(Arc::clone(cooldowns) as Arc<dyn Cooldowns>)
+        .guard(guard)
+        .event_bus(Arc::clone(bus) as Arc<dyn EventBus>)
+        .build()
+        .expect("engine builds")
+}
+
+/// Fix brief 04-6: the provider answered and billed the attempt the proxy's
+/// guard then refused, so the ledger carries its failed row — and because a
+/// guard refusal is proxy policy, not an upstream fault, the member does not
+/// cool and the ladder does not fail over (exactly one attempt happened).
+#[tokio::test]
+async fn a_guard_rejected_response_still_writes_a_failed_attempt_row() {
+    let primary = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let secondary = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let cooldowns = Arc::new(CooldownStore::new());
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_guarded_engine(
+        Arc::new(RejectingResponseGuard),
+        &cooldowns,
+        &bus,
+        &[primary, secondary],
+    );
+
+    let error = engine
+        .execute(engine_request("both", false))
+        .await
+        .expect_err("the guard refuses the completed response");
+    assert!(
+        matches!(error, EngineError::InvalidRequest(_)),
+        "the guard rejection surfaces as InvalidRequest, got {error:?}"
+    );
+
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 1, "the billed attempt writes exactly one row");
+    assert_eq!(rows[0].provider, "primary");
+    assert_eq!(rows[0].attempt, 0);
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(
+        rows[0].http_status,
+        Some(400),
+        "the row records the guard error's status"
+    );
+    assert_eq!(rows[0].error_kind.as_deref(), Some("InvalidRequest"));
+
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        cooldowns.provider_available("primary", now).await,
+        "a guard refusal is proxy policy: the member that answered is not cooled"
+    );
+    assert!(
+        cooldowns.provider_available("secondary", now).await,
+        "the member the ladder never reached is not cooled"
+    );
+}
+
+/// The streaming twin: a guard rejection of the buffered prefix also ends
+/// the attempt after the provider billed it, so its failed row exists even
+/// though the attempt never committed as `Streaming`.
+#[tokio::test]
+async fn a_guard_rejected_stream_still_writes_a_failed_attempt_row() {
+    let primary = spawn_upstream(upstream_ok_stream()).await;
+    let secondary = spawn_upstream(upstream_ok_stream()).await;
+    let cooldowns = Arc::new(CooldownStore::new());
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_guarded_engine(
+        Arc::new(RejectingStreamGuard),
+        &cooldowns,
+        &bus,
+        &[primary, secondary],
+    );
+
+    let error = engine
+        .execute_stream(engine_request("both", true))
+        .await
+        .expect_err("the guard refuses the streamed prefix");
+    assert!(
+        matches!(error, EngineError::InvalidRequest(_)),
+        "the guard rejection surfaces as InvalidRequest, got {error:?}"
+    );
+
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 1, "the billed attempt writes exactly one row");
+    assert_eq!(rows[0].provider, "primary");
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[0].http_status, Some(400));
+
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        cooldowns.provider_available("primary", now).await,
+        "a guard refusal is proxy policy: the member that answered is not cooled"
     );
 }
