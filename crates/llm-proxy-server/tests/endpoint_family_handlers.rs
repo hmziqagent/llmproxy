@@ -40,7 +40,19 @@ struct Seen {
     query: Option<String>,
     auth: String,
     content_types: Vec<String>,
+    /// Every header as `(lowercased name, value)`, first value per name.
+    headers: Vec<(String, String)>,
     body: Bytes,
+}
+
+impl Seen {
+    /// First value the upstream saw for `name` (names arrive lowercased).
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(seen_name, _)| seen_name == name)
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 type Capture = Arc<Mutex<Vec<Seen>>>;
@@ -139,6 +151,16 @@ async fn spawn_upstream() -> (String, Capture) {
                             .unwrap_or_default()
                             .to_owned()
                     };
+                    let mut seen_headers: Vec<(String, String)> = Vec::new();
+                    for (name, value) in headers.iter() {
+                        let Ok(text) = value.to_str() else {
+                            continue;
+                        };
+                        let lower = name.as_str().to_ascii_lowercase();
+                        if !seen_headers.iter().any(|(seen, _)| seen == &lower) {
+                            seen_headers.push((lower, text.to_owned()));
+                        }
+                    }
                     sink.lock().await.push(Seen {
                         method,
                         path: path.to_string(),
@@ -149,6 +171,7 @@ async fn spawn_upstream() -> (String, Capture) {
                             .iter()
                             .filter_map(|value| value.to_str().ok().map(str::to_owned))
                             .collect(),
+                        headers: seen_headers,
                         body: body.clone(),
                     });
                     answer(&path)
@@ -403,6 +426,61 @@ async fn embeddings_routes_through_with_the_model_alias_and_credential() {
         completed.usage.provenance,
         llm_proxy_protocol::core::UsageProvenance::ProviderReported,
         "the family's reported tokens reach the ledger row"
+    );
+}
+
+/// Family forwarding goes through the one runtime filter the chat
+/// pipeline uses: the allowlist selects, the shared never-forwarded set
+/// still wins, and a name that survives validation has no private side
+/// channel into the upstream request.
+#[tokio::test]
+async fn family_forwarding_honours_allowlist_and_never_forwarded_set() {
+    let (endpoint, captured) = spawn_upstream().await;
+    let mut config = provider_config(&endpoint);
+    let adapter = config
+        .adapters
+        .get_mut("Embeddings")
+        .expect("embeddings adapter");
+    // Set directly, bypassing config validation: the runtime filter is
+    // what must hold even when an allowlist names a protected header.
+    adapter.forward_inbound_headers = Some(vec![
+        "x-custom-trace".to_owned(),
+        "browser-use".to_owned(),
+        "origin".to_owned(),
+    ]);
+    let (app, _bus) = app_over(config);
+    let body = r#"{"model":"embed-small","input":["hello"]}"#;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/providers/fake/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-custom-trace", "trace-123")
+                .header("browser-use", "desktop")
+                .header(header::ORIGIN, "https://app.example")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = captured.lock().await;
+    let seen = &requests[0];
+    assert_eq!(seen.path, "v1/embeddings");
+    assert_eq!(
+        seen.header("x-custom-trace"),
+        Some("trace-123"),
+        "the allowlisted safe header is forwarded verbatim"
+    );
+    assert!(
+        seen.header("browser-use").is_none(),
+        "browser-* headers are never forwarded, even when allowlisted"
+    );
+    assert!(
+        seen.header("origin").is_none(),
+        "origin is never forwarded, even when allowlisted"
     );
 }
 

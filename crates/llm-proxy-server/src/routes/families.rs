@@ -56,7 +56,9 @@ use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 
-use super::core_pipeline::{emit_response_failed, extract_inbound_auth};
+use super::core_pipeline::{
+    emit_response_failed, extract_inbound_auth, inbound_headers_for_engine,
+};
 use super::error_response::{ClientProtocol, RouteError, route_error_response};
 use crate::middleware::RequestMeta;
 use crate::state::AppState;
@@ -362,12 +364,12 @@ async fn forward(
     if let Some(content_type) = outbound.content_type {
         extra_headers.insert(header::CONTENT_TYPE.to_string(), content_type);
     }
-    for name in target.forward_inbound_headers.iter() {
-        if let Some(value) = outbound.headers.get(name)
-            && let Ok(value) = value.to_str()
-        {
-            extra_headers.insert(name.clone(), value.to_owned());
-        }
+    let inbound = inbound_headers_for_engine(outbound.headers);
+    for (name, value) in llm_proxy_engine::headers::select_forwarded_headers(
+        &inbound,
+        &target.forward_inbound_headers,
+    ) {
+        extra_headers.insert(name, value);
     }
     let request = ProxyRequest {
         url: outbound.url,
