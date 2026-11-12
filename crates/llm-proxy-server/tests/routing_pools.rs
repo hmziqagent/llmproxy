@@ -11,7 +11,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, Sse};
 use axum::routing::post;
+use futures::StreamExt;
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{
     AppConfig, AuthStyle, BareV1Config, PoolConfig, ProviderAdapterConfig, ProviderConfig,
@@ -408,4 +410,152 @@ async fn bare_v1_resolves_a_model_to_a_pool_when_enabled() {
         .filter(|event| matches!(event, ProxyEvent::AttemptCompleted(_)))
         .count();
     assert_eq!(attempt_rows, 2);
+}
+
+/// An upstream that opens the stream (headers) and then stays silent
+/// forever: no event ever arrives (modelled on the engine suite's
+/// `upstream_silent_stream`).
+fn silent_stream_router() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let never = futures::stream::pending::<Result<Event, std::convert::Infallible>>();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(never).into_response(),
+            )
+        }),
+    )
+}
+
+async fn spawn_silent_stream_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, silent_stream_router()).await {
+            tracing::trace!(%error, "fake upstream stopped");
+        }
+    });
+    format!("http://{addr}/v1/messages")
+}
+
+fn streaming_messages_request(uri: &str, model: &str) -> Request<Body> {
+    let body = format!(
+        r#"{{"model":"{model}","max_tokens":16,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
+    );
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The axum SSE default keep-alive frame (`KeepAlive::new()` without an
+/// event): a bare comment.
+const KEEPALIVE_COMMENT: &[u8; 3] = b":\n\n";
+
+#[tokio::test]
+async fn a_committed_silent_stream_emits_keepalive_comments() {
+    let silent = spawn_silent_stream_upstream().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with(
+        vec![member("silent", silent)],
+        vec![PoolConfig {
+            name: "held".to_owned(),
+            members: vec!["silent".to_owned()],
+            retry: RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::from_millis(200),
+            },
+            affinity: Default::default(),
+            health: Default::default(),
+        }],
+        BareV1Config::default(),
+        bus,
+    );
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(streaming_messages_request(
+            "/providers/held/v1/messages",
+            "claude-sonnet-4-6",
+        ))
+        .await
+        .expect("the hold budget commits the silent stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+    );
+
+    // The upstream never speaks, so the only bytes the client can receive
+    // are the server's keep-alive comments: read for one HEARTBEAT_INTERVAL
+    // (3s, `core_pipeline.rs`) plus margin.
+    let mut body = response.into_body().into_data_stream();
+    let mut received = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_millis(4000), body.next()).await;
+        let Ok(Some(Ok(chunk))) = frame else {
+            break;
+        };
+        received.extend_from_slice(&chunk);
+        if received
+            .windows(KEEPALIVE_COMMENT.len())
+            .any(|window| window == KEEPALIVE_COMMENT)
+        {
+            break;
+        }
+    }
+    assert!(
+        received
+            .windows(KEEPALIVE_COMMENT.len())
+            .any(|window| window == KEEPALIVE_COMMENT),
+        "a committed silent stream must be covered by keep-alive comments, got {:?}",
+        String::from_utf8_lossy(&received),
+    );
+}
+
+#[tokio::test]
+async fn a_stream_with_no_hold_budget_sends_nothing_before_the_first_event() {
+    let silent = spawn_silent_stream_upstream().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with(
+        vec![member("silent", silent)],
+        vec![PoolConfig {
+            name: "unheld".to_owned(),
+            members: vec!["silent".to_owned()],
+            retry: ladder(),
+            affinity: Default::default(),
+            health: Default::default(),
+        }],
+        BareV1Config::default(),
+        bus,
+    );
+    let app = build_router(state);
+
+    // `hold = 0`: the engine commits nothing while the upstream is silent,
+    // so the server builds no HTTP response — a real status code for the
+    // failure stays possible.
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(300),
+        app.oneshot(streaming_messages_request(
+            "/providers/unheld/v1/messages",
+            "claude-sonnet-4-6",
+        )),
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "with hold = 0 a silent upstream must not start the HTTP response before the first event"
+    );
 }
