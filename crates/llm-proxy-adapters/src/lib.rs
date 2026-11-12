@@ -597,3 +597,108 @@ pub(crate) fn truncate_str_safe(s: &str, max_len: usize) -> &str {
         s.get(..end).unwrap_or(s)
     }
 }
+
+#[cfg(test)]
+mod usage_tests {
+    use llm_proxy_protocol::openai::{CompletionTokensDetails, PromptTokensDetails, UsageInfo};
+
+    use super::build_usage_from_openai;
+
+    #[test]
+    fn deepseek_hit_and_miss_map_to_cache_read_and_plain_input() {
+        // DeepSeek guarantees prompt_tokens = hit + miss: hit tokens are
+        // cache reads, miss tokens are plain input, and nothing here is
+        // cache creation.
+        let usage = build_usage_from_openai(&UsageInfo {
+            prompt_tokens: 30,
+            completion_tokens: 7,
+            total_tokens: 37,
+            prompt_cache_hit_tokens: Some(10),
+            prompt_cache_miss_tokens: Some(20),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, Some(10));
+        assert_eq!(
+            usage.cache_creation_input_tokens, None,
+            "miss tokens must never surface as cache creation"
+        );
+        assert_eq!(
+            usage.provenance,
+            llm_proxy_protocol::core::UsageProvenance::ProviderReported
+        );
+    }
+
+    #[test]
+    fn openai_cached_tokens_detail_maps_to_cache_read() {
+        let usage = build_usage_from_openai(&UsageInfo {
+            prompt_tokens: 50,
+            completion_tokens: 5,
+            total_tokens: 55,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(12),
+            }),
+            completion_tokens_details: None,
+        });
+
+        assert_eq!(usage.input_tokens, 38);
+        assert_eq!(usage.cache_read_input_tokens, Some(12));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn completion_reasoning_tokens_map_to_core() {
+        let with_detail = build_usage_from_openai(&UsageInfo {
+            prompt_tokens: 10,
+            completion_tokens: 30,
+            total_tokens: 40,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(9),
+            }),
+        });
+        assert_eq!(with_detail.reasoning_tokens, Some(9));
+
+        let without_detail = build_usage_from_openai(&UsageInfo {
+            completion_tokens_details: None,
+            ..with_detail_producer()
+        });
+        assert_eq!(without_detail.reasoning_tokens, None);
+    }
+
+    fn with_detail_producer() -> UsageInfo {
+        UsageInfo {
+            prompt_tokens: 10,
+            completion_tokens: 30,
+            total_tokens: 40,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }
+    }
+
+    #[test]
+    fn cached_tokens_larger_than_prompt_does_not_underflow() {
+        let usage = build_usage_from_openai(&UsageInfo {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(9),
+            }),
+            completion_tokens_details: None,
+        });
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, Some(9));
+    }
+}

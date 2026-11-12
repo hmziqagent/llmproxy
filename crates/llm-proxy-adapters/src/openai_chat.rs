@@ -1377,9 +1377,9 @@ mod tests {
                 delta: None,
             }],
             usage: Some(UsageInfo {
-                prompt_tokens: 100,
+                prompt_tokens: 30,
                 completion_tokens: 50,
-                total_tokens: 150,
+                total_tokens: 80,
                 prompt_cache_hit_tokens: Some(10),
                 prompt_cache_miss_tokens: Some(20),
                 prompt_tokens_details: None,
@@ -1394,12 +1394,16 @@ mod tests {
         assert_eq!(core_resp.id, Some("chatcmpl-test".to_owned()));
         assert_eq!(core_resp.model.requested, "gpt-4o");
         assert_eq!(core_resp.stop_reason, StopReason::EndTurn);
-        assert_eq!(core_resp.usage.input_tokens, 90);
+        assert_eq!(core_resp.usage.input_tokens, 20);
         assert_eq!(core_resp.usage.output_tokens, 50);
         assert_eq!(
             core_resp.usage.cache_read_input_tokens,
             Some(10),
             "prompt_cache_hit_tokens must map to cache reads"
+        );
+        assert_eq!(
+            core_resp.usage.cache_creation_input_tokens, None,
+            "DeepSeek cache-miss tokens are plain input, never cache creation"
         );
         assert_eq!(core_resp.content.len(), 1);
         assert_eq!(
