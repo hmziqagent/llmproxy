@@ -3223,6 +3223,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_with_undecodable_nested_block_returns_400() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let app = build_router(state);
+
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": [
+                        { "type": "text", "text": "ok" },
+                        { "type": "tool_use", "name": "no_id" }
+                    ]
+                }]
+            }],
+            "max_tokens": 64
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp_body["type"], "error");
+        assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+        assert!(
+            resp_body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("tool_result content")),
+            "error body should name tool_result content, got {resp_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_messages_route_works() {
         let mock_url = spawn_mock_anthropic_non_stream().await;
         let state = state_with_anthropic_provider(&mock_url);

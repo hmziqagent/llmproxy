@@ -203,20 +203,15 @@ fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreConten
         match decode_wire_block(item, "tool_result content") {
             Ok(core) => blocks.push(core),
             Err(ProtocolError::Decode(msg)) => {
-                let truncated = crate::util::truncate_str_safe(&msg, 64);
-                tracing::warn!(
-                    decode_error = truncated,
-                    "skipping undecodable block inside tool_result content array"
-                );
+                let detail = crate::util::truncate_str_safe(&msg, 120);
+                return Err(ProtocolError::InvalidRequest(format!(
+                    "malformed tool_result content: {detail}"
+                )));
             }
             Err(other) => return Err(other),
         }
     }
-    if blocks.is_empty() {
-        tracing::warn!(
-            "tool_result: all inner content blocks failed to parse; \
-             synthesizing empty text block"
-        );
+    if arr.is_empty() {
         blocks.push(CoreContent::Text {
             text: String::new(),
             cache: None,
@@ -1376,6 +1371,45 @@ mod tests {
                 matches!(decode_request(req), Err(ProtocolError::InvalidRequest(_))),
                 "expected a rejection for content = {content}"
             );
+        }
+    }
+
+    #[test]
+    fn tool_result_with_undecodable_nested_block_is_rejected() {
+        let mut req = make_anthropic_request();
+        req.messages = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": "tu_1",
+                "content": [
+                    { "type": "text", "text": "ok" },
+                    { "type": "tool_use", "name": "no_id" }
+                ]
+            }]),
+        }];
+        let err = decode_request(req).unwrap_err();
+        assert!(
+            matches!(&err, ProtocolError::InvalidRequest(m) if m.contains("tool_result content")),
+            "expected InvalidRequest naming tool_result content, got {err:?}"
+        );
+
+        // An explicitly empty content array stays valid: it must decode to a
+        // ToolResult whose content is exactly one empty text block.
+        let mut req = make_anthropic_request();
+        req.messages = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "tool_result", "tool_use_id": "tu_1", "content": [] }
+            ]),
+        }];
+        let core = decode_request(req).expect("empty tool_result content array is valid");
+        match &core.messages[0].content[0] {
+            CoreContent::ToolResult { content, .. } => match content.as_slice() {
+                [CoreContent::Text { text, cache: None }] => assert_eq!(text, ""),
+                other => panic!("expected exactly one empty Text block, got {other:?}"),
+            },
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 
