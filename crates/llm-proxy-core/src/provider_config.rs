@@ -705,6 +705,16 @@ pub struct AuthConfig {
     /// on every mount requires its bearer token.
     #[serde(default)]
     pub admin: Option<AdminAuthConfig>,
+    /// Accept tokens without a `<key-id>.` prefix (pre-prefix behaviour).
+    ///
+    /// Default `false`: a bare token is refused without running any
+    /// verifier, so a bad token's lookup cost stays flat whatever the key
+    /// count. When `true`, a bare token is checked against every
+    /// configured key in turn — its cost grows with the key count, up to
+    /// the cap the server applies (`ClientAuth`). Existing deployments
+    /// that hand out bare secrets set this to keep them working.
+    #[serde(default)]
+    pub legacy_bare_tokens: bool,
 }
 
 /// One client key: its verifier, optionally plus its admission policy
@@ -3380,6 +3390,7 @@ mod tests {
                 ClientKeySpec::Verifier(secrecy::SecretString::from("argon2id$hash")),
             )]),
             admin: None,
+            legacy_bare_tokens: false,
         };
         let mut provider = make_minimal_provider("passthrough-provider");
         provider.passthrough_auth = true;
@@ -3403,6 +3414,7 @@ mod tests {
             mode: AuthMode::None,
             clients: HashMap::new(),
             admin: None,
+            legacy_bare_tokens: false,
         };
         let mut provider = make_minimal_provider("passthrough-provider");
         provider.passthrough_auth = true;
@@ -3420,6 +3432,7 @@ mod tests {
                 ClientKeySpec::Verifier(secrecy::SecretString::from("argon2id$hash")),
             )]),
             admin: None,
+            legacy_bare_tokens: false,
         };
         let provider = make_minimal_provider("keyed-provider");
 

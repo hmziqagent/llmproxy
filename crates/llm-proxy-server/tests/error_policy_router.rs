@@ -115,6 +115,7 @@ fn client_keys_state() -> AppState {
             )),
         )]),
         admin: None,
+        legacy_bare_tokens: false,
     };
     state(auth, HashMap::new())
 }

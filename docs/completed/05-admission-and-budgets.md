@@ -49,8 +49,10 @@ proposes three different admission models, and this plan replaces them with one.
   its `x-should-retry` row on every error plus any `Retry-After` advice, and
   tests on both sides enforce that every engine and server status is a row.
 - Client tokens are `<key-id>.<secret>`: one argon2 verification per bad
-  prefixed token, zero for an unknown id, at any key count (the bare-secret
-  scan remains as the legacy fallback).
+  prefixed token, zero for an unknown id, at any key count. A bare secret
+  without a dot is refused unless `[auth] legacy_bare_tokens = true`; the
+  opt-in scan is capped, and recently failed token digests are briefly
+  negative-cached so a repeated bad token costs one verification.
 - `PolicyAdmission` implements the `Admission` trait with the four rules in
   one atomic reservation: glob allowlists (403, fail closed without a model),
   rpm/tpm/rpd windows (429 with the reset), a `usd_per_day` budget that

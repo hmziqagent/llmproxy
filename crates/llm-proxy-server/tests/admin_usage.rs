@@ -82,6 +82,7 @@ mod tests {
                 mode: llm_proxy_core::AuthMode::None,
                 clients: std::collections::HashMap::new(),
                 admin,
+                legacy_bare_tokens: false,
             },
             storage: Some(StorageConfig {
                 path: db_path,

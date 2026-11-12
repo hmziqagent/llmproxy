@@ -1292,6 +1292,7 @@ path = "usage.db"
                     token: secrecy::SecretString::from("admin-secret"),
                     key_store: None,
                 }),
+                legacy_bare_tokens: false,
             },
             storage: Some(StorageConfig {
                 path: "usage.db".into(),

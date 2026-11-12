@@ -98,6 +98,7 @@ mod tests {
                     token: secrecy::SecretString::from("admin-sentinel-token"),
                     key_store: None,
                 }),
+                legacy_bare_tokens: false,
             },
             storage: Some(llm_proxy_core::StorageConfig {
                 path: "usage.db".into(),

@@ -660,6 +660,7 @@ mod auth_gate_tests {
                 mode: llm_proxy_core::AuthMode::ClientKeys,
                 clients,
                 admin: None,
+                legacy_bare_tokens: false,
             },
             storage: None,
             replica: None,
@@ -703,7 +704,10 @@ mod auth_gate_tests {
     #[tokio::test]
     async fn valid_token_passes_when_the_peer_has_budget() {
         let (app, _state) = auth_router(100);
-        let response = app.oneshot(bearer_request("sekrit-token")).await.unwrap();
+        let response = app
+            .oneshot(bearer_request("laptop.sekrit-token"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -712,12 +716,15 @@ mod auth_gate_tests {
         let (app, state) = auth_router(1);
         let first = app
             .clone()
-            .oneshot(bearer_request("wrong-token"))
+            .oneshot(bearer_request("laptop.wrong-token"))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(state.metrics.get_snapshot().rate_limited, 0);
-        let second = app.oneshot(bearer_request("sekrit-token")).await.unwrap();
+        let second = app
+            .oneshot(bearer_request("laptop.sekrit-token"))
+            .await
+            .unwrap();
         assert_eq!(
             second.status(),
             StatusCode::UNAUTHORIZED,

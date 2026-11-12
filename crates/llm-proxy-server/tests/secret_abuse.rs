@@ -80,6 +80,7 @@ mod tests {
             mode: AuthMode::ClientKeys,
             clients,
             admin: None,
+            legacy_bare_tokens: false,
         })
         .expect("valid client auth");
         (auth, phcs)
@@ -162,6 +163,7 @@ mod tests {
                     mode: AuthMode::None,
                     clients: HashMap::new(),
                     admin,
+                    legacy_bare_tokens: false,
                 },
                 storage: storage_path.map(|path| StorageConfig {
                     path,
@@ -419,9 +421,11 @@ mod tests {
             .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         let app = build_router(state.clone());
 
+        let laptop_bearer = format!("{KEY_ID_LAPTOP}.{LAPTOP_TOKEN}");
+        let phone_bearer = format!("{KEY_ID_PHONE}.{PHONE_TOKEN}");
         let traffic: [(Option<&str>, StatusCode); 5] = [
-            (Some(LAPTOP_TOKEN), StatusCode::OK),
-            (Some(PHONE_TOKEN), StatusCode::OK),
+            (Some(laptop_bearer.as_str()), StatusCode::OK),
+            (Some(phone_bearer.as_str()), StatusCode::OK),
             (Some(WRONG_TOKEN), StatusCode::UNAUTHORIZED),
             (None, StatusCode::UNAUTHORIZED),
             (Some(ADMIN_TOKEN), StatusCode::UNAUTHORIZED),
@@ -511,8 +515,12 @@ mod tests {
 
         let body = marked_body(BODY_MARKER);
         let digest = hex_sha256(body.as_bytes());
-        let (status, response, _) =
-            send(app.clone(), post_messages(Some(LAPTOP_TOKEN), &body)).await;
+        let laptop_bearer = format!("{KEY_ID_LAPTOP}.{LAPTOP_TOKEN}");
+        let (status, response, _) = send(
+            app.clone(),
+            post_messages(Some(laptop_bearer.as_str()), &body),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "valid client request: {response}");
         let (status, _, _) = send(app.clone(), post_messages(Some(WRONG_TOKEN), &body)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -565,8 +573,12 @@ mod tests {
 
         let body = marked_body(BODY_MARKER);
         let digest = hex_sha256(body.as_bytes());
-        let (status, response, _) =
-            send(main_app.clone(), post_messages(Some(LAPTOP_TOKEN), &body)).await;
+        let laptop_bearer = format!("{KEY_ID_LAPTOP}.{LAPTOP_TOKEN}");
+        let (status, response, _) = send(
+            main_app.clone(),
+            post_messages(Some(laptop_bearer.as_str()), &body),
+        )
+        .await;
         assert_ne!(
             status,
             StatusCode::OK,
@@ -712,9 +724,11 @@ mod tests {
             .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         let app = build_router(state);
 
+        let alpha_bearer = format!("{ALPHA_ID}.{ALPHA_TOKEN}");
+        let beta_bearer = format!("{BETA_ID}.{BETA_TOKEN}");
         let (status, _, _) = send(
             app.clone(),
-            post_messages(Some(ALPHA_TOKEN), &marked_body("alpha traffic")),
+            post_messages(Some(alpha_bearer.as_str()), &marked_body("alpha traffic")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -722,7 +736,7 @@ mod tests {
         let capture = TraceCapture::install();
         let (status, body, request_id) = send(
             app.clone(),
-            post_messages(Some(BETA_TOKEN), &marked_body("beta traffic")),
+            post_messages(Some(beta_bearer.as_str()), &marked_body("beta traffic")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);

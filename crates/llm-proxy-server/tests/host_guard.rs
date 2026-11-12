@@ -299,6 +299,7 @@ mod tests {
                 )),
             )]),
             admin: None,
+            legacy_bare_tokens: false,
         };
         let app = build_router(state(None, auth));
         let response = app

@@ -1997,6 +1997,7 @@ mod tests {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
             admin: None,
+            legacy_bare_tokens: false,
         })
         .expect("valid client auth")
     }
@@ -2073,7 +2074,7 @@ mod tests {
             .method("POST")
             .uri("/providers/mock-provider/v1/messages")
             .header("content-type", "application/json")
-            .header("authorization", "bearer sekrit-token")
+            .header("authorization", "bearer laptop.sekrit-token")
             .body(Body::from(make_messages_body("claude-sonnet-4-6", false)))
             .unwrap();
         let resp = app.oneshot(request).await.unwrap();
@@ -3802,7 +3803,7 @@ mod tests {
 
         let first = app
             .clone()
-            .oneshot(authorized_messages_request("first-token", &body))
+            .oneshot(authorized_messages_request("laptop.first-token", &body))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
@@ -3811,7 +3812,7 @@ mod tests {
 
         let old = app
             .clone()
-            .oneshot(authorized_messages_request("first-token", &body))
+            .oneshot(authorized_messages_request("laptop.first-token", &body))
             .await
             .unwrap();
         assert_eq!(
@@ -3820,7 +3821,7 @@ mod tests {
             "the old token must stop authenticating after the swap"
         );
         let new = app
-            .oneshot(authorized_messages_request("second-token", &body))
+            .oneshot(authorized_messages_request("laptop.second-token", &body))
             .await
             .unwrap();
         assert_eq!(new.status(), StatusCode::OK);
@@ -3854,6 +3855,7 @@ mod tests {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
             admin: None,
+            legacy_bare_tokens: false,
         };
         Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
             &auth, registry, backend,
@@ -3885,7 +3887,7 @@ mod tests {
 
         let allowed = app
             .clone()
-            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .oneshot(authorized_messages_request("laptop.sekrit-token", &body))
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
@@ -3905,7 +3907,7 @@ mod tests {
         );
 
         let refused = app
-            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .oneshot(authorized_messages_request("laptop.sekrit-token", &body))
             .await
             .unwrap();
         assert_eq!(
@@ -3963,7 +3965,7 @@ mod tests {
         for _ in 0..2 {
             let served = app
                 .clone()
-                .oneshot(authorized_messages_request("sekrit-token", &body))
+                .oneshot(authorized_messages_request("laptop.sekrit-token", &body))
                 .await
                 .unwrap();
             assert_eq!(served.status(), StatusCode::OK);
@@ -3983,7 +3985,7 @@ mod tests {
         ));
 
         let refused = app
-            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .oneshot(authorized_messages_request("laptop.sekrit-token", &body))
             .await
             .unwrap();
         assert_eq!(
@@ -4024,7 +4026,7 @@ mod tests {
 
         let first = app
             .clone()
-            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .oneshot(authorized_messages_request("laptop.sekrit-token", &body))
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK, "rpd of 1 admits one");
@@ -4038,7 +4040,7 @@ mod tests {
         ));
 
         let second = app
-            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .oneshot(authorized_messages_request("laptop.sekrit-token", &body))
             .await
             .unwrap();
         assert_eq!(
@@ -4086,7 +4088,7 @@ mod tests {
         // Sanity: generation one serves one-token under permissive rules.
         let served = app
             .clone()
-            .oneshot(authorized_messages_request("one-token", &body))
+            .oneshot(authorized_messages_request("laptop.one-token", &body))
             .await
             .unwrap();
         assert_eq!(served.status(), StatusCode::OK);
@@ -4098,11 +4100,14 @@ mod tests {
                 ("one-token", permissive(), StatusCode::OK)
             };
             pair.replace(Arc::new(client_auth_for("laptop", token)), rules);
+            // The config stores a verifier of the bare secret; the wire
+            // token is that secret prefixed with the key id.
             let other_token = if swap % 2 == 0 {
-                "one-token"
+                "laptop.one-token"
             } else {
-                "two-token"
+                "laptop.two-token"
             };
+            let fresh_token = format!("laptop.{token}");
 
             // The previous generation's token is already unknown to the
             // new authenticator — 401, never authenticated-under-old and
@@ -4124,7 +4129,7 @@ mod tests {
             // halves were one swap apart.
             let fresh = app
                 .clone()
-                .oneshot(authorized_messages_request(token, &body))
+                .oneshot(authorized_messages_request(&fresh_token, &body))
                 .await
                 .unwrap();
             assert_eq!(

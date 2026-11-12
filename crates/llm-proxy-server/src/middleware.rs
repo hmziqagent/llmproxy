@@ -1,10 +1,10 @@
 //! Middleware components for the LLM proxy server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::extract::{ConnectInfo, FromRequestParts};
@@ -257,11 +257,24 @@ struct CachedDigest {
 /// Splits a prefixed client token `<key-id>.<secret>` (audit conflict 12,
 /// plan 05 step 2). The id is everything before the first `.`; both parts
 /// must be non-empty. A token without a `.` is a legacy bare secret and
-/// returns `None` (the scanning fallback handles it).
+/// returns `None` (accepted only under `legacy_bare_tokens`, and then
+/// scanned with a cap).
 fn split_prefixed_token(token: &str) -> Option<(&str, &str)> {
     let (key_id, secret) = token.split_once('.')?;
     (!key_id.is_empty() && !secret.is_empty()).then_some((key_id, secret))
 }
+
+/// Upper bound on the per-request verifier scan a `legacy_bare_tokens`
+/// deployment pays for one bare token; more keys than this and the scan
+/// is skipped (logged once) rather than paid.
+const LEGACY_SCAN_MAX: usize = 16;
+
+/// How many recent failed-token digests the negative cache retains.
+const NEGATIVE_CACHE_MAX: usize = 256;
+
+/// How long a failed-token digest stays in the negative cache; a repeat
+/// of the same bad token inside this window costs no argon2 run.
+const NEGATIVE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Whether a managed key store is configured (`[auth.admin].key_store`):
 /// it can be a deployment's only key source, so client-keys mode may
@@ -316,15 +329,34 @@ pub enum ClientAuthError {
 /// the id selects exactly one verifier, so a bad token costs at most one
 /// argon2 run and an unknown id costs none, whatever the number of keys
 /// (audit conflict 12). A bare secret with no `.` is the legacy shape and
-/// is checked against every verifier in turn — its cost grows with the key
-/// count, which is why new keys are issued prefixed.
+/// is refused unless `legacy_bare_tokens` is configured; with the opt-in,
+/// it is scanned against every verifier but only up to
+/// [`LEGACY_SCAN_MAX`] keys — a deployment with more keys than the cap
+/// gets a refusal instead of an unbounded scan, so a bad token's lookup
+/// cost never grows unboundedly with the key count.
+///
+/// The digest of a definitively failed token is remembered briefly in a
+/// bounded negative cache, so a client retrying the same bad token costs
+/// one argon2 run, not one per attempt. The cache lives inside this
+/// instance: a hot-reload swap (new keys, e.g. a freshly issued key)
+/// starts with an empty negative cache and cannot be blocked by a stale
+/// entry.
 ///
 /// Manual `Debug` prints the mode and key ids, never the verifier strings.
 pub struct ClientAuth {
     enforced: bool,
+    /// Whether tokens without a `<key-id>.` prefix are accepted by
+    /// scanning verifiers (`[auth] legacy_bare_tokens = true`).
+    legacy_bare_tokens: bool,
     /// Sorted by `key_id` so a prefix lookup is a binary search.
     verifiers: Vec<ClientVerifier>,
     cache: Mutex<Vec<CachedDigest>>,
+    /// Digests of recently failed tokens: no token bytes, digest plus
+    /// insertion time, bounded and time-limited.
+    failed_recently: Mutex<VecDeque<([u8; 32], Instant)>>,
+    /// Set the first time a legacy scan is skipped for exceeding
+    /// [`LEGACY_SCAN_MAX`], so the warning fires once per process.
+    legacy_cap_warned: AtomicBool,
     /// argon2 password verifications run so far: the observable lookup
     /// cost, exposed so the scaling property is testable.
     verifications: AtomicU64,
@@ -386,8 +418,11 @@ impl ClientAuth {
         verifiers.sort_by(|a, b| a.key_id.cmp(&b.key_id));
         Ok(Self {
             enforced: matches!(config.mode, AuthMode::ClientKeys),
+            legacy_bare_tokens: config.legacy_bare_tokens,
             verifiers,
             cache: Mutex::new(Vec::new()),
+            failed_recently: Mutex::new(VecDeque::new()),
+            legacy_cap_warned: AtomicBool::new(false),
             verifications: AtomicU64::new(0),
         })
     }
@@ -400,8 +435,11 @@ impl ClientAuth {
     pub fn fail_closed() -> Self {
         Self {
             enforced: true,
+            legacy_bare_tokens: false,
             verifiers: Vec::new(),
             cache: Mutex::new(Vec::new()),
+            failed_recently: Mutex::new(VecDeque::new()),
+            legacy_cap_warned: AtomicBool::new(false),
             verifications: AtomicU64::new(0),
         }
     }
@@ -438,14 +476,18 @@ impl ClientAuth {
 
     /// Runs argon2 against `candidates` (key id, PHC) in order, off the
     /// async runtime, and caches the digest of a matching token.
+    ///
+    /// Returns the matched key id plus whether the outcome is definitive:
+    /// `false` means the verification task itself failed (spawn/join), so
+    /// the token must not be remembered as failed.
     async fn verify_against(
         &self,
         token: &str,
         digest: [u8; 32],
         candidates: Vec<(String, String)>,
-    ) -> Option<String> {
+    ) -> (Option<String>, bool) {
         if candidates.is_empty() {
-            return None;
+            return (None, true);
         }
         let token = token.to_owned();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -470,7 +512,9 @@ impl ClientAuth {
             error
         })
         .ok();
-        let (matched, runs) = outcome.unwrap_or((None, 0));
+        let Some((matched, runs)) = outcome else {
+            return (None, false);
+        };
         self.verifications.fetch_add(runs, Ordering::Relaxed);
         if let Some(key_id) = &matched {
             let mut cache = self.cache.lock().unwrap_or_else(|e| {
@@ -487,7 +531,7 @@ impl ClientAuth {
                 });
             }
         }
-        matched
+        (matched, true)
     }
 
     /// The one verifier a prefixed token names, if that key id exists.
@@ -499,11 +543,52 @@ impl ClientAuth {
             .map(|v| (v.key_id.clone(), v.phc.expose_secret().to_owned()))
     }
 
+    /// Whether this exact token digest definitively failed recently; also
+    /// drops expired entries. Digests compare in constant time.
+    fn recently_failed(&self, digest: &[u8; 32]) -> bool {
+        let mut failed = self.failed_recently.lock().unwrap_or_else(|e| {
+            tracing::warn!("client auth negative cache poisoned; recovering from panic");
+            e.into_inner()
+        });
+        let now = Instant::now();
+        failed.retain(|(_, at)| now.duration_since(*at) < NEGATIVE_CACHE_TTL);
+        failed
+            .iter()
+            .any(|(failed_digest, _)| constant_time_eq(failed_digest, digest))
+    }
+
+    /// Records a definitively failed token digest (never the token bytes).
+    fn remember_failure(&self, digest: [u8; 32]) {
+        let mut failed = self.failed_recently.lock().unwrap_or_else(|e| {
+            tracing::warn!("client auth negative cache poisoned; recovering from panic");
+            e.into_inner()
+        });
+        failed.push_back((digest, Instant::now()));
+        while failed.len() > NEGATIVE_CACHE_MAX {
+            failed.pop_front();
+        }
+    }
+
+    /// Warns once per process that the legacy bare-token scan was skipped
+    /// because the key count exceeds the cap.
+    fn warn_legacy_scan_capped(&self) {
+        if !self.legacy_cap_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                cap = LEGACY_SCAN_MAX,
+                keys = self.verifiers.len(),
+                "legacy_bare_tokens scan skipped: more configured keys than the cap, \
+                 bare tokens are refused"
+            );
+        }
+    }
+
     /// Resolves a presented token to its key id, or `None`.
     ///
-    /// Order: the digest cache (no argon2), then — for a `<key-id>.<secret>`
-    /// token — the one verifier that id names (one argon2 run, none when
-    /// the id is unknown), else the legacy scan of every verifier.
+    /// Order: the digest cache (no argon2), the negative cache of recent
+    /// failures (no argon2), then — for a `<key-id>.<secret>` token — the
+    /// one verifier that id names (one argon2 run, none when the id is
+    /// unknown). A bare token is refused with zero argon2 runs unless
+    /// `legacy_bare_tokens` is set, and even then the scan is capped.
     ///
     /// This is the check the managed-key flow must satisfy: a store's
     /// `client_specs()` verifiers have to accept the tokens that store
@@ -517,18 +602,36 @@ impl ClientAuth {
         if let Some(key_id) = self.cached_key_id(&digest) {
             return Some(key_id);
         }
+        if self.recently_failed(&digest) {
+            return None;
+        }
         match split_prefixed_token(token) {
             Some((key_id, secret)) => {
                 let candidates = self.verifier_for(key_id).into_iter().collect();
-                self.verify_against(secret, digest, candidates).await
+                let (matched, definitive) = self.verify_against(secret, digest, candidates).await;
+                if definitive && matched.is_none() {
+                    self.remember_failure(digest);
+                }
+                matched
             }
             None => {
+                if !self.legacy_bare_tokens {
+                    return None;
+                }
+                if self.verifiers.len() > LEGACY_SCAN_MAX {
+                    self.warn_legacy_scan_capped();
+                    return None;
+                }
                 let candidates = self
                     .verifiers
                     .iter()
                     .map(|v| (v.key_id.clone(), v.phc.expose_secret().to_owned()))
                     .collect();
-                self.verify_against(token, digest, candidates).await
+                let (matched, definitive) = self.verify_against(token, digest, candidates).await;
+                if definitive && matched.is_none() {
+                    self.remember_failure(digest);
+                }
+                matched
             }
         }
     }
@@ -678,6 +781,7 @@ mod tests {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
             admin: None,
+            legacy_bare_tokens: false,
         }
     }
 
@@ -696,6 +800,7 @@ mod tests {
                 mode: llm_proxy_core::AuthMode::None,
                 clients,
                 admin: None,
+                legacy_bare_tokens: false,
             }
         };
         assert!(matches!(
@@ -707,6 +812,7 @@ mod tests {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients: HashMap::new(),
             admin: None,
+            legacy_bare_tokens: false,
         };
         assert!(matches!(
             ClientAuth::from_config(&keys_without_clients),
@@ -728,6 +834,7 @@ mod tests {
                 token: SecretString::from("admin-tok".to_owned()),
                 key_store: Some(std::path::PathBuf::from("managed-keys.db")),
             }),
+            legacy_bare_tokens: false,
         };
         let auth = ClientAuth::from_config(&config).expect("boots with an empty store");
         assert!(auth.is_enforced(), "the mode is still enforced");
@@ -772,13 +879,13 @@ mod tests {
         let secret = cheap_phc("the-real-secret", b"0123456789abcdef");
         let auth = ClientAuth::from_config(&auth_config_with(&secret)).expect("valid config");
 
-        let matched = auth.authenticate("the-real-secret").await;
+        let matched = auth.authenticate("laptop.the-real-secret").await;
         assert_eq!(matched.as_deref(), Some("laptop"));
         assert_eq!(
-            auth.authenticate("the-real-secret").await.as_deref(),
+            auth.authenticate("laptop.the-real-secret").await.as_deref(),
             Some("laptop")
         );
-        assert_eq!(auth.authenticate("wrong-secret").await, None);
+        assert_eq!(auth.authenticate("laptop.wrong-secret").await, None);
         assert_eq!(auth.authenticate("").await, None);
     }
 
@@ -798,15 +905,24 @@ mod tests {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
             admin: None,
+            legacy_bare_tokens: false,
         };
         let auth = ClientAuth::from_config(&config).expect("valid config");
-        assert_eq!(auth.authenticate("two").await.as_deref(), Some("beta"));
-        assert_eq!(auth.authenticate("three").await.as_deref(), Some("gamma"));
-        assert_eq!(auth.authenticate("four").await, None);
+        assert_eq!(auth.authenticate("beta.two").await.as_deref(), Some("beta"));
+        assert_eq!(
+            auth.authenticate("gamma.three").await.as_deref(),
+            Some("gamma")
+        );
+        assert_eq!(auth.authenticate("ghost.four").await, None);
     }
 
     /// An authenticator over `count` keys, each with its own cheap PHC.
     async fn auth_with_keys(count: usize) -> ClientAuth {
+        auth_with_keys_opt_in(count, false).await
+    }
+
+    /// The same key set with `[auth] legacy_bare_tokens` set to `opt_in`.
+    async fn auth_with_keys_opt_in(count: usize, opt_in: bool) -> ClientAuth {
         let mut clients = HashMap::new();
         clients.insert(
             "laptop".to_owned(),
@@ -828,6 +944,7 @@ mod tests {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
             admin: None,
+            legacy_bare_tokens: opt_in,
         };
         ClientAuth::from_config(&config).expect("valid config")
     }
@@ -854,6 +971,102 @@ mod tests {
                 "a known id names exactly one verifier ({count} keys)"
             );
         }
+    }
+
+    /// A bare token (no `<key-id>.` prefix) must be refused without
+    /// running any verifier: its lookup cost must not grow with the
+    /// number of configured keys.
+    #[tokio::test]
+    async fn a_bare_token_costs_no_argon2_by_default() {
+        for count in [3, 60] {
+            let auth = auth_with_keys(count).await;
+            assert_eq!(
+                bad_token_cost(&auth, "no-dot-wrong").await,
+                0,
+                "a bare token must cost zero argon2 runs, not one per key ({count} keys)"
+            );
+        }
+    }
+
+    /// One bad token verified twice (e.g. a client retrying) must cost one
+    /// argon2 run in total, not one per attempt.
+    #[tokio::test]
+    async fn a_repeated_bad_token_is_not_verified_twice() {
+        let auth = auth_with_keys(3).await;
+        let before = auth.argon2_verifications();
+        assert_eq!(auth.authenticate("laptop.wrong").await, None);
+        assert_eq!(auth.authenticate("laptop.wrong").await, None);
+        assert_eq!(
+            auth.argon2_verifications() - before,
+            1,
+            "the repeat must be answered without another argon2 run"
+        );
+    }
+
+    /// With `legacy_bare_tokens = true`, the bare secret shape keeps
+    /// working: the real bare secret authenticates and a wrong bare token
+    /// costs at most one run per key (bounded by the configured count).
+    #[tokio::test]
+    async fn a_bare_token_with_the_opt_in_authenticates() {
+        let auth = auth_with_keys_opt_in(3, true).await;
+        assert_eq!(
+            auth.authenticate("the-real-secret").await.as_deref(),
+            Some("laptop"),
+            "the opt-in keeps the legacy bare-secret shape working"
+        );
+        assert!(
+            bad_token_cost(&auth, "no-such-secret").await <= 3,
+            "the opt-in scan checks every key but never more"
+        );
+    }
+
+    /// The opt-in scan is capped: with more keys than the cap, a bare
+    /// token is refused without running any verifier.
+    #[tokio::test]
+    async fn the_legacy_scan_is_capped() {
+        let auth = auth_with_keys_opt_in(60, true).await;
+        assert_eq!(
+            bad_token_cost(&auth, "no-dot-wrong").await,
+            0,
+            "over the cap the legacy scan must be skipped entirely"
+        );
+    }
+
+    /// A rebuilt `ClientAuth` — what a hot-reload key swap constructs —
+    /// owns a fresh negative cache, so a token that failed against the
+    /// old instance authenticates once its key exists.
+    #[tokio::test]
+    async fn a_rebuilt_client_auth_is_not_blocked_by_a_stale_failure() {
+        let old_auth = auth_with_keys_opt_in(3, true).await;
+        assert_eq!(
+            old_auth.authenticate("laptop.not-yet-issued").await,
+            None,
+            "control: the token fails before the key exists"
+        );
+
+        let mut clients = HashMap::new();
+        clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                "not-yet-issued",
+                b"0123456789abcdef",
+            ))),
+        );
+        let new_auth = ClientAuth::from_config(&llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+            legacy_bare_tokens: false,
+        })
+        .expect("valid config");
+        assert_eq!(
+            new_auth
+                .authenticate("laptop.not-yet-issued")
+                .await
+                .as_deref(),
+            Some("laptop"),
+            "a stale negative entry must not block a freshly built authenticator"
+        );
     }
 
     #[tokio::test]

@@ -329,6 +329,7 @@ fn fake_auth_config() -> llm_proxy_core::AuthConfig {
             },
         )]),
         admin: None,
+        legacy_bare_tokens: false,
     }
 }
 

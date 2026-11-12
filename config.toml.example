@@ -99,8 +99,9 @@ mode = "none"
 #   Authorization: Bearer laptop.2V7mZ9xQ4k...
 # The id prefix selects exactly one verifier, so a wrong token costs at
 # most one argon2 run regardless of how many keys exist. A bare secret
-# with no dot still works (checked against every key in turn), but its
-# lookup cost grows with the key count.
+# with no dot is refused unless [auth] legacy_bare_tokens = true (the
+# opt-in scans keys in turn, capped, and its cost grows with the key
+# count).
 #
 # [auth.clients]
 # laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
