@@ -1573,6 +1573,91 @@ mod tests {
         );
     }
 
+    // A Responses server tool (`{"type": "web_search"}`) has no Anthropic
+    // equivalent; crossing formats must reject it by name, never silently
+    // change what the model can do.
+    #[tokio::test]
+    async fn responses_web_search_is_rejected_by_name_cross_format() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let mut body = responses_request(false);
+        let function_tool = body["tools"][0].clone();
+        body["tools"] = json!([function_tool, {"type": "web_search"}]);
+        let response = build_router(state)
+            .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("web_search"),
+            "the rejection must name web_search: {text}"
+        );
+    }
+
+    // The Gemini server tool (`{"googleSearch": {}}`) is rejected the same
+    // way, and the Gemini-dialect client gets the google error shape.
+    #[tokio::test]
+    async fn gemini_google_search_is_rejected_by_name_cross_format() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::GenerateContent,
+            false,
+        );
+        let mut body = gemini_request();
+        body["tools"] = json!([{"googleSearch": {}}]);
+        let response = build_router(state)
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:generateContent",
+                &body,
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_str(&body_text(response).await).expect("json error");
+        assert_eq!(value["error"]["code"], 400, "{value}");
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("googleSearch"),
+            "the rejection must name googleSearch: {message}"
+        );
+    }
+
+    // Same-format Responses passthrough forwards the raw body, so a server
+    // tool the upstream itself supports survives untouched.
+    #[tokio::test]
+    async fn responses_web_search_survives_same_format() {
+        let upstream = spawn_fake_upstream(Behavior::ResponsesNonStream).await;
+        let state = state_with_provider(
+            &upstream,
+            "openai_responses",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let app = build_router(state);
+        let mut body = responses_request(false);
+        let function_tool = body["tools"][0].clone();
+        body["tools"] = json!([function_tool, {"type": "web_search"}]);
+        let response = app
+            .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_body = captured(&upstream).await;
+        assert_eq!(
+            upstream_body["tools"][1],
+            json!({"type": "web_search"}),
+            "same-format passthrough must keep the server tool verbatim"
+        );
+    }
+
     // Same-format Responses streaming: the upstream's Responses SSE decodes
     // and re-encodes back into Responses SSE.
     #[tokio::test]

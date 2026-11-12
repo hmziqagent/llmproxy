@@ -1045,6 +1045,100 @@ mod tests {
         assert!(!anthropic_body_has_server_tools(&client.body));
     }
 
+    // The Responses and Gemini dialects decode their server tools the same
+    // way the Anthropic arm above does (`{"type": "web_search"}`,
+    // `{"googleSearch": {}}`); crossing formats must reject them by name
+    // rather than silently change what the model can do, and the lossy
+    // variant must drop them instead of failing.
+    #[test]
+    fn responses_server_tools_are_rejected_by_name_cross_format() {
+        let body = json!({
+            "model": "m", "input": [],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "keep", "parameters": {}}
+            ]
+        });
+        for provider in [
+            protocols::ANTHROPIC_MESSAGES,
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::GEMINI_GENERATE_CONTENT,
+        ] {
+            let client = wire(ClientWireFormat::OpenAiResponses, body.clone());
+            let err = apply_field_policy(&client, &ProtocolName::new(provider), false)
+                .expect_err("a Responses server tool must be rejected cross-format");
+            let text = err.to_string();
+            assert!(
+                text.contains("web_search"),
+                "error must name the server tool for {provider}: {text}"
+            );
+            let client = wire(ClientWireFormat::OpenAiResponses, body.clone());
+            apply_field_policy(&client, &ProtocolName::new(provider), true)
+                .expect("lossy drops the server tool instead of failing");
+        }
+    }
+
+    #[test]
+    fn gemini_server_tools_are_rejected_by_name_cross_format() {
+        let body = json!({
+            "contents": [],
+            "tools": [{"googleSearch": {}}]
+        });
+        for provider in [
+            protocols::ANTHROPIC_MESSAGES,
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::OPENAI_RESPONSES,
+        ] {
+            let client = wire(ClientWireFormat::GeminiGenerateContent, body.clone());
+            let err = apply_field_policy(&client, &ProtocolName::new(provider), false)
+                .expect_err("a Gemini server tool must be rejected cross-format");
+            let text = err.to_string();
+            assert!(
+                text.contains("googleSearch"),
+                "error must name the server tool for {provider}: {text}"
+            );
+            let client = wire(ClientWireFormat::GeminiGenerateContent, body.clone());
+            apply_field_policy(&client, &ProtocolName::new(provider), true)
+                .expect("lossy drops the server tool instead of failing");
+        }
+    }
+
+    #[test]
+    fn gemini_function_declarations_are_not_server_tools() {
+        let client = wire(
+            ClientWireFormat::GeminiGenerateContent,
+            json!({
+                "contents": [],
+                "tools": [{"functionDeclarations": [
+                    {"name": "get_weather", "parameters": {"type": "object"}}
+                ]}]
+            }),
+        );
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            false,
+        )
+        .expect("function declarations are core tools, not server tools");
+    }
+
+    #[test]
+    fn responses_function_tools_are_not_server_tools() {
+        let client = wire(
+            ClientWireFormat::OpenAiResponses,
+            json!({
+                "model": "m", "input": [],
+                "tools": [{"type": "function", "name": "keep", "parameters": {}}]
+            }),
+        );
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            false,
+        )
+        .expect("function tools are core tools, not server tools");
+    }
+
     // A tool-level `strict: true` on a Responses function tool carries the
     // client's structured-output guarantee; the core tool has no such field,
     // so crossing formats must reject it by name instead of silently
