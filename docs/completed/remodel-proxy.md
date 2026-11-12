@@ -122,14 +122,13 @@ log_level = "info"
 hot_reload = false
 rate_limit_rpm = 100
 trust_forwarded_headers = false
-dedup_window = "0ms"
 server_name = "llm-proxy"
 ```
 
 `hot_reload = true` is rejected because hot reload is not implemented.
 `rate_limit_rpm = 0` disables rate limiting; direct loopback clients are
 exempt. Forwarding headers are ignored unless `trust_forwarded_headers = true`.
-`dedup_window = "0ms"` disables identical-request rejection.
+Identical requests are never rejected; see plan 06 for single-flight, `Idempotency-Key` and the opt-in response cache.
 
 Provider config owns provider details, adapters, inbound route mapping, and
 optional discovery:
