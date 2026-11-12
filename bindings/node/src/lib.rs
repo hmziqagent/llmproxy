@@ -43,6 +43,23 @@ fn error_info(error: &BridgeError) -> ErrorInfo {
     }
 }
 
+/// The JSON an error crosses the napi boundary as: the [`ErrorInfo`] fields
+/// under the camelCase key names the JS layer unpacks (`ProxyError` reads
+/// `retryAfterSeconds` / `shouldRetry`), so a thrown error and a structured
+/// result carry the same policy fields. The single source of those key
+/// names.
+fn error_json(error: &BridgeError) -> String {
+    let info = error_info(error);
+    serde_json::json!({
+        "kind": info.kind,
+        "status": info.status,
+        "message": info.message,
+        "retryAfterSeconds": info.retry_after_seconds,
+        "shouldRetry": info.should_retry,
+    })
+    .to_string()
+}
+
 /// Converts the per-call options object into bridge options.
 fn options_from(obj: Option<OptionsObj>) -> ExecuteOptions {
     let Some(obj) = obj else {
@@ -144,9 +161,9 @@ impl Proxy {
     /// is cancelled when the JS object is garbage collected.
     ///
     /// A failure before the first event commits throws a napi error whose
-    /// message is the JSON-encoded [`ErrorInfo`] — napi 3.4 cannot carry a
-    /// class inside a plain object, and the JS layer parses it back into a
-    /// `ProxyError`.
+    /// message is the JSON-encoded [`ErrorInfo`] under the JS-facing
+    /// (camelCase) key names — napi 3.4 cannot carry a class inside a plain
+    /// object, and the JS layer parses it back into a `ProxyError`.
     #[napi]
     pub async fn execute_stream(
         &self,
@@ -160,16 +177,7 @@ impl Proxy {
             .bridge
             .execute_stream(&provider, &dialect, &body, &options)
             .await
-            .map_err(|error| {
-                let info = serde_json::json!({
-                    "kind": error.kind,
-                    "status": error.status,
-                    "message": error.message,
-                    "retry_after_seconds": error.retry_after.map(|d| d.as_secs_f64()),
-                    "should_retry": error.should_retry,
-                });
-                Error::new(Status::GenericFailure, info.to_string())
-            })?;
+            .map_err(|error| Error::new(Status::GenericFailure, error_json(&error)))?;
         Ok(Stream { inner: stream })
     }
 

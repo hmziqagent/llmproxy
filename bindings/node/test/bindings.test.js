@@ -50,7 +50,10 @@ class CannedUpstream {
       this.capture = { headers, body };
       if (this.canned.kind === 'json') {
         const payload = JSON.stringify(this.canned.body);
-        res.writeHead(200, { 'content-type': 'application/json' });
+        res.writeHead(this.canned.status || 200, {
+          'content-type': 'application/json',
+          ...this.canned.headers,
+        });
         res.end(payload);
       } else {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -261,6 +264,47 @@ test('failures throw ProxyError with status and kind', async () => {
         assert.ok(failure instanceof ProxyError);
         assert.equal(failure.status, 400);
         assert.equal(failure.kind, 'InvalidRequest');
+        return true;
+      }
+    );
+  } finally {
+    upstream.stop();
+  }
+});
+
+// A failure before the first stream event throws through executeStream; the
+// ProxyError must keep the retry policy the Rust error carries. The upstream
+// answers 429 with Retry-After: 7; the engine's pre-commit wrap turns the
+// transient failure into RetryExhausted (should_retry false, plan 04 step
+// 12) but keeps the advised wait, so the client fields must read false and
+// 7 — exactly what the Rust side carries — not undefined.
+test('a pre-commit stream failure keeps its retry fields', async () => {
+  const upstream = await startUpstream({
+    kind: 'json',
+    status: 429,
+    headers: { 'retry-after': '7' },
+    body: {
+      error: { type: 'rate_limit_error', message: 'rate limit exceeded' },
+    },
+  });
+  try {
+    const provider = providerFor('anthropic-upstream', upstream.baseUrl);
+    const proxy = new Proxy({ providers: [provider], record_usage: false });
+    const body = {
+      model: 'claude-sonnet-4-5',
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+
+    await assert.rejects(
+      proxy.executeStream('anthropic-upstream', 'anthropic_messages', body),
+      (error) => {
+        assert.ok(error instanceof ProxyError);
+        assert.equal(error.kind, 'RetryExhausted');
+        assert.equal(error.status, 429);
+        assert.equal(typeof error.shouldRetry, 'boolean');
+        assert.equal(error.shouldRetry, false);
+        assert.equal(error.retryAfterSeconds, 7);
         return true;
       }
     );
