@@ -66,8 +66,10 @@ Add pools, retries and failover on top of the routing decision in the
   config validation rejects a duplicate member, an empty member list and a
   pool name colliding with a provider (`validate_pool_config_against`,
   `provider_registry.rs`), and every attempt of a pool's ladder writes its
-  own `AttemptCompleted` row — `pool_survives_a_429…`, `…a_5xx_then_a_
-  connect_error…` and `a_direct_provider_route_never_fails_over…`
+  own `AttemptCompleted` row — `pool_survives_a_429…`,
+  `pool_survives_a_5xx_from_its_first_member…`,
+  `pool_survives_a_connect_error_from_its_first_member…` and
+  `a_direct_provider_route_never_fails_over…`
   (`crates/llm-proxy-engine/tests/pools_and_failover.rs`) pin the done-when
   lines, over HTTP in `crates/llm-proxy-server/tests/routing_pools.rs`.
 - One ladder deadline spans all attempts (`ladder_deadline`, the tighter of
