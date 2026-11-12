@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use llm_proxy_protocol::core::{CoreContent, CoreRequest};
+use llm_proxy_protocol::core::{CoreContent, CoreRequest, CoreToolChoice};
 use serde_json::Value;
 
 use crate::ProtocolName;
@@ -320,6 +320,38 @@ pub fn apply_field_policy(
         "field(s) {} have no {provider} equivalent; remove them or enable the route's lossy mode",
         rejected.join(", "),
     )))
+}
+
+/// Cross-format `tool_choice` policy shared by the Chat, Responses and
+/// Anthropic encoders: each encoder supplies its per-variant `map`, and a
+/// variant the map cannot represent (`CoreToolChoice` is `#[non_exhaustive]`,
+/// so future variants decode fine and map to nothing) is rejected with an
+/// error naming the field — or, under the per-route `lossy` opt-in, dropped
+/// with a logged warning instead of being silently omitted.
+pub(crate) fn resolve_tool_choice<F>(
+    choice: &CoreToolChoice,
+    lossy: bool,
+    protocol: &str,
+    map: F,
+) -> Result<Option<Value>, ProviderError>
+where
+    F: FnOnce(&CoreToolChoice) -> Option<Value>,
+{
+    match map(choice) {
+        Some(value) => Ok(Some(value)),
+        None if lossy => {
+            tracing::warn!(
+                tool_choice = ?choice,
+                provider = protocol,
+                "lossy route: dropping tool_choice with no provider equivalent"
+            );
+            Ok(None)
+        }
+        None => Err(ProviderError::InvalidRequest(format!(
+            "tool_choice {choice:?} has no {protocol} equivalent; \
+             remove it or enable the route's lossy mode"
+        ))),
+    }
 }
 
 /// Server tools (Anthropic `{"type": "web_search_...", ...}`, Responses
@@ -892,5 +924,55 @@ mod tests {
         .expect("store and prompt_cache_key are native Responses fields");
         assert_eq!(carried.get("store"), Some(&json!(false)));
         assert_eq!(carried.get("prompt_cache_key"), Some(&json!("k")));
+    }
+
+    #[test]
+    fn resolve_tool_choice_rejects_an_unmapped_variant_by_name() {
+        let err = resolve_tool_choice(
+            &CoreToolChoice::Auto,
+            false,
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            |_| None,
+        )
+        .expect_err("an unmapped tool_choice must reject on a strict route");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_choice"),
+            "error must name tool_choice: {msg}"
+        );
+        assert!(
+            msg.contains("lossy"),
+            "error must mention the lossy opt-in: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_tool_choice_drops_an_unmapped_variant_on_a_lossy_route() {
+        let resolved = resolve_tool_choice(
+            &CoreToolChoice::Any,
+            true,
+            protocols::ANTHROPIC_MESSAGES,
+            |_| None,
+        )
+        .expect("a lossy route drops the unmapped tool_choice instead of failing");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_tool_choice_carries_a_mapped_variant() {
+        let resolved = resolve_tool_choice(
+            &CoreToolChoice::Auto,
+            false,
+            protocols::OPENAI_RESPONSES,
+            |tc| {
+                if matches!(tc, CoreToolChoice::Auto) {
+                    Some(json!("auto"))
+                } else {
+                    None
+                }
+            },
+        )
+        .expect("a mapped variant resolves without error");
+        assert_eq!(resolved, Some(json!("auto")));
     }
 }

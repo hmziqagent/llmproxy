@@ -512,6 +512,26 @@ fn edit_raw_chat_request(
     Ok(serde_json::Value::Object(obj))
 }
 
+/// The Chat Completions API documents `tool_choice` as a string for the
+/// generic modes and an object only for naming a function; a client `Raw`
+/// choice forwards verbatim. A future core variant has no wired mapping yet
+/// (`CoreToolChoice` is `#[non_exhaustive]`); the shared
+/// `resolve_tool_choice` policy turns that missing mapping into a named
+/// rejection (or a lossy drop) instead of a silent omission.
+fn tool_choice_value(tc: &CoreToolChoice) -> Option<serde_json::Value> {
+    match tc {
+        CoreToolChoice::Auto => Some(serde_json::json!("auto")),
+        CoreToolChoice::Any => Some(serde_json::json!("required")),
+        CoreToolChoice::None => Some(serde_json::json!("none")),
+        CoreToolChoice::Tool { name } => Some(serde_json::json!({
+            "type": "function",
+            "function": {"name": name}
+        })),
+        CoreToolChoice::Raw(v) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "field-by-field wire encode of the OpenAI Chat Completions request \
@@ -703,22 +723,15 @@ fn encode_normalized_request(
         })
         .collect();
 
-    let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
-        // The Chat Completions API documents tool_choice as a string for
-        // the generic modes and an object only for naming a function.
-        CoreToolChoice::Auto => Some(serde_json::json!("auto")),
-        CoreToolChoice::Any => Some(serde_json::json!("required")),
-        CoreToolChoice::None => Some(serde_json::json!("none")),
-        CoreToolChoice::Tool { name } => Some(serde_json::json!({
-            "type": "function",
-            "function": {"name": name}
-        })),
-        CoreToolChoice::Raw(v) => Some(v.clone()),
-        _ => {
-            tracing::warn!(?tc, "OpenAI Chat: unknown tool_choice variant, omitting");
-            None
-        }
-    });
+    let tool_choice = match core.tool_choice.as_ref() {
+        Some(tc) => super::client_wire::resolve_tool_choice(
+            tc,
+            target.lossy,
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            tool_choice_value,
+        )?,
+        None => None,
+    };
 
     let mut req = ChatCompletionRequest {
         model: target.upstream_model.clone(),

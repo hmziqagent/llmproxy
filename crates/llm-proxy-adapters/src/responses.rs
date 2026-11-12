@@ -627,20 +627,12 @@ impl ResponsesAdapter {
         }
 
         if let Some(ref tc) = core.tool_choice {
-            req.tool_choice = match tc {
-                CoreToolChoice::Auto => Some(serde_json::json!("auto")),
-                CoreToolChoice::Any => Some(serde_json::json!("required")),
-                CoreToolChoice::None => Some(serde_json::json!("none")),
-                CoreToolChoice::Tool { name } => Some(serde_json::json!({
-                    "type": "function",
-                    "name": name
-                })),
-                CoreToolChoice::Raw(v) => Some(v.clone()),
-                _ => {
-                    tracing::warn!(?tc, "Responses: unknown tool_choice variant, omitting");
-                    None
-                }
-            };
+            req.tool_choice = super::client_wire::resolve_tool_choice(
+                tc,
+                target.lossy,
+                protocols::OPENAI_RESPONSES,
+                tool_choice_value,
+            )?;
         }
 
         // Phase 3 (plan 06 step 7): operator hygiene at the provider edge —
@@ -744,6 +736,26 @@ impl ResponsesAdapter {
             stop_sent: false,
             saw_terminal: false,
         }
+    }
+}
+
+/// The Responses API accepts the generic modes as strings and a named
+/// function as `{"type": "function", "name": ...}`; a client `Raw` choice
+/// forwards verbatim. A future core variant has no wired mapping yet
+/// (`CoreToolChoice` is `#[non_exhaustive]`); the shared
+/// `resolve_tool_choice` policy turns that missing mapping into a named
+/// rejection (or a lossy drop) instead of a silent omission.
+fn tool_choice_value(tc: &CoreToolChoice) -> Option<serde_json::Value> {
+    match tc {
+        CoreToolChoice::Auto => Some(serde_json::json!("auto")),
+        CoreToolChoice::Any => Some(serde_json::json!("required")),
+        CoreToolChoice::None => Some(serde_json::json!("none")),
+        CoreToolChoice::Tool { name } => Some(serde_json::json!({
+            "type": "function",
+            "name": name
+        })),
+        CoreToolChoice::Raw(v) => Some(v.clone()),
+        _ => None,
     }
 }
 

@@ -694,7 +694,7 @@ fn encode_normalized_request(
     let system = encode_system(&core.system, &core.messages);
     let messages = encode_messages(&core.messages);
     let tools = encode_tools_for_target(core, client, target);
-    let tool_choice = encode_tool_choice_for_target(core, client);
+    let tool_choice = encode_tool_choice_for_target(core, client, target)?;
 
     let mut req = serde_json::json!({
         "model": target.upstream_model,
@@ -802,18 +802,29 @@ fn encode_tools_for_target(
 
 /// `tool_choice` for the cross-format path, mapping the OpenAI Chat
 /// `parallel_tool_calls` knob onto Anthropic's `disable_parallel_tool_use`.
+/// An unmapped core variant rejects (or drops under `target.lossy`) through
+/// the shared `resolve_tool_choice` policy.
 fn encode_tool_choice_for_target(
     core: &CoreRequest,
     client: &super::client_wire::ClientWireRequest,
-) -> Option<serde_json::Value> {
-    let mut encoded = core.tool_choice.as_ref().and_then(encode_tool_choice);
+    target: &ProviderAdapterTarget,
+) -> Result<Option<serde_json::Value>, ProviderError> {
+    let mut encoded = match core.tool_choice.as_ref() {
+        Some(tc) => super::client_wire::resolve_tool_choice(
+            tc,
+            target.lossy,
+            protocols::ANTHROPIC_MESSAGES,
+            tool_choice_value,
+        )?,
+        None => None,
+    };
     let parallel = client
         .body
         .as_object()
         .and_then(|obj| obj.get("parallel_tool_calls"))
         .and_then(serde_json::Value::as_bool);
     let Some(parallel) = parallel else {
-        return encoded;
+        return Ok(encoded);
     };
     let disable = serde_json::json!(!parallel);
     match encoded.as_mut().and_then(serde_json::Value::as_object_mut) {
@@ -827,7 +838,7 @@ fn encode_tool_choice_for_target(
             }));
         }
     }
-    encoded
+    Ok(encoded)
 }
 
 fn map_anthropic_stop_reason(reason: &str) -> StopReason {
@@ -1104,7 +1115,13 @@ fn encode_tools(tools: &[CoreTool]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn encode_tool_choice(tc: &CoreToolChoice) -> Option<serde_json::Value> {
+/// Anthropic takes the generic modes as `{"type": ...}` objects and a named
+/// function as `{"type": "tool", "name": ...}`; a client `Raw` choice
+/// forwards verbatim. A future core variant has no wired mapping yet
+/// (`CoreToolChoice` is `#[non_exhaustive]`); the shared
+/// `resolve_tool_choice` policy turns that missing mapping into a named
+/// rejection (or a lossy drop) instead of a silent omission.
+fn tool_choice_value(tc: &CoreToolChoice) -> Option<serde_json::Value> {
     match tc {
         CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
         CoreToolChoice::Any => Some(serde_json::json!({"type": "any"})),
