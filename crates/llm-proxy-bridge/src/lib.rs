@@ -15,8 +15,9 @@
 //!   against the configured providers, with the caller's dialect decoded in
 //!   and encoded back out exactly as the HTTP routes do it.
 //! - **Streaming events** ([`Bridge::execute_stream`]): the engine's core
-//!   events as a JSON iterator; dropping or cancelling it cancels the
-//!   upstream request and settles it as `ClientCancelled`.
+//!   events as a JSON iterator; dropping it before it ends, or cancelling
+//!   it, cancels the upstream request and settles it as `ClientCancelled`,
+//!   while a stream read to its end stays completed.
 //! - **Configuration from code** ([`Bridge::from_json`]): providers, model
 //!   aliases and routing as a JSON document, mirroring the TOML daemon
 //!   configuration.

@@ -68,7 +68,8 @@ translated = proxy.translate_request(body, "anthropic_messages", "openai_chat_co
 A stream stops when you leave its `with` block, call `stream.cancel()`
 (or `stream.close()`), or release its last reference; breaking out of a
 loop over a stream you still hold keeps the request running until the
-stream is released.
+stream is released. A stream that has run to its end is not cancelled on
+release: its request settles as completed.
 
 Dialect names: `anthropic_messages`, `openai_chat_completions`,
 `openai_responses`, `gemini_generate_content`, `ollama_chat`,

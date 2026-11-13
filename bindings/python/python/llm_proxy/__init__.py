@@ -9,7 +9,8 @@ shared bridge crate; this module unpacks its error tuple into a
 >>> reply = proxy.execute("acme", "anthropic_messages", request_body)
 >>> with proxy.execute_stream("acme", "anthropic_messages", body) as stream:
 ...     for event in stream:
-...         ...  # each event is a dict; leaving the with block cancels
+...         ...  # each event is a dict; the with block cancels an
+...         ...  # unfinished stream
 """
 
 from llm_proxy._llm_proxy import Proxy as _NativeProxy
