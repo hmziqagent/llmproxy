@@ -526,12 +526,16 @@ pub fn load_registry_with_checks(
 
     // Self-loop refusal (backlog 32): an upstream that resolves to one of
     // this instance's own listeners would forward to itself forever. The
-    // listeners are the main bind plus the admin bind when one is served.
+    // listeners are the main bind, the admin bind when one is served, and
+    // the MCP gateway's bind when `[mcp]` is configured.
     let mut own_listeners = vec![app_config.server.bind];
     if app_config.admin_posture().is_some() && app_config.server.dedicated_admin_listener() {
         if let Some(admin_bind) = app_config.server.effective_admin_bind() {
             own_listeners.push(admin_bind);
         }
+    }
+    if let Some(mcp) = app_config.mcp.as_ref() {
+        own_listeners.push(mcp.bind);
     }
     let loop_problems = llm_proxy_core::self_loop_problems(registry.iter(), &own_listeners);
     if !loop_problems.is_empty() {
@@ -1648,6 +1652,58 @@ server_name = "t"
         let message = format!("{err:#}");
         assert!(
             message.contains("loopy") && message.contains("self-referential"),
+            "the refusal names the provider and the reason: {message}"
+        );
+    }
+
+    /// The MCP gateway's dedicated listener is one of this instance's own
+    /// listeners: an upstream pointed at it forwards through the gateway to
+    /// the proxy and back, so the self-loop check must cover it too.
+    #[test]
+    fn an_upstream_on_the_mcp_listener_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/loopy-mcp.toml"),
+            r#"[provider]
+name = "loopy-mcp"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "anthropic_messages"
+endpoint = "http://127.0.0.1:3457/v1/messages"
+[provider.routes]
+messages = "chat"
+"#,
+        )
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[mcp]
+bind = "127.0.0.1:3457"
+tokens = ["t"]
+"#,
+        )
+        .unwrap();
+
+        let app_config = llm_proxy_core::load_app_config(&path).unwrap();
+        let err = load_registry_with_checks(
+            &app_config,
+            &path,
+            &llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+        )
+        .expect_err("an upstream naming the MCP gateway listener is invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("loopy-mcp") && message.contains("self-referential"),
             "the refusal names the provider and the reason: {message}"
         );
     }
