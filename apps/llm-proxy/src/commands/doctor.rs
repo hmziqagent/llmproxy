@@ -354,7 +354,12 @@ async fn probe_check(provider: &ProviderConfig, config: &AppConfig) -> CheckOutc
             check,
             outcome: Outcome::Warn,
             detail: format!("no one-token probe for protocol {}", adapter.protocol),
-            fix: None,
+            fix: Some(format!(
+                "doctor can only probe openai_chat_completions and anthropic_messages routes; \
+                 point [provider.routes] chat_completions or messages at an adapter speaking \
+                 one of those, or rely on the reachability row for protocol {}",
+                adapter.protocol
+            )),
         };
     }
     let model = probe_model(provider, &adapter.protocol);
@@ -556,6 +561,7 @@ mod tests {
         dir: &std::path::Path,
         endpoint: &str,
         name: &str,
+        chat_protocol: &str,
         egress: Option<&str>,
     ) -> std::path::PathBuf {
         std::fs::create_dir_all(dir.join("providers")).expect("providers dir");
@@ -570,7 +576,7 @@ name = "{name}"
 api_key = "doctor-test-key"
 auth_style = "x-api-key"
 {egress_section}[provider.adapters.chat]
-protocol = "openai_chat_completions"
+protocol = "{chat_protocol}"
 endpoint = "{endpoint}"
 [provider.adapters.messages]
 protocol = "anthropic_messages"
@@ -624,7 +630,13 @@ server_name = "doctor-test"
     async fn a_live_upstream_passes_both_checks() {
         let endpoint = spawn_upstream(200).await;
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &endpoint, "healthy", None);
+        let path = write_config(
+            dir.path(),
+            &endpoint,
+            "healthy",
+            "openai_chat_completions",
+            None,
+        );
         let report = run_doctor(Some(&path), true).await.expect("doctor runs");
         assert!(
             report.all_passed(),
@@ -648,7 +660,13 @@ server_name = "doctor-test"
     async fn rejected_credentials_fail_with_a_named_fix() {
         let endpoint = spawn_upstream(401).await;
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &endpoint, "badkey", None);
+        let path = write_config(
+            dir.path(),
+            &endpoint,
+            "badkey",
+            "openai_chat_completions",
+            None,
+        );
         let report = run_doctor(Some(&path), true).await.expect("doctor runs");
         let probe = report
             .rows
@@ -668,7 +686,13 @@ server_name = "doctor-test"
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &format!("http://{addr}/v1/x"), "dead", None);
+        let path = write_config(
+            dir.path(),
+            &format!("http://{addr}/v1/x"),
+            "dead",
+            "openai_chat_completions",
+            None,
+        );
         let report = run_doctor(Some(&path), false).await.expect("doctor runs");
         let reach = report
             .rows
@@ -698,6 +722,7 @@ server_name = "doctor-test"
             dir.path(),
             "https://unresolvable.invalid/v1/chat/completions",
             "egress",
+            "openai_chat_completions",
             Some(&format!("http://{proxy_addr}")),
         );
         let report = run_doctor(Some(&path), false).await.expect("doctor runs");
@@ -721,6 +746,7 @@ server_name = "doctor-test"
             dir.path(),
             "https://unresolvable.invalid/v1/chat/completions",
             "dead-proxy",
+            "openai_chat_completions",
             Some(&format!("http://{proxy_addr}")),
         );
         let report = run_doctor(Some(&path), false).await.expect("doctor runs");
@@ -737,14 +763,34 @@ server_name = "doctor-test"
         );
     }
 
+    /// Plan 07 step 9, item 07-10: a chat route wired to a protocol the
+    /// one-token probe cannot speak stays a WARN, but the row names its fix —
+    /// including the protocols doctor can probe instead.
     #[tokio::test]
-    async fn every_row_is_a_pass_or_carries_a_named_fix() {
-        // The Done-when property itself, on a mixed report: PASS rows carry
-        // no fix; everything else does.
-        let endpoint = spawn_upstream(404).await;
+    async fn a_provider_with_an_unprobeable_protocol_still_names_a_fix() {
+        let endpoint = spawn_upstream(200).await;
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &endpoint, "odd", None);
+        let path = write_config(dir.path(), &endpoint, "responses", "openai_responses", None);
         let report = run_doctor(Some(&path), true).await.expect("doctor runs");
+        let probe = report
+            .rows
+            .iter()
+            .find(|row| row.check == "probe one-token")
+            .expect("the probe ran");
+        assert_eq!(probe.outcome, Outcome::Warn, "{}", report.render());
+        let fix = probe
+            .fix
+            .as_deref()
+            .expect("a warn without a fix gives the operator nothing to do");
+        assert!(
+            fix.contains("openai_chat_completions"),
+            "the fix names the probeable protocols: {fix}"
+        );
+    }
+
+    /// The Done-when property: PASS rows carry no fix; every WARN and FAIL
+    /// names a non-empty one.
+    fn rows_are_a_pass_or_carry_a_named_fix(report: &DoctorReport) {
         assert!(!report.rows.is_empty());
         for row in &report.rows {
             match row.outcome {
@@ -756,6 +802,24 @@ server_name = "doctor-test"
                     row.detail
                 ),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_row_is_a_pass_or_carries_a_named_fix() {
+        // The Done-when property itself, on mixed reports from two provider
+        // files — an odd-status upstream and a chat route whose protocol the
+        // probe cannot speak: PASS rows carry no fix; everything else does.
+        let endpoint = spawn_upstream(404).await;
+        let responses_endpoint = spawn_upstream(200).await;
+        for (name, chat_protocol, endpoint) in [
+            ("odd", "openai_chat_completions", endpoint.as_str()),
+            ("responses", "openai_responses", responses_endpoint.as_str()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_config(dir.path(), endpoint, name, chat_protocol, None);
+            let report = run_doctor(Some(&path), true).await.expect("doctor runs");
+            rows_are_a_pass_or_carry_a_named_fix(&report);
         }
     }
 
