@@ -486,8 +486,11 @@ async fn family_forwarding_honours_allowlist_and_never_forwarded_set() {
 
 /// The admission half of the family usage fix: a tpm-limited key must be
 /// throttled by the usage its family calls report. The fake upstream
-/// answers `usage {prompt_tokens: 5, total_tokens: 5}`; with tpm = 8 the
-/// third call inside the minute is refused before any upstream call.
+/// answers `usage {prompt_tokens: 5, total_tokens: 5}`; the small body
+/// reserves 12 estimated input tokens (47 outbound bytes, chars/4), so
+/// with tpm = 20 the reservation alone fits the window twice and the
+/// third call inside the minute — 10 reported tokens plus its own 12 — is
+/// refused before any upstream call.
 #[tokio::test]
 async fn a_tpm_limited_key_is_throttled_by_reported_family_usage() {
     let (endpoint, _captured) = spawn_upstream().await;
@@ -501,7 +504,7 @@ async fn a_tpm_limited_key_is_throttled_by_reported_family_usage() {
             allow_providers: vec![],
             limits: Some(KeyWindowLimits {
                 rpm: None,
-                tpm: Some(8),
+                tpm: Some(20),
                 rpd: None,
             }),
             budget: None,
@@ -545,7 +548,7 @@ async fn a_tpm_limited_key_is_throttled_by_reported_family_usage() {
         assert_eq!(
             response.status(),
             expected,
-            "call {call}: 5 tokens per call against a tpm of 8 throttles the third"
+            "call {call}: 5 reported tokens per call against a tpm of 20 throttles the third"
         );
     }
     // The throttled call never reached the upstream but is still
@@ -566,6 +569,163 @@ async fn a_tpm_limited_key_is_throttled_by_reported_family_usage() {
             .count(),
         3,
         "every call, refused or not, wrote its request row"
+    );
+}
+
+/// An admission step that records every reservation's input estimate and
+/// admits everything, so a test can observe exactly what the family spine
+/// claimed before any real policy runs.
+#[derive(Debug, Default)]
+struct RecordingAdmission {
+    estimates: std::sync::Mutex<Vec<u64>>,
+}
+
+impl RecordingAdmission {
+    fn estimates(&self) -> Vec<u64> {
+        self.estimates.lock().expect("estimates lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl llm_proxy_engine::Admission for RecordingAdmission {
+    async fn reserve(
+        &self,
+        claim: &llm_proxy_engine::AdmissionClaim<'_>,
+    ) -> Result<llm_proxy_engine::AdmissionTicket, llm_proxy_engine::EngineError> {
+        self.estimates
+            .lock()
+            .expect("estimates lock")
+            .push(claim.estimated_input_tokens);
+        Ok(llm_proxy_engine::AdmissionTicket::default())
+    }
+}
+
+/// A 4,000-byte JSON embeddings body: the un-aliased upstream model name
+/// plus filler input, so the surgical model-alias edit leaves the length
+/// untouched and the reservation estimate is exactly chars/4 of 4,000.
+fn embeddings_body_of_4000_bytes() -> Vec<u8> {
+    let prefix = r#"{"model":"text-embedding-3-small","input":""#;
+    let suffix = r#""}"#;
+    let filler = "x".repeat(4_000 - prefix.len() - suffix.len());
+    let body = format!("{prefix}{filler}{suffix}");
+    assert_eq!(body.len(), 4_000, "the fixture body is exactly 4,000 bytes");
+    body.into_bytes()
+}
+
+/// JSON family bodies reserve a real input estimate: 4,000 bytes of body
+/// must claim 1,000 input tokens at reservation time, not the zero that
+/// let a burst of large embeddings pass every TPM window check.
+#[tokio::test]
+async fn a_json_family_call_reserves_an_input_estimate_from_the_body() {
+    let (endpoint, _captured) = spawn_upstream().await;
+    let registry =
+        ProviderRegistry::from_providers(vec![provider_config(&endpoint)]).expect("registry");
+    let admission = Arc::new(RecordingAdmission::default());
+    let app = build_router(
+        state(base_config(), registry, Arc::new(RecordingBus::new()))
+            .with_admission(Arc::clone(&admission) as Arc<dyn llm_proxy_engine::Admission>),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/providers/fake/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(embeddings_body_of_4000_bytes()))
+                .expect("request"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        admission.estimates(),
+        vec![1_000],
+        "the reservation carries ceil(body bytes / 4) input tokens"
+    );
+}
+
+/// Opaque byte bodies (a multipart audio upload) are not tokenizable
+/// text: they reserve zero input tokens, and settlement charges the
+/// provider-reported usage.
+#[tokio::test]
+async fn a_binary_family_call_reserves_no_input_estimate() {
+    let (endpoint, _captured) = spawn_upstream().await;
+    let registry =
+        ProviderRegistry::from_providers(vec![provider_config(&endpoint)]).expect("registry");
+    let admission = Arc::new(RecordingAdmission::default());
+    let app = build_router(
+        state(base_config(), registry, Arc::new(RecordingBus::new()))
+            .with_admission(Arc::clone(&admission) as Arc<dyn llm_proxy_engine::Admission>),
+    );
+
+    let multipart =
+        b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF-bytes\r\n--boundary--\r\n";
+    let response = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/audio/transcriptions",
+        Some("multipart/form-data; boundary=boundary"),
+        multipart,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        admission.estimates(),
+        vec![0],
+        "audio bytes are not tokens: the reservation stays at zero"
+    );
+}
+
+/// End to end: a key whose TPM window is 500 tokens cannot send a
+/// 4,000-byte embeddings body (1,000 estimated input tokens); the
+/// reservation refuses it 429 before any upstream call.
+#[tokio::test]
+async fn a_tpm_window_refuses_a_large_json_family_body_before_the_upstream() {
+    let (endpoint, captured) = spawn_upstream().await;
+    let mut config = base_config();
+    config.auth.mode = AuthMode::ClientKeys;
+    config.auth.clients.insert(
+        "ktight".to_owned(),
+        ClientKeySpec::Policy {
+            verifier: phc_of("fam-secret"),
+            allow_models: vec![],
+            allow_providers: vec![],
+            limits: Some(KeyWindowLimits {
+                rpm: None,
+                tpm: Some(500),
+                rpd: None,
+            }),
+            budget: None,
+        },
+    );
+    let registry =
+        ProviderRegistry::from_providers(vec![provider_config(&endpoint)]).expect("registry");
+    let app = build_router(state(config, registry, Arc::new(RecordingBus::new())));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/providers/fake/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer ktight.fam-secret")
+                .body(Body::from(embeddings_body_of_4000_bytes()))
+                .expect("request"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "1,000 estimated input tokens against tpm 500 refuse the call at reservation"
+    );
+    assert_eq!(
+        captured.lock().await.len(),
+        0,
+        "the refused call never reached the upstream"
     );
 }
 

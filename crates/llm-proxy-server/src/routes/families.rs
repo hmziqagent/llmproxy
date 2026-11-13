@@ -250,10 +250,11 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
     };
 
     // Admission: the same reserve/settle step the chat pipeline runs. A
-    // refusal never reaches the upstream. The reservation itself carries
-    // no token estimate (families have no chat-style estimator); the
-    // settlement in `account` charges the provider-reported usage, so
-    // per-key TPM windows and priced budgets count family traffic.
+    // refusal never reaches the upstream. The reservation carries the
+    // body's coarse input estimate ([`input_estimate`]); the settlement
+    // in `account` charges the provider-reported usage, so per-key TPM
+    // windows and priced budgets count family traffic.
+    let estimated_input_tokens = input_estimate(spec, &outbound_body);
     let engine = match state.engine() {
         Ok(engine) => engine,
         Err(error) => {
@@ -269,7 +270,7 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
         model: &target.upstream_model,
         requested_model: &ctx.requested_model,
         body_hash: &ctx.body_hash,
-        estimated_input_tokens: 0,
+        estimated_input_tokens,
         max_output_tokens: None,
     };
     let ticket = match admission.reserve(&claim).await {
@@ -576,6 +577,20 @@ struct TokenCounts {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+}
+
+/// The reservation's input estimate for a prepared family body: JSON
+/// bodies stand in for tokens at the coarse chars/4 rate (families have
+/// no chat-style estimator, so the outbound body length is what a TPM
+/// window or priced budget sees before settlement); opaque byte bodies —
+/// a multipart upload, a file — reserve zero: bytes are not tokens.
+fn input_estimate(spec: &FamilySpec, outbound_body: &[u8]) -> u64 {
+    if !spec.json {
+        return 0;
+    }
+    u64::try_from(outbound_body.len())
+        .unwrap_or(u64::MAX)
+        .div_ceil(4)
 }
 
 /// Rewrites the family body for egress: JSON families get their `model`
