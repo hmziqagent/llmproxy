@@ -747,7 +747,8 @@ mod auth_gate_tests {
                 target: "test",
                 git_sha: "test",
             },
-        );
+        )
+        .expect("app state");
 
         let router = Router::new()
             .route(

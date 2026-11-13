@@ -99,6 +99,7 @@ fn state(auth: AuthConfig, families: HashMap<String, EndpointFamilyConfig>) -> A
             git_sha: "test",
         },
     )
+    .expect("app state")
 }
 
 fn anonymous_state() -> AppState {

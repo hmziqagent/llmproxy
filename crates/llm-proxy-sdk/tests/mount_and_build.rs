@@ -65,6 +65,7 @@ fn state() -> AppState {
             git_sha: "test",
         },
     )
+    .expect("app state")
 }
 
 #[cfg(feature = "server")]

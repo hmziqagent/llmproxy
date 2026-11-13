@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use llm_proxy_adapters::ProviderAdapterRegistry;
+use llm_proxy_adapters::ProviderError;
 use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
 use llm_proxy_engine::{Engine, EngineBuilder, ModelCatalogService};
 use llm_proxy_storage::{EventBus, NoopBus};
-use llm_proxy_transport::ProxyClient;
+use llm_proxy_transport::{DiscoveryClient, ProxyClient};
 
 use crate::auth_pair::SwappingAuthPair;
 use crate::middleware::{ClientAuth, RateLimiter, RequestIdGenerator};
@@ -139,14 +140,17 @@ impl std::fmt::Debug for AppState {
 
 impl AppState {
     /// Construct `AppState` with TOML configuration.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError`] when the model-discovery HTTP client cannot be built.
     pub fn new(
         app_config: AppConfig,
         providers: ProviderRegistry,
         provider_adapters: ProviderAdapterRegistry,
         proxy_client: ProxyClient,
         build: BuildInfo,
-    ) -> Self {
+    ) -> Result<Self, ProviderError> {
         Self::new_with_catalog_dir(
             app_config,
             providers,
@@ -158,7 +162,10 @@ impl AppState {
     }
 
     /// Construct `AppState` with an optional on-disk provider catalog directory.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError`] when the model-discovery HTTP client cannot be built.
     pub fn new_with_catalog_dir(
         app_config: AppConfig,
         providers: ProviderRegistry,
@@ -166,7 +173,7 @@ impl AppState {
         proxy_client: ProxyClient,
         build: BuildInfo,
         catalog_dir: Option<std::path::PathBuf>,
-    ) -> Self {
+    ) -> Result<Self, ProviderError> {
         let rate_limit_rpm = app_config.server.rate_limit_rpm;
         let client_auth = match ClientAuth::from_config(&app_config.auth) {
             Ok(auth) => Arc::new(auth),
@@ -192,7 +199,7 @@ impl AppState {
         let config_source = Arc::new(llm_proxy_engine::SwappingConfigSource::new(Arc::clone(
             &app_config,
         )));
-        Self {
+        Ok(Self {
             app_config,
             providers: Arc::new(providers),
             provider_adapters: Arc::new(provider_adapters),
@@ -203,7 +210,10 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             rate_limiter: Arc::new(RateLimiter::new(rate_limit_rpm)),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
-            model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
+            model_catalogs: Arc::new(ModelCatalogService::new(
+                catalog_dir,
+                DiscoveryClient::try_new()?,
+            )),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
             client_auth,
             config_source,
@@ -211,7 +221,7 @@ impl AppState {
             cooldowns_override: None,
             runtime_issued_keys: Arc::from(Vec::new()),
             engine: Arc::new(EngineSlot::default()),
-        }
+        })
     }
 
     /// Replace the serving authenticator (builder-style), keeping the
@@ -585,7 +595,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(state.server_name(), "test-proxy");
         assert_eq!(state.request_timeout(), Duration::from_secs(300));
         assert_eq!(state.shutdown_timeout(), Duration::from_secs(30));
@@ -599,7 +610,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(state.server_name(), "test-proxy");
         assert_eq!(state.request_timeout(), Duration::from_secs(300));
     }
@@ -632,7 +644,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         let debug_output = format!("{:?}", state);
         assert!(
             !debug_output.contains("sk-secret-key-99999"),
@@ -652,7 +665,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         let debug_output = format!("{:?}", state);
         for field in [
             "app_config",
@@ -683,7 +697,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         let protocol_names = state.provider_adapters.protocol_names();
         assert!(
             protocol_names.len() >= 4,
@@ -819,7 +834,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(
             state.bind_address(),
             "10.0.0.1:8080".parse::<SocketAddr>().unwrap()
@@ -834,7 +850,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         let cloned = state.clone();
         assert!(
             Arc::ptr_eq(&state.metrics, &cloned.metrics),
@@ -935,7 +952,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(state.request_timeout(), Duration::ZERO);
     }
 
@@ -949,7 +967,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(state.server_name(), "");
     }
 
@@ -963,7 +982,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(state.server_name(), "代理服务器-ünïcödé");
     }
 
@@ -978,7 +998,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert_eq!(state.server_name(), long_name);
     }
 
@@ -998,7 +1019,8 @@ mod tests {
             ProviderAdapterRegistry::builtin(),
             ProxyClient::try_new().expect("client"),
             make_build_info(),
-        );
+        )
+        .expect("app state");
         assert!(
             state.client_auth.current_client_auth().is_enforced(),
             "invalid auth config must fail closed, not open"
@@ -1055,7 +1077,8 @@ mod tests {
                 ProviderAdapterRegistry::builtin(),
                 ProxyClient::try_new().expect("client"),
                 make_build_info(),
-            );
+            )
+            .expect("app state");
         }
         String::from_utf8(buf.lock().expect("buffer lock not poisoned").clone())
             .expect("captured bytes are UTF-8")
@@ -1129,6 +1152,7 @@ mod tests {
             ProxyClient::try_new().expect("client"),
             make_build_info(),
         )
+        .expect("app state")
         .with_client_auth(Arc::new(client_auth));
         let debug = format!("{state:?}");
         assert!(

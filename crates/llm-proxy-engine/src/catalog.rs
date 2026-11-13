@@ -80,9 +80,10 @@ pub struct ModelCatalogService {
 }
 
 impl ModelCatalogService {
-    /// Create a catalog service. When `cache_dir` is absent, disk caching is disabled.
+    /// Create a catalog service over the given discovery client. When
+    /// `cache_dir` is absent, disk caching is disabled.
     #[must_use]
-    pub fn new(cache_dir: Option<PathBuf>) -> Self {
+    pub fn new(cache_dir: Option<PathBuf>, discovery: DiscoveryClient) -> Self {
         Self {
             cache_dir,
             cache: RwLock::new(HashMap::new()),
@@ -90,7 +91,7 @@ impl ModelCatalogService {
             id_index: RwLock::new(HashMap::new()),
             refresh_locks: Mutex::new(HashMap::new()),
             refresh_outcomes: Mutex::new(HashMap::new()),
-            discovery: DiscoveryClient::default(),
+            discovery,
         }
     }
 
@@ -517,12 +518,6 @@ fn is_safe_provider_slug(provider: &str) -> bool {
         })
 }
 
-impl Default for ModelCatalogService {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -537,6 +532,10 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("llm-proxy-catalog-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn catalog_service(cache_dir: Option<PathBuf>) -> ModelCatalogService {
+        ModelCatalogService::new(cache_dir, DiscoveryClient::try_new().expect("client"))
     }
 
     fn provider(endpoint: String) -> ProviderConfig {
@@ -633,7 +632,7 @@ mod tests {
     async fn concurrent_failed_refreshes_are_single_flight() {
         let (endpoint, count) = failing_server().await;
         let provider = Arc::new(provider(endpoint));
-        let service = Arc::new(ModelCatalogService::new(None));
+        let service = Arc::new(catalog_service(None));
         let barrier = Arc::new(tokio::sync::Barrier::new(8));
         let mut tasks = Vec::new();
         for _ in 0..8 {
@@ -661,7 +660,7 @@ mod tests {
         let (endpoint, count) = failing_server().await;
         let directory = temp_dir();
         write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let models = service.catalog(&provider(endpoint), true).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "cached-model");
@@ -711,7 +710,7 @@ mod tests {
             .as_mut()
             .expect("fixture provider has discovery")
             .kind = ProviderDiscoveryKind::GeminiModels;
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
 
         let models = service.catalog(&provider, true).await.unwrap();
 
@@ -736,7 +735,7 @@ mod tests {
             supports: Vec::new(),
             context_length: None,
         }];
-        let service = ModelCatalogService::new(None);
+        let service = catalog_service(None);
 
         let result = service.catalog(&provider, true).await;
 
@@ -779,7 +778,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = minimal_provider("symlink-provider");
         let result = service.load_disk_cache(&provider).await;
 
@@ -806,7 +805,7 @@ mod tests {
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let service = ModelCatalogService::new(Some(link.clone()));
+        let service = catalog_service(Some(link.clone()));
         let endpoint_unused = "http://catalog-endpoint-unused.invalid/models".to_owned();
         let result = service.catalog(&provider(endpoint_unused), false).await;
 
@@ -832,7 +831,7 @@ mod tests {
         let file = base.join("plain-file");
         std::fs::write(&file, "not a directory").unwrap();
 
-        let service = ModelCatalogService::new(Some(file.clone()));
+        let service = catalog_service(Some(file.clone()));
         let provider = minimal_provider("test-provider");
         let result = service.load_disk_cache(&provider).await;
 
@@ -864,7 +863,7 @@ mod tests {
                 .expect("mkfifo must be available");
         }
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = minimal_provider("fifo-provider");
         let result = service.load_disk_cache(&provider).await;
 
@@ -888,7 +887,7 @@ mod tests {
         let raw = toml::to_string_pretty(&file).unwrap();
         std::fs::write(directory.join("test-provider.toml"), &raw).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = minimal_provider("test-provider");
         let result = service.load_disk_cache(&provider).await;
 
@@ -913,7 +912,7 @@ mod tests {
         )
         .unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = minimal_provider("bad-toml");
         let result = service.load_disk_cache(&provider).await;
 
@@ -973,7 +972,7 @@ mod tests {
             .unwrap();
         write_catalog_atomic(&directory, &catalog_file(&now)).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = provider("http://127.0.0.1:0/models".to_owned());
         service.load_disk_cache(&provider).await.unwrap();
         assert!(
@@ -989,7 +988,7 @@ mod tests {
         let directory = temp_dir();
         write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = provider("http://127.0.0.1:0/models".to_owned());
         service.load_disk_cache(&provider).await.unwrap();
         assert!(
@@ -1002,7 +1001,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_is_fresh_returns_false_when_empty() {
-        let service = ModelCatalogService::new(None);
+        let service = catalog_service(None);
         let provider = provider("http://127.0.0.1:0/models".to_owned());
         assert!(
             !service.cache_is_fresh(&provider).await,
@@ -1018,7 +1017,7 @@ mod tests {
             .unwrap();
         write_catalog_atomic(&directory, &catalog_file(&now)).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let mut provider = provider("http://127.0.0.1:0/models".to_owned());
         provider.catalog.as_mut().unwrap().cache_ttl = Duration::ZERO;
         service.load_disk_cache(&provider).await.unwrap();
@@ -1039,7 +1038,7 @@ mod tests {
             .unwrap();
         write_catalog_atomic(&directory, &catalog_file(&future_str)).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = provider("http://127.0.0.1:0/models".to_owned());
         service.load_disk_cache(&provider).await.unwrap();
         assert!(
@@ -1055,7 +1054,7 @@ mod tests {
         let directory = temp_dir();
         write_catalog_atomic(&directory, &catalog_file("not-a-valid-timestamp")).unwrap();
 
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
         let provider = provider("http://127.0.0.1:0/models".to_owned());
         service.load_disk_cache(&provider).await.unwrap();
         assert!(
@@ -1104,7 +1103,7 @@ mod tests {
         let (endpoint, count) = succeeding_server(vec!["live-model"]).await;
         let mut provider = provider(endpoint);
         provider.catalog = None;
-        let service = ModelCatalogService::new(None);
+        let service = catalog_service(None);
 
         let models = service.catalog(&provider, true).await.unwrap();
 
@@ -1127,7 +1126,7 @@ mod tests {
         let (endpoint, count) = succeeding_server(vec!["live-model"]).await;
         let mut provider = provider(endpoint);
         provider.catalog = None;
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
 
         service.catalog(&provider, true).await.unwrap();
         service.catalog(&provider, true).await.unwrap();
@@ -1145,7 +1144,7 @@ mod tests {
     async fn concurrent_successful_refreshes_are_single_flight() {
         let (endpoint, count) = succeeding_server(vec!["model-a", "model-b"]).await;
         let provider = Arc::new(provider(endpoint));
-        let service = Arc::new(ModelCatalogService::new(None));
+        let service = Arc::new(catalog_service(None));
         let barrier = Arc::new(tokio::sync::Barrier::new(6));
         let mut tasks = Vec::new();
         for _ in 0..6 {
@@ -1214,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn contains_model_static_catalog_no_cache() {
         let provider = static_catalog_provider("static-only", vec![model_entry("static-a")]);
-        let service = ModelCatalogService::new(None);
+        let service = catalog_service(None);
         assert!(
             service
                 .contains_model(&provider, "static-a", "openai_chat")
@@ -1235,7 +1234,7 @@ mod tests {
     async fn contains_model_gemini_prefix_normalization() {
         let provider =
             static_catalog_provider("gemini-prov", vec![model_entry("models/gemini-2.5-pro")]);
-        let service = ModelCatalogService::new(None);
+        let service = catalog_service(None);
         assert!(
             service
                 .contains_model(&provider, "gemini-2.5-pro", "gemini_generate_content")
@@ -1284,7 +1283,7 @@ mod tests {
         let (endpoint, _count) = succeeding_server(vec!["new-model"]).await;
         let mut provider = provider(endpoint);
         provider.catalog.as_mut().unwrap().cache_ttl = Duration::ZERO;
-        let service = ModelCatalogService::new(Some(directory.clone()));
+        let service = catalog_service(Some(directory.clone()));
 
         assert!(
             service

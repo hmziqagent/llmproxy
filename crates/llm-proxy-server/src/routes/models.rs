@@ -342,6 +342,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
     fn build_state_without_catalog() -> AppState {
         let provider = ProviderConfig {
@@ -404,6 +405,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     #[tokio::test]

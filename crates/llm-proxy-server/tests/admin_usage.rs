@@ -108,6 +108,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     async fn get(app: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, String) {

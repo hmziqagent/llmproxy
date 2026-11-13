@@ -67,6 +67,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     #[tokio::test]

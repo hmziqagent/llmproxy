@@ -208,6 +208,7 @@ fn proxy(base: &str, aliases: &[(&str, &str)]) -> (Router, Arc<RecordingBus>) {
             git_sha: "test",
         },
     )
+    .expect("app state")
     .with_event_bus(Arc::clone(&bus) as Arc<dyn llm_proxy_storage::EventBus>);
     (build_router(state), bus)
 }

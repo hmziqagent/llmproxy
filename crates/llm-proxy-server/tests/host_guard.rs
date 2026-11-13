@@ -102,6 +102,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn post_messages(extra: &[(&'static str, &'static str)]) -> Request<Body> {
@@ -493,6 +494,7 @@ mod loop_guard_tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn post(path: &str, hop: bool) -> Request<Body> {

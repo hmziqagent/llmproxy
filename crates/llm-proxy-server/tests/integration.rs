@@ -66,6 +66,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn state_with_provider() -> AppState {
@@ -150,6 +151,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     #[tokio::test]
@@ -893,6 +895,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     #[tokio::test]
@@ -1025,6 +1028,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn state_with_provider_and_bus() -> (AppState, Arc<RecordingBus>) {

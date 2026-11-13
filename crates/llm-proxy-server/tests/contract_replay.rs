@@ -242,6 +242,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn state_with_provider(

@@ -269,6 +269,7 @@ fn state(config: AppConfig, registry: ProviderRegistry, bus: Arc<RecordingBus>) 
             git_sha: "test",
         },
     )
+    .expect("app state")
     .with_event_bus(bus)
 }
 

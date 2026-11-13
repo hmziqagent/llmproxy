@@ -375,18 +375,6 @@ fn build_client(proxy: Option<&str>) -> Result<Client, ProviderError> {
         .map_err(crate::client::provider_error_from_reqwest)
 }
 
-impl Default for DiscoveryClient {
-    /// Returns a default discovery client; panics if the HTTP client cannot be
-    /// constructed — use [`DiscoveryClient::try_new`] for the fallible form.
-    #[expect(
-        clippy::expect_used,
-        reason = "Default is infallible in practice; try_new is the fallible constructor"
-    )]
-    fn default() -> Self {
-        Self::try_new().expect("default discovery HTTP client configuration is valid")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,7 +489,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let models = DiscoveryClient::default()
+        let models = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect("Anthropic discovery should succeed");
@@ -517,7 +506,8 @@ mod tests {
         let provider =
             discovery_provider(endpoint, ProviderDiscoveryKind::AnthropicModels, headers);
 
-        let models = DiscoveryClient::default()
+        let models = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect("Anthropic discovery should succeed");
@@ -534,7 +524,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let models = DiscoveryClient::default()
+        let models = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect("discovery should succeed");
@@ -569,7 +560,8 @@ mod tests {
         );
         provider.discovery.as_mut().unwrap().max_pages = 1;
 
-        let error = DiscoveryClient::default()
+        let error = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect_err("page limit should stop pagination");
@@ -592,7 +584,8 @@ mod tests {
         );
         provider.discovery.as_mut().unwrap().max_models = 1;
 
-        let error = DiscoveryClient::default()
+        let error = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect_err("model limit should stop discovery");
@@ -614,7 +607,8 @@ mod tests {
         );
         provider.discovery.as_mut().unwrap().max_response_bytes = 8;
 
-        let error = DiscoveryClient::default()
+        let error = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect_err("response size limit should stop discovery");
@@ -648,7 +642,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let error = DiscoveryClient::default()
+        let error = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect_err("a stalled pagination token must fail discovery");
@@ -677,7 +672,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let error = DiscoveryClient::default()
+        let error = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect_err("`has_more` without `last_id` must fail discovery");
@@ -817,7 +813,8 @@ mod tests {
         .await;
         let provider = discovery_provider_with_auth(endpoint, auth_style, SECRET);
 
-        let models = DiscoveryClient::default()
+        let models = DiscoveryClient::try_new()
+            .expect("client")
             .discover(&provider)
             .await
             .expect("discovery should succeed");

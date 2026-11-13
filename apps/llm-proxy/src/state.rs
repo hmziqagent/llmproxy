@@ -159,6 +159,7 @@ pub async fn load_toml_state_from_config(
         build_info(),
         Some(cache_dir),
     )
+    .context("building app state")?
     .with_egress_clients(egress_clients)
     .with_event_bus(event_bus);
 

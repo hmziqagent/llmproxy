@@ -463,6 +463,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     /// A static catalog entry with only its id set.

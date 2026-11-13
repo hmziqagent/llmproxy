@@ -160,6 +160,7 @@ fn state_with(
             git_sha: "test",
         },
     )
+    .expect("app state")
     .with_event_bus(bus as Arc<dyn EventBus>)
 }
 

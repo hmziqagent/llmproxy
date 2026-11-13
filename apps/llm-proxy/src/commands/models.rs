@@ -101,8 +101,9 @@ pub async fn cmd_models(
     }
 
     let cache_dir = providers_dir.join(".catalog");
-    let catalogs = ModelCatalogService::new(Some(cache_dir.clone()));
-    let mut discovery: Option<DiscoveryClient> = None;
+    let discovery =
+        DiscoveryClient::try_new().context("building the HTTP client for model discovery")?;
+    let catalogs = ModelCatalogService::new(Some(cache_dir.clone()), discovery.clone());
 
     println!("Provider models (from {}):", providers_dir.display());
     println!();
@@ -119,7 +120,6 @@ pub async fn cmd_models(
                     provider.name
                 );
             }
-            let discovery = discovery.get_or_insert_with(DiscoveryClient::default);
             match discovery.discover(provider).await {
                 Ok(discovered) => {
                     let entries = merge_catalog(&catalog_config, &discovered);

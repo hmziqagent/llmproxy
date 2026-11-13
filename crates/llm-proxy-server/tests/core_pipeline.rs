@@ -263,6 +263,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn state_with_anthropic_provider(mock_endpoint: &str) -> AppState {
@@ -1467,6 +1468,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
         .with_event_bus(Arc::<RecordingBus>::clone(&bus));
         let app = build_router(state);
 
@@ -2903,7 +2905,8 @@ mod tests {
                 target: "test",
                 git_sha: "test",
             },
-        );
+        )
+        .expect("app state");
         let app = build_router(state);
 
         let body1 = json!({
@@ -3447,6 +3450,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     #[tokio::test]
@@ -3694,6 +3698,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     async fn spawn_mock_anthropic_leading_error_stream() -> String {

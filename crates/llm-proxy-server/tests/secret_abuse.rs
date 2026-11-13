@@ -184,6 +184,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn marked_body(marker: &str) -> String {

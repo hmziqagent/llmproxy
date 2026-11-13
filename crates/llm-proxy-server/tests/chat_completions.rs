@@ -225,6 +225,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn state_with_openai_chat_provider(mock_endpoint: &str) -> AppState {
@@ -418,6 +419,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn state_with_mock_provider_no_upstream() -> AppState {
@@ -497,6 +499,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn chat_request(body: &str) -> Request<Body> {
@@ -1958,7 +1961,8 @@ mod tests {
                 target: "test",
                 git_sha: "test",
             },
-        );
+        )
+        .expect("app state");
         let app = build_router(state);
 
         let body = serde_json::json!({"model": "gpt-4o", "messages": []}).to_string();

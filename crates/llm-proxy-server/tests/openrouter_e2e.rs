@@ -332,6 +332,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     fn openai_chat_request(body: &str) -> Request<Body> {
@@ -977,6 +978,7 @@ mod tests {
                 git_sha: "test",
             },
         )
+        .expect("app state")
     }
 
     async fn live_request_with_backoff(

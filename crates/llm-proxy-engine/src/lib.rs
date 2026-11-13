@@ -56,7 +56,7 @@ use std::sync::Arc;
 use llm_proxy_adapters::{ProviderAdapterRegistry, ProviderAdapterTarget};
 use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
 use llm_proxy_storage::EventBus;
-use llm_proxy_transport::ProxyClient;
+use llm_proxy_transport::{DiscoveryClient, ProxyClient};
 
 pub use admission::{KeyPolicy, PolicyAdmission};
 pub use admission_backend::{
@@ -552,9 +552,14 @@ impl EngineBuilder {
                 )
             }
         };
-        let catalogs = self
-            .catalogs
-            .unwrap_or_else(|| Arc::new(ModelCatalogService::new(None)));
+        let catalogs = match self.catalogs {
+            Some(catalogs) => catalogs,
+            None => Arc::new(ModelCatalogService::new(
+                None,
+                DiscoveryClient::try_new()
+                    .map_err(|error| EngineError::Internal(error.to_string()))?,
+            )),
+        };
         let known_protocols = self.adapters.protocol_names();
         self.providers
             .validate_protocols(known_protocols.iter().map(String::as_str))

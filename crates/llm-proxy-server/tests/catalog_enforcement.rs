@@ -211,6 +211,7 @@ fn state_with_provider(provider: ProviderConfig) -> AppState {
             git_sha: "test",
         },
     )
+    .expect("app state")
 }
 
 fn chat_request(uri: &str, model: &str) -> Request<Body> {
