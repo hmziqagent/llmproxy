@@ -53,9 +53,14 @@ the engine and add no logic of their own, so they start once its API has stopped
 - **Python package (step 2).** `bindings/python`: pyo3 0.30 (abi3-py39) +
   maturin. The extension converts dicts/lists to JSON and back; the
   pure-Python layer (`llm_proxy/__init__.py`) unpacks the error tuple into a
-  `ProxyError` with attributes and documents the surface. Two wheels are
+  `ProxyError` with attributes, documents the surface, and gives `Stream` a
+  context manager, `close()` and a finalizer: leaving a `with` block, an
+  explicit `cancel()`/`close()`, or releasing the last reference cancels the
+  upstream request and settles it as `ClientCancelled`, while releasing a
+  stream that has run to its end leaves the completed settlement in place.
+  Two wheels are
   built here: `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl`
-  (installed into a fresh venv whose `pip install` runs no Rust; 14 pytest
+  (installed into a fresh venv whose `pip install` runs no Rust; 18 pytest
   tests pass against the installed wheel) and
   `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation),
   which is run-verified with the embeddable Windows CPython 3.13.5 under

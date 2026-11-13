@@ -11,6 +11,7 @@ Run against an installed wheel:
     .venv-test/bin/python -m pytest tests -q
 """
 
+import gc
 import http.server
 import json
 import pathlib
@@ -348,6 +349,144 @@ def test_cancel_from_another_thread_unblocks_a_blocked_next(shared=load_shared()
          "messages": [{"role": "user", "content": "again"}]},
     )
     assert "id" in followup
+
+
+def stalled_stream_proxy(shared):
+    """A recording proxy against a stalled SSE upstream (one event, then
+    nothing for an hour) plus a fast JSON followup upstream."""
+    scenario = shared["cancellation"]
+    sse = CannedUpstream(
+        shared["upstream_responses"][scenario["upstream_response"]], 3_600_000
+    )
+    json_upstream = CannedUpstream(shared["upstream_responses"]["anthropic_json"])
+    proxy = make_proxy(
+        shared,
+        [
+            provider_for(shared, scenario["stream_provider"], sse.base_url),
+            provider_for(shared, scenario["followup_provider"], json_upstream.base_url),
+        ],
+        record_usage=True,
+    )
+    return proxy, scenario
+
+
+def wait_for_client_cancelled(proxy, timeout, why):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = proxy.usage_events()
+        if any(
+            row.get("kind") == "response_failed"
+            and row.get("error_kind") == "ClientCancelled"
+            for row in rows
+        ):
+            return
+        time.sleep(0.05)
+    pytest.fail("%s: %r" % (why, proxy.usage_events()))
+
+
+def test_leaving_a_with_block_cancels(shared=load_shared()):
+    proxy, scenario = stalled_stream_proxy(shared)
+
+    with proxy.execute_stream(
+        scenario["stream_provider"], scenario["dialect"], scenario["request"]
+    ) as stream:
+        first = next(iter(stream))
+        assert "MessageStart" in first
+
+    assert stream.cancelled, "leaving the with block must cancel the stream"
+    wait_for_client_cancelled(
+        proxy,
+        scenario.get("settle_timeout_secs", 5),
+        "the ClientCancelled row must land after the with block",
+    )
+
+
+def test_breaking_out_of_a_loop_over_a_temporary_stream_cancels(shared=load_shared()):
+    proxy, scenario = stalled_stream_proxy(shared)
+
+    for _ in proxy.execute_stream(
+        scenario["stream_provider"], scenario["dialect"], scenario["request"]
+    ):
+        break
+
+    gc.collect()
+    wait_for_client_cancelled(
+        proxy,
+        scenario.get("settle_timeout_secs", 5),
+        "the ClientCancelled row must land after the temporary stream is released",
+    )
+
+
+def test_deleting_the_stream_cancels(shared=load_shared()):
+    proxy, scenario = stalled_stream_proxy(shared)
+    stream = proxy.execute_stream(
+        scenario["stream_provider"], scenario["dialect"], scenario["request"]
+    )
+    first = next(iter(stream))
+    assert "MessageStart" in first
+
+    del stream
+    gc.collect()
+    wait_for_client_cancelled(
+        proxy,
+        scenario.get("settle_timeout_secs", 5),
+        "the ClientCancelled row must land after the stream is deleted",
+    )
+
+
+def test_a_fully_consumed_stream_that_is_released_stays_completed(shared=load_shared()):
+    def completed_row_lands(proxy, timeout, why):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = proxy.usage_events()
+            if any(row.get("kind") == "response_completed" for row in rows):
+                return rows
+            time.sleep(0.05)
+        pytest.fail("%s: %r" % (why, proxy.usage_events()))
+
+    scenario = shared["cancellation"]
+    body = scenario["request"]
+
+    # Drained to the end (StopIteration), then released.
+    fast = CannedUpstream(shared["upstream_responses"][scenario["upstream_response"]])
+    proxy = make_proxy(
+        shared,
+        [provider_for(shared, scenario["stream_provider"], fast.base_url)],
+        record_usage=True,
+    )
+    with proxy.execute_stream(
+        scenario["stream_provider"], scenario["dialect"], body
+    ) as stream:
+        with pytest.raises(StopIteration):
+            while True:
+                next(iter(stream))
+    rows = completed_row_lands(
+        proxy,
+        scenario.get("settle_timeout_secs", 5),
+        "the completed row must land after a drained stream is released",
+    )
+    assert not any(row.get("kind") == "response_failed" for row in rows), rows
+    assert not stream.cancelled
+
+    # Released right after the terminal event, without reading to the end.
+    fast = CannedUpstream(shared["upstream_responses"][scenario["upstream_response"]])
+    proxy = make_proxy(
+        shared,
+        [provider_for(shared, scenario["stream_provider"], fast.base_url)],
+        record_usage=True,
+    )
+    for event in proxy.execute_stream(
+        scenario["stream_provider"], scenario["dialect"], body
+    ):
+        if "MessageStop" in event:
+            break
+    gc.collect()
+    rows = completed_row_lands(
+        proxy,
+        scenario.get("settle_timeout_secs", 5),
+        "the completed row must land after a release at the terminal event",
+    )
+    assert not any(row.get("kind") == "response_failed" for row in rows), rows
 
 
 def test_usage_events_record_the_lifecycle_when_opted_in(shared=load_shared()):

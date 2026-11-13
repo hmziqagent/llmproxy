@@ -7,8 +7,9 @@ shared bridge crate; this module unpacks its error tuple into a
 >>> from llm_proxy import Proxy
 >>> proxy = Proxy({"providers": [...]})
 >>> reply = proxy.execute("acme", "anthropic_messages", request_body)
->>> for event in proxy.execute_stream("acme", "anthropic_messages", body):
-...     ...  # each event is a dict; breaking or dropping cancels upstream
+>>> with proxy.execute_stream("acme", "anthropic_messages", body) as stream:
+...     for event in stream:
+...         ...  # each event is a dict; leaving the with block cancels
 """
 
 from llm_proxy._llm_proxy import Proxy as _NativeProxy
@@ -51,22 +52,57 @@ def _unpack(error):
 class Stream:
     """A streaming response: an iterator of event dicts.
 
-    ``cancel()`` (or dropping the iterator) stops delivery and settles the
-    request as ``ClientCancelled``.
+    Use ``with proxy.execute_stream(...) as stream:`` or call
+    ``stream.cancel()`` (or ``stream.close()``); breaking out of a loop over
+    a temporary stream cancels it when the object is released; keeping a
+    reference keeps the request running. Leaving the ``with`` block (or
+    releasing the stream) after the stream has run to its end does not
+    cancel: the request settles as completed.
     """
 
     def __init__(self, native):
         self._native = native
+        self._ended = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        return self._native.__next__()
+        try:
+            event = self._native.__next__()
+        except StopIteration:
+            self._ended = True
+            raise
+        if "MessageStop" in event:
+            self._ended = True
+        return event
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        # An ended stream must not be cancelled: the engine is settling it
+        # as completed, and a cancel in that window would flip the row.
+        if not self._ended:
+            self.cancel()
 
     def cancel(self):
         """Stop delivering events and cancel the upstream request."""
         self._native.cancel()
+
+    def close(self):
+        """Alias of ``cancel()``."""
+        self.cancel()
+
+    def __del__(self):
+        # A finalizer must not raise; this only makes the cancel prompt if
+        # the native object outlives this wrapper.
+        if self._ended:
+            return
+        try:
+            self._native.cancel()
+        except Exception:
+            pass
 
     @property
     def cancelled(self):

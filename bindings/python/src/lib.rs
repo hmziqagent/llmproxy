@@ -244,7 +244,10 @@ fn parse_options(options: Option<&Bound<'_, PyAny>>) -> PyResult<ExecuteOptions>
 }
 
 /// A streaming response: iterate for event dicts; `cancel()` stops
-/// delivery and settles the request as `ClientCancelled`.
+/// delivery and settles the request as `ClientCancelled`. Dropping this
+/// native object cancels too; the pure-Python `Stream` wrapper
+/// (`python/llm_proxy/__init__.py`) adds the user-facing paths — `with`,
+/// `close()` and a finalizer — and documents the contract.
 ///
 /// Every method goes through the bridge's shared-state synchronization, so
 /// `cancel()` and the `cancelled` getter work from any thread while another
