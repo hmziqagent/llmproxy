@@ -1215,6 +1215,124 @@ mod tests {
         );
     }
 
+    fn client_auth_for(key_id: &str, token: &str) -> llm_proxy_server::ClientAuth {
+        use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let phc = hasher
+            .hash_password_customized(
+                token.as_bytes(),
+                b"0123456789abcdef",
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string();
+        let mut clients = HashMap::new();
+        clients.insert(
+            key_id.to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc)),
+        );
+        llm_proxy_server::ClientAuth::from_config(&llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+            legacy_bare_tokens: false,
+        })
+        .expect("valid client auth")
+    }
+
+    async fn models_error_body(
+        app: axum::Router,
+        method: &'static str,
+        uri: &'static str,
+        bearer: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let resp = app
+            .oneshot(builder.body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        let status = resp.status();
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("json body");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn models_layer_and_handler_errors_share_the_openai_envelope() {
+        let state = state_with_provider().with_client_auth(std::sync::Arc::new(client_auth_for(
+            "laptop",
+            "sekrit-token",
+        )));
+        let (auth_status, auth_body) = models_error_body(
+            build_router(state.clone()),
+            "GET",
+            "/providers/mock-provider/v1/models",
+            None,
+        )
+        .await;
+        let (handler_status, handler_body) = models_error_body(
+            build_router(state.clone()),
+            "GET",
+            "/providers/nope/v1/models",
+            Some("laptop.sekrit-token"),
+        )
+        .await;
+        let (method_status, method_body) = models_error_body(
+            build_router(state),
+            "POST",
+            "/providers/mock-provider/v1/models",
+            Some("laptop.sekrit-token"),
+        )
+        .await;
+
+        assert_eq!(auth_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(handler_status, StatusCode::NOT_FOUND);
+        assert!(
+            method_status == StatusCode::METHOD_NOT_ALLOWED
+                || method_status == StatusCode::NOT_FOUND,
+            "wrong-method models request must fall through to the router's 405/404, got {method_status}"
+        );
+
+        let bodies = [
+            ("layer 401", auth_status, &auth_body),
+            ("handler 404", handler_status, &handler_body),
+            ("method 405", method_status, &method_body),
+        ];
+        let mut top_level_keys: Option<Vec<String>> = None;
+        for (label, status, body) in &bodies {
+            let object = body.as_object().unwrap_or_else(|| {
+                panic!("{label} ({status}) must answer a JSON object, got {body}")
+            });
+            let mut keys: Vec<String> = object.keys().cloned().collect();
+            keys.sort();
+            assert!(
+                body["error"]["message"].is_string(),
+                "{label} must carry an OpenAI error.message string, got {body}"
+            );
+            assert!(
+                body.get("type").is_none(),
+                "{label} must not carry the Anthropic top-level type key, got {body}"
+            );
+            match &top_level_keys {
+                Some(previous) => assert_eq!(
+                    &keys, previous,
+                    "every /v1/models failure must share one envelope's top-level keys"
+                ),
+                None => top_level_keys = Some(keys),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn upstream_failure_inside_pipeline_emits_one_response_failed() {
         let (state, bus) = state_with_provider_and_bus();

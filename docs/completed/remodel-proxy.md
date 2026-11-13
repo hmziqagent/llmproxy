@@ -413,6 +413,8 @@ silently lowercase or normalize mismatches.
 
 The 404 classifier should classify `/providers/{provider}/v1/chat/*` as
 OpenAI-shaped and `/providers/{provider}/v1/messages*` as Anthropic-shaped.
+`/v1/models` has no single client protocol (the listing body is a
+superset), so its layer errors are OpenAI-shaped to match the handler.
 
 ## CLI Changes
 
@@ -903,6 +905,8 @@ Server tests:
 - Provider-prefixed unknown chat paths return OpenAI-shaped 404 responses.
 - Provider-prefixed unknown messages paths return Anthropic-shaped 404
   responses.
+- Auth rejection, wrong method, and unknown provider on `/v1/models` all
+  answer the same top-level OpenAI-shaped envelope.
 
 CLI tests:
 

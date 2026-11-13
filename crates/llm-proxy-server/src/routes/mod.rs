@@ -507,9 +507,13 @@ fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
     // The dialect of the path decides the error body shape for layer-level
     // failures (auth, limits, 404/405) that never reach a route handler.
     // Everything under a `chat` segment is OpenAI-shaped, including unknown
-    // subpaths that only hit the 404/405 fallback (remodel plan).
+    // subpaths that only hit the 404/405 fallback (remodel plan). `/v1/models`
+    // has no single inbound client protocol — its listing body is an
+    // OpenAI+Anthropic superset and the handler already answers OpenAI-shaped
+    // errors — so its layer failures are OpenAI-shaped too (remodel plan).
     if path.contains("/v1/chat/")
         || path.ends_with("/v1/chat")
+        || path.ends_with("/v1/models")
         || OPENAI_FAMILY_PATHS
             .iter()
             .any(|prefix| path.contains(prefix))
@@ -591,6 +595,21 @@ mod tests {
                 protocol_for_path(path),
                 error_response::ClientProtocol::OpenAiChat,
                 "{path} must classify as OpenAI-shaped"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_for_path_classifies_models_listing_as_openai() {
+        for path in [
+            "/providers/p/v1/models",
+            "/providers/nope/v1/models",
+            "/v1/models",
+        ] {
+            assert_eq!(
+                protocol_for_path(path),
+                error_response::ClientProtocol::OpenAiChat,
+                "{path} must classify as OpenAI-shaped so layer failures match the handler"
             );
         }
     }
