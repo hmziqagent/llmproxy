@@ -1,9 +1,10 @@
 //! The `doctor` command (plan 07 step 9, backlog 26): live reachability
 //! checks and optional one-token probes against every configured provider,
 //! every failure carrying a named fix. Reachability costs nothing (DNS +
-//! TCP); the one-token probe sends a real `max_tokens = 1` request through
-//! the real transport and is therefore opt-in (`--probe`) — it can spend
-//! money.
+//! TCP); a provider with `[provider.egress]` is checked at its proxy, the
+//! same hop its traffic actually takes. The one-token probe sends a real
+//! `max_tokens = 1` request through the real transport (egress proxy
+//! included) and is therefore opt-in (`--probe`) — it can spend money.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -123,7 +124,10 @@ pub(crate) async fn run_doctor(config_path: Option<&Path>, probe: bool) -> Resul
     Ok(DoctorReport { rows })
 }
 
-/// DNS + TCP reachability for every adapter and discovery endpoint.
+/// DNS + TCP reachability for every adapter and discovery endpoint — at the
+/// egress proxy when the provider has `[provider.egress]` (that is the hop
+/// its traffic actually takes; with `socks5h` even the upstream's DNS only
+/// exists at the proxy).
 async fn reachability_checks(provider: &ProviderConfig) -> Vec<CheckOutcome> {
     let mut rows = Vec::new();
     let mut targets: Vec<(&str, &str)> = provider
@@ -141,6 +145,22 @@ async fn reachability_checks(provider: &ProviderConfig) -> Vec<CheckOutcome> {
 }
 
 async fn reachability(provider: &ProviderConfig, name: &str, endpoint: &str) -> CheckOutcome {
+    // The egress path replaces the direct path entirely (plan 07 step 9):
+    // an upstream reachable only through the proxy would otherwise FAIL
+    // here while the server serves it fine. Config validation has already
+    // accepted the proxy URL, so an unparseable host:port is fail-closed.
+    if provider.egress.is_some() {
+        return match proxy_endpoint(provider) {
+            Some((host, port)) => reachability_via_egress_proxy(provider, name, &host, port).await,
+            None => CheckOutcome {
+                provider: provider.name.clone(),
+                check: format!("reachability {name} via egress proxy"),
+                outcome: Outcome::Fail,
+                detail: "the [provider.egress] proxy URL has no host:port".to_owned(),
+                fix: Some(EGRESS_PROXY_FIX.to_owned()),
+            },
+        };
+    }
     let check = format!("reachability {name}");
     let Some((host, port)) = host_port(endpoint) else {
         return CheckOutcome {
@@ -222,6 +242,80 @@ async fn reachability(provider: &ProviderConfig, name: &str, endpoint: &str) -> 
     }
 }
 
+/// The named remedy for a proxy hop that does not come up.
+const EGRESS_PROXY_FIX: &str =
+    "check [provider.egress] proxy host/port and that the proxy is running";
+
+/// TCP reachability of the provider's egress proxy — the only hop doctor
+/// can verify without speaking the proxy protocol. The upstream is
+/// deliberately not contacted: with `socks5h` its DNS may only exist at the
+/// proxy, and the check must reflect what the server does. The detail names
+/// the proxy `host:port` only, never the URL (it may carry userinfo).
+async fn reachability_via_egress_proxy(
+    provider: &ProviderConfig,
+    name: &str,
+    host: &str,
+    port: u16,
+) -> CheckOutcome {
+    let check = format!("reachability {name} via egress proxy");
+    let row = |outcome, detail: String| CheckOutcome {
+        provider: provider.name.clone(),
+        check: check.clone(),
+        outcome,
+        detail,
+        fix: (outcome != Outcome::Pass).then(|| EGRESS_PROXY_FIX.to_owned()),
+    };
+
+    // Resolve off the async runtime: DNS is blocking.
+    let resolve_host = host.to_owned();
+    let resolved = tokio::task::spawn_blocking(move || {
+        (resolve_host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+    })
+    .await
+    .unwrap_or_else(|error| Err(std::io::Error::other(format!("join: {error}"))));
+
+    let addresses = match resolved {
+        Ok(addresses) if !addresses.is_empty() => addresses,
+        Ok(_) => {
+            return row(
+                Outcome::Fail,
+                format!("\"{host}:{port}\" resolves to no address"),
+            );
+        }
+        Err(error) => {
+            return row(
+                Outcome::Fail,
+                format!("cannot resolve \"{host}:{port}\": {error}"),
+            );
+        }
+    };
+
+    let timeout = Duration::from_secs(5);
+    for address in &addresses {
+        match tokio::time::timeout(timeout, TokioTcpStream::connect(address)).await {
+            Ok(Ok(_)) => {
+                return row(
+                    Outcome::Pass,
+                    format!("proxy reachable at {host}:{port}; upstream not contacted"),
+                );
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return row(
+                    Outcome::Fail,
+                    format!("connection refused at {host}:{port}"),
+                );
+            }
+            _ => continue,
+        }
+    }
+    row(
+        Outcome::Fail,
+        format!("no address for \"{host}:{port}\" accepted a connection within {timeout:?}"),
+    )
+}
+
 /// The one-token probe: a `max_tokens = 1` request through the real
 /// transport with the provider's own credential, classified by what the
 /// upstream answers.
@@ -278,24 +372,35 @@ async fn probe_check(provider: &ProviderConfig, config: &AppConfig) -> CheckOutc
         extra_headers: std::collections::HashMap::new(),
         forwarded_headers: std::collections::HashMap::new(),
     };
-    let client =
-        match llm_proxy_transport::ProxyClient::try_with_timeouts(&config.server.upstream_timeouts)
-        {
-            Ok(client) => client,
-            Err(error) => {
-                return CheckOutcome {
-                    provider: provider.name.clone(),
-                    check,
-                    outcome: Outcome::Fail,
-                    detail: format!("building the transport client failed: {error}"),
-                    fix: Some(
-                        "check the [server.upstream_timeouts] phases and the proxy/TLS \
-                         environment reqwest builds under"
-                            .to_owned(),
-                    ),
-                };
-            }
-        };
+    // The probe takes the same egress path as the server
+    // (`build_egress_clients`), so it tests the route real traffic takes.
+    let client = if let Some(egress) = &provider.egress {
+        llm_proxy_transport::ProxyClient::try_with_egress_proxy_and_timeouts(
+            &egress.proxy,
+            &config.server.upstream_timeouts,
+        )
+    } else {
+        llm_proxy_transport::ProxyClient::try_with_timeouts(&config.server.upstream_timeouts)
+    };
+    let client = match client {
+        Ok(client) => client,
+        Err(error) => {
+            let fix = if provider.egress.is_some() {
+                "check the [provider.egress] proxy URL; the probe builds the same egress \
+                 client as the server"
+            } else {
+                "check the [server.upstream_timeouts] phases and the proxy/TLS \
+                 environment reqwest builds under"
+            };
+            return CheckOutcome {
+                provider: provider.name.clone(),
+                check,
+                outcome: Outcome::Fail,
+                detail: format!("building the transport client failed: {error}"),
+                fix: Some(fix.to_owned()),
+            };
+        }
+    };
     let detail_prefix = format!(
         "model {model} at {}",
         endpoint_without_query(&adapter.endpoint)
@@ -393,7 +498,16 @@ fn probe_model(provider: &ProviderConfig, protocol: &str) -> String {
     }
 }
 
-/// The `host:port` of an endpoint URL with scheme-derived default port.
+/// The `host:port` of the provider's `[provider.egress]` proxy — the
+/// address reachability checks instead of the upstream. Userinfo is
+/// stripped (`host_port`), so no credential can reach a detail line.
+fn proxy_endpoint(provider: &ProviderConfig) -> Option<(String, u16)> {
+    host_port(&provider.egress.as_ref()?.proxy)
+}
+
+/// The `host:port` of an endpoint or proxy URL with scheme-derived default
+/// port: `https` 443, `http` 80, and the egress schemes `socks5h`/`socks5`
+/// 1080 (`[provider.egress]` accepts all four).
 fn host_port(endpoint: &str) -> Option<(String, u16)> {
     let (scheme, rest) = endpoint.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
@@ -401,6 +515,7 @@ fn host_port(endpoint: &str) -> Option<(String, u16)> {
     let default_port = match scheme {
         "https" => 443,
         "http" => 80,
+        "socks5h" | "socks5" => 1080,
         _ => return None,
     };
     let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
@@ -437,8 +552,16 @@ pub async fn cmd_doctor(config_path: Option<&Path>, probe: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn write_config(dir: &std::path::Path, endpoint: &str, name: &str) -> std::path::PathBuf {
+    fn write_config(
+        dir: &std::path::Path,
+        endpoint: &str,
+        name: &str,
+        egress: Option<&str>,
+    ) -> std::path::PathBuf {
         std::fs::create_dir_all(dir.join("providers")).expect("providers dir");
+        let egress_section = egress
+            .map(|proxy| format!("\n[provider.egress]\nproxy = \"{proxy}\"\n"))
+            .unwrap_or_default();
         std::fs::write(
             dir.join("providers/probe.toml"),
             format!(
@@ -446,7 +569,7 @@ mod tests {
 name = "{name}"
 api_key = "doctor-test-key"
 auth_style = "x-api-key"
-[provider.adapters.chat]
+{egress_section}[provider.adapters.chat]
 protocol = "openai_chat_completions"
 endpoint = "{endpoint}"
 [provider.adapters.messages]
@@ -501,7 +624,7 @@ server_name = "doctor-test"
     async fn a_live_upstream_passes_both_checks() {
         let endpoint = spawn_upstream(200).await;
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &endpoint, "healthy");
+        let path = write_config(dir.path(), &endpoint, "healthy", None);
         let report = run_doctor(Some(&path), true).await.expect("doctor runs");
         assert!(
             report.all_passed(),
@@ -525,7 +648,7 @@ server_name = "doctor-test"
     async fn rejected_credentials_fail_with_a_named_fix() {
         let endpoint = spawn_upstream(401).await;
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &endpoint, "badkey");
+        let path = write_config(dir.path(), &endpoint, "badkey", None);
         let report = run_doctor(Some(&path), true).await.expect("doctor runs");
         let probe = report
             .rows
@@ -545,7 +668,7 @@ server_name = "doctor-test"
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &format!("http://{addr}/v1/x"), "dead");
+        let path = write_config(dir.path(), &format!("http://{addr}/v1/x"), "dead", None);
         let report = run_doctor(Some(&path), false).await.expect("doctor runs");
         let reach = report
             .rows
@@ -560,13 +683,67 @@ server_name = "doctor-test"
         );
     }
 
+    /// Plan 07 step 9: a provider with `[provider.egress]` is served through
+    /// its proxy, so reachability must check the proxy hop instead of the
+    /// (possibly proxy-only DNS) upstream. The detail names the proxy, never
+    /// the unreachable upstream.
+    #[tokio::test]
+    async fn an_egress_provider_is_checked_through_its_proxy() {
+        // A live loopback listener stands in for the egress proxy: doctor
+        // verifies the TCP hop, whatever speaks on the other end.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "https://unresolvable.invalid/v1/chat/completions",
+            "egress",
+            Some(&format!("http://{proxy_addr}")),
+        );
+        let report = run_doctor(Some(&path), false).await.expect("doctor runs");
+        let reach = report
+            .rows
+            .iter()
+            .find(|row| row.check.starts_with("reachability chat"))
+            .expect("reachability ran");
+        assert_eq!(reach.outcome, Outcome::Pass, "{}", report.render());
+        assert!(
+            !reach.detail.contains("unresolvable.invalid"),
+            "the row checks the proxy, not the upstream: {}",
+            reach.detail
+        );
+
+        // A proxy port with nothing listening is a FAIL whose fix names
+        // the [provider.egress] section.
+        drop(listener);
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "https://unresolvable.invalid/v1/chat/completions",
+            "dead-proxy",
+            Some(&format!("http://{proxy_addr}")),
+        );
+        let report = run_doctor(Some(&path), false).await.expect("doctor runs");
+        let reach = report
+            .rows
+            .iter()
+            .find(|row| row.check.starts_with("reachability chat"))
+            .expect("reachability ran");
+        assert_eq!(reach.outcome, Outcome::Fail, "{}", report.render());
+        let fix = reach.fix.as_deref().expect("the failure carries a fix");
+        assert!(
+            fix.contains("provider.egress"),
+            "the fix names the egress section: {fix}"
+        );
+    }
+
     #[tokio::test]
     async fn every_row_is_a_pass_or_carries_a_named_fix() {
         // The Done-when property itself, on a mixed report: PASS rows carry
         // no fix; everything else does.
         let endpoint = spawn_upstream(404).await;
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), &endpoint, "odd");
+        let path = write_config(dir.path(), &endpoint, "odd", None);
         let report = run_doctor(Some(&path), true).await.expect("doctor runs");
         assert!(!report.rows.is_empty());
         for row in &report.rows {
@@ -638,6 +815,59 @@ chat_completions = "chat"
             probe_model(&provider, "openai_chat_completions"),
             "aa-model",
             "without aliases the probe names the first priced model by name"
+        );
+    }
+
+    /// The egress-proxy helper accepts all four `[provider.egress]` schemes
+    /// with their default ports, and a URL with userinfo yields the bare
+    /// `host:port` — no credential in any output.
+    #[test]
+    fn proxy_endpoint_parses_all_four_schemes_and_strips_userinfo() {
+        let proxy_for = |proxy: &str| {
+            toml::from_str::<llm_proxy_core::ProviderFile>(&format!(
+                r#"[provider]
+name = "egress-parse"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+[provider.routes]
+chat_completions = "chat"
+[provider.egress]
+proxy = "{proxy}"
+"#
+            ))
+            .expect("provider parses")
+            .provider
+        };
+
+        assert_eq!(
+            proxy_endpoint(&proxy_for("socks5h://exit.example:1080")),
+            Some(("exit.example".to_owned(), 1080)),
+        );
+        assert_eq!(
+            proxy_endpoint(&proxy_for("socks5://exit.example")),
+            Some(("exit.example".to_owned(), 1080)),
+            "socks5 defaults to port 1080"
+        );
+        assert_eq!(
+            proxy_endpoint(&proxy_for("http://exit.example")),
+            Some(("exit.example".to_owned(), 80)),
+            "http defaults to port 80"
+        );
+        assert_eq!(
+            proxy_endpoint(&proxy_for("https://exit.example:8443")),
+            Some(("exit.example".to_owned(), 8443)),
+        );
+
+        let userinfo = proxy_endpoint(&proxy_for("socks5h://user:pw@h:1081"))
+            .expect("a userinfo proxy parses to its host:port");
+        assert_eq!(userinfo, ("h".to_owned(), 1081));
+        let rendered = format!("{userinfo:?}");
+        assert!(
+            !rendered.contains("pw"),
+            "no secret in any output: {rendered}"
         );
     }
 }

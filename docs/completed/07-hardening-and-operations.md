@@ -80,8 +80,9 @@ All eleven steps landed, each with regression tests:
 8. `/usage/requests` rows carry a derived `state`
    (`in_flight`/`failed`/`completed`) and in-flight rows carry `elapsed_ms`
    measured at query time.
-9. `llm-proxy doctor [--probe]` — DNS/TCP reachability per endpoint, plus an
-   opt-in one-token probe through the real transport; every non-PASS row
+9. `llm-proxy doctor [--probe]` — DNS/TCP reachability per endpoint (at the
+   `[provider.egress]` proxy for an egress provider), plus an opt-in one-token
+   probe through the real transport (egress proxy included); every non-PASS row
    names its fix; failures exit 1.
 10. `llm_proxy_engine::SwappingConfigSource` — whole-snapshot swaps, never
     merges; one stated precedence documented on the `ConfigSource` trait;
