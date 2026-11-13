@@ -117,12 +117,8 @@ pub struct Proxy {
 impl Proxy {
     #[napi(constructor)]
     pub fn new(config: Value) -> Result<Self> {
-        let bridge = Bridge::from_json(&config).map_err(|error| {
-            Error::new(
-                Status::GenericFailure,
-                format!("{}: {}", error.kind, error.message),
-            )
-        })?;
+        let bridge = Bridge::from_json(&config)
+            .map_err(|error| Error::new(Status::GenericFailure, error_json(&error)))?;
         Ok(Self {
             bridge: Arc::new(bridge),
         })

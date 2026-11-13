@@ -39,6 +39,20 @@ function unwrap(result) {
   return result.response;
 }
 
+// The native layer throws a napi error whose message is the JSON-encoded
+// failure info (see src/lib.rs); keep it structured. A message that is not
+// JSON (a napi type error, e.g. a config value that cannot be represented as
+// JSON) is rethrown unchanged.
+function toProxyError(error) {
+  let info;
+  try {
+    info = JSON.parse(error.message);
+  } catch {
+    throw error;
+  }
+  return new ProxyError(info);
+}
+
 class Stream {
   constructor(nativeStream) {
     this._native = nativeStream;
@@ -97,7 +111,11 @@ if (Symbol.asyncDispose) {
 
 class Proxy {
   constructor(config) {
-    this._native = new native.Proxy(config);
+    try {
+      this._native = new native.Proxy(config);
+    } catch (error) {
+      throw toProxyError(error);
+    }
   }
 
   async execute(provider, dialect, body, options) {
@@ -109,15 +127,7 @@ class Proxy {
     try {
       stream = await this._native.executeStream(provider, dialect, body, options);
     } catch (error) {
-      // The native layer throws a napi error whose message is the JSON
-      // encoded failure info (see src/lib.rs); keep it structured.
-      let info;
-      try {
-        info = JSON.parse(error.message);
-      } catch {
-        throw error;
-      }
-      throw new ProxyError(info);
+      throw toProxyError(error);
     }
     return new Stream(stream);
   }

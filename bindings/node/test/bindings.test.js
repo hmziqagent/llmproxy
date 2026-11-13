@@ -281,6 +281,45 @@ test('failures throw ProxyError with status and kind', async () => {
   }
 });
 
+// A configuration mistake made in the constructor must surface as the same
+// ProxyError every other failure uses (with kind and status), not as a plain
+// Error. A config value napi cannot even represent as JSON (here: undefined)
+// still surfaces as the raw napi type error — only JSON-parseable failures
+// become ProxyErrors.
+test('constructor config errors are ProxyErrors', () => {
+  assert.throws(
+    () =>
+      new Proxy({
+        providers: [
+          {
+            name: 'broken',
+            api_key: 'k',
+            auth_style: 'bearer',
+            adapters: { a: { protocol: 'carrier-pigeon', endpoint: 'http://127.0.0.1:1' } },
+            routes: { messages: 'a' },
+          },
+        ],
+      }),
+    (error) => {
+      assert.ok(error instanceof ProxyError);
+      assert.equal(error.kind, 'InvalidConfig');
+      assert.equal(typeof error.status, 'number');
+      return true;
+    }
+  );
+  assert.throws(
+    () => new Proxy({ providers: [], request_timeout_secs: 0 }),
+    (error) => {
+      assert.ok(error instanceof ProxyError);
+      assert.equal(error.kind, 'InvalidConfig');
+      assert.equal(error.status, 500);
+      assert.equal(error.message, 'request_timeout_secs must be at least 1');
+      return true;
+    }
+  );
+  assert.throws(() => new Proxy(undefined), (error) => !(error instanceof ProxyError));
+});
+
 // request_timeout_secs bounds the whole request: an upstream that accepts
 // the connection and then stalls for 30 s must surface as a ProxyError
 // within the budget, not wait out the stall.

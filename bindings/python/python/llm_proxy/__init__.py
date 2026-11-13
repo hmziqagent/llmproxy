@@ -120,7 +120,13 @@ class Proxy:
     """
 
     def __init__(self, config):
-        self._native = _NativeProxy(config)
+        try:
+            self._native = _NativeProxy(config)
+        except _NativeProxyError as error:
+            # The native constructor raises the raw exception class; unpack
+            # its tuple so config mistakes surface as the public ProxyError
+            # with kind and status, like every other failure.
+            raise _unpack(error) from None
 
     def execute(self, provider, dialect, body, options=None):
         """Run one non-streaming request end to end.

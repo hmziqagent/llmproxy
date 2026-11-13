@@ -236,6 +236,35 @@ def test_failures_raise_proxy_error_with_status_and_kind(shared=load_shared()):
     assert bad_body.value.kind == "InvalidRequest"
 
 
+def test_constructor_config_errors_are_proxy_errors():
+    """A configuration mistake made in the constructor must surface as the
+    same ProxyError every other failure uses (with kind and status), not as
+    the raw native exception class."""
+    bad_protocol = {
+        "providers": [
+            {
+                "name": "broken",
+                "api_key": "k",
+                "auth_style": "bearer",
+                "adapters": {
+                    "a": {"protocol": "carrier-pigeon", "endpoint": "http://127.0.0.1:1"}
+                },
+                "routes": {"messages": "a"},
+            }
+        ]
+    }
+    with pytest.raises(ProxyError) as unknown_protocol:
+        Proxy(bad_protocol)
+    assert unknown_protocol.value.kind == "InvalidConfig"
+    assert unknown_protocol.value.status == 500
+
+    with pytest.raises(ProxyError) as zero_timeout:
+        Proxy({"providers": [], "request_timeout_secs": 0})
+    assert zero_timeout.value.kind == "InvalidConfig"
+    assert zero_timeout.value.status == 500
+    assert zero_timeout.value.message == "request_timeout_secs must be at least 1"
+
+
 def test_request_timeout_is_enforced(shared=load_shared()):
     """``request_timeout_secs`` bounds the whole request: an upstream that
     accepts the connection and then stalls for 30 s must surface as a
