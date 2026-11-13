@@ -117,11 +117,6 @@ impl DiscoveryClient {
         self.send_once(self.http.get(url), max_bytes).await
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "the retry loop below runs at least once and every `continue` stores the \
-                  error, so `last_error` is always Some at the tail expression"
-    )]
     async fn fetch_page(
         &self,
         http: &Client,
@@ -132,15 +127,14 @@ impl DiscoveryClient {
             ProviderError::InvalidConfig("missing discovery configuration".to_owned())
         })?;
 
-        let mut last_error = None;
-        for attempt in 0..=Self::MAX_TRANSIENT_RETRIES {
-            if attempt > 0 {
-                tokio::time::sleep(Self::RETRY_BACKOFF).await;
-            }
+        let mut attempt = 0;
+        loop {
             let request = self.build_request(http, provider, discovery, url);
             match self.send_once(request, discovery.max_response_bytes).await {
-                Ok(value) => return Ok(value),
-                Err(error) if Self::is_transient(&error) => {
+                Ok(page) => return Ok(page),
+                Err(error)
+                    if Self::is_transient(&error) && attempt < Self::MAX_TRANSIENT_RETRIES =>
+                {
                     tracing::warn!(
                         provider = %provider.name,
                         attempt,
@@ -148,13 +142,12 @@ impl DiscoveryClient {
                         error = %error,
                         "transient discovery failure; retrying",
                     );
-                    last_error = Some(error);
-                    continue;
+                    attempt += 1;
+                    tokio::time::sleep(Self::RETRY_BACKOFF).await;
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(last_error.expect("retry loop ran at least once"))
     }
 
     /// Upper bound on retries after the first attempt for a transient failure;
@@ -917,6 +910,75 @@ mod tests {
                 .as_deref()
                 .is_some_and(|target| target.contains("upstream.invalid")),
             "the proxy stub must see the absolute upstream.invalid target, got {seen_target:?}"
+        );
+    }
+
+    async fn flaky_models(State(calls): State<Arc<AtomicUsize>>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let attempt = calls.fetch_add(1, Ordering::SeqCst);
+        if attempt < 2 {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+        }
+        Json(json!({"data": [{"id": "m"}]})).into_response()
+    }
+
+    async fn always_failing_models(
+        State(calls): State<Arc<AtomicUsize>>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        calls.fetch_add(1, Ordering::SeqCst);
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "down").into_response()
+    }
+
+    #[tokio::test]
+    async fn transient_failures_retry_exactly_max_times() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recovers = Router::new()
+            .route("/models", get(flaky_models))
+            .with_state(Arc::clone(&calls));
+        let endpoint = start_test_server(recovers).await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect("two transient failures must exhaust the retry budget and then succeed");
+        assert_eq!(models[0].id, "m");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize,
+            "a transient failure must be retried exactly MAX_TRANSIENT_RETRIES times"
+        );
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failing = Router::new()
+            .route("/models", get(always_failing_models))
+            .with_state(Arc::clone(&failures));
+        let endpoint = start_test_server(failing).await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+
+        let error = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect_err("persistent failure must surface after the retry budget");
+        assert!(
+            matches!(error, ProviderError::Api { ref status, .. } if (500..600).contains(status)),
+            "expected the last transient (5xx) error, got: {error}"
+        );
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize,
+            "no attempt may be made beyond 1 + MAX_TRANSIENT_RETRIES"
         );
     }
 }
