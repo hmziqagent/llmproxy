@@ -477,6 +477,149 @@ async fn modes_declare_what_a_guard_sees() {
     assert!(matches!(post_hoc.mode(), GuardMode::PostHoc));
 }
 
+/// A tracing subscriber that collects warn-level event messages, so the
+/// fail-open path's warning is observable in-process without racing other
+/// tests (thread-local dispatcher, no global state).
+#[derive(Debug, Default, Clone)]
+struct WarnCapture {
+    messages: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+struct WarnMessage {
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for WarnMessage {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = WarnMessage { message: None };
+        event.record(&mut visitor);
+        if let Some(message) = visitor.message {
+            self.messages.lock().expect("capture lock").push(message);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::Id) {}
+
+    fn exit(&self, _span: &tracing::Id) {}
+
+    fn clone_span(&self, id: &tracing::Id) -> tracing::Id {
+        id.clone()
+    }
+}
+
+/// A mask rule wired into a deny-only guard is a misconfiguration: the
+/// guard can never redact, so under `FailPolicy::Closed` the matching
+/// request is refused instead of passing unredacted with no signal.
+#[tokio::test]
+async fn a_mask_rule_in_a_deny_only_guard_is_refused_under_fail_closed() {
+    let rule = PatternRule::mask(r"sk-[a-z0-9]{8,}", "[REDACTED]").expect("rule");
+    let guard = Guardrail::deny_only(Arc::new(rule), FailPolicy::Closed);
+
+    match guard
+        .inspect_request(&core_request(false, "rotate sk-clientsecret77 now"))
+        .await
+    {
+        Err(EngineError::Internal(message)) => {
+            assert!(
+                message.contains("non-masking guard"),
+                "the refusal must name the misconfiguration, got {message}"
+            );
+        }
+        other => {
+            panic!("a mask rule in a deny-only guard must refuse under fail closed, got {other:?}")
+        }
+    }
+}
+
+/// The same misconfiguration under `FailPolicy::Open` keeps serving — but
+/// logs a warning, never a silent pass-through of text the rule wanted
+/// redacted.
+#[tokio::test]
+async fn a_mask_rule_in_a_deny_only_guard_is_allowed_with_a_warning_under_fail_open() {
+    let rule = PatternRule::mask(r"sk-[a-z0-9]{8,}", "[REDACTED]").expect("rule");
+    let guard = Guardrail::deny_only(Arc::new(rule), FailPolicy::Open);
+    let capture = WarnCapture::default();
+    let reader = capture.clone();
+    let _subscriber = tracing::subscriber::set_default(capture);
+
+    let decision = guard
+        .inspect_request(&core_request(false, "rotate sk-clientsecret77 now"))
+        .await;
+    assert!(
+        matches!(decision, Ok(GuardDecision::Allow)),
+        "fail open must serve the request, got {decision:?}"
+    );
+    let messages = reader.messages.lock().expect("capture lock").clone();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("failing open")),
+        "the misconfigured mask verdict must be logged, got {messages:?}"
+    );
+}
+
+/// A post-hoc guard with a mask rule masks the completed response — the
+/// response is finished, so masking is safe — and never touches requests.
+#[tokio::test]
+async fn a_post_hoc_masking_guard_masks_the_response() {
+    let rule = PatternRule::mask(r"sk-[a-z0-9]{8,}", "[REDACTED]").expect("rule");
+    let guard = Guardrail::post_hoc(Arc::new(rule), FailPolicy::Closed);
+
+    let mut response = core_response("the upstream saw sk-upstreamsecret99");
+    guard.inspect_response(&response).await.expect("allowed");
+    guard
+        .transform_response(&mut response)
+        .await
+        .expect("masked");
+    match response.content.first() {
+        Some(CoreContent::Text { text, .. }) => {
+            assert!(!text.contains("sk-upstreamsecret99"), "got {text}");
+            assert!(text.contains("[REDACTED]"), "got {text}");
+        }
+        other => panic!("text block expected, got {other:?}"),
+    }
+
+    let mut request = core_request(false, "rotate sk-clientsecret77 now");
+    guard
+        .transform_request(&mut request)
+        .await
+        .expect("untouched");
+    assert_eq!(
+        request_texts(&request).collect::<Vec<_>>(),
+        request_texts(&core_request(false, "rotate sk-clientsecret77 now")).collect::<Vec<_>>(),
+        "a post-hoc guard never touches the request"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Through a real engine against a loopback upstream.
 

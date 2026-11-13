@@ -15,7 +15,11 @@
 //!   A match can straddle two stream chunks, and this crate does not yet
 //!   carry per-request masking state, so **a masking guard rejects
 //!   streaming requests instead of masking them unsafely** — the plan 09
-//!   rule. Deny-only guards let streams through.
+//!   rule. Deny-only guards let streams through. A rule that answers
+//!   [`GuardVerdict::Mask`] under a guard that cannot rewrite text
+//!   (deny-only) is a misconfiguration, decided by the guard's fail
+//!   policy rather than a silent pass-through; a post-hoc guard applies
+//!   mask verdicts to the completed response.
 //!
 //! The crate is opt-in: it never becomes a dependency of the engine, the
 //! server or the daemon. Embedders add guards through
@@ -40,9 +44,11 @@ use llm_proxy_protocol::core::{CoreRequest, CoreResponse};
 pub enum GuardMode {
     /// Before egress: inspects (and may reject) the request only.
     PreCall,
-    /// After completion: inspects (and may reject or mask) the response
-    /// only. Streams skip the guard's verdict — a PostHoc rule that must
-    /// see every output belongs in [`GuardMode::Buffered`].
+    /// After completion: inspects (and may reject or mask) the completed
+    /// response only. Responses are finished when it sees them, so a mask
+    /// verdict is applied here; requests are never inspected or rewritten.
+    /// Streams skip the guard's verdict — a PostHoc rule that must see
+    /// every output belongs in [`GuardMode::Buffered`].
     PostHoc,
     /// Both sides, with masking: the request is redacted before egress
     /// and the completed response before the client sees it. Streaming
@@ -105,7 +111,10 @@ pub struct Guardrail {
 }
 
 impl Guardrail {
-    /// A deny-only guard: it never rewrites text, so streams may pass.
+    /// A deny-only guard: it never rewrites text, so streams may pass. A
+    /// rule that answers [`GuardVerdict::Mask`] is a misconfiguration
+    /// here — the guard cannot redact — and the verdict is decided by the
+    /// [`FailPolicy`].
     #[must_use]
     pub fn deny_only(rule: Arc<dyn GuardRule>, fail_policy: FailPolicy) -> Self {
         Self {
@@ -127,7 +136,8 @@ impl Guardrail {
         }
     }
 
-    /// A post-hoc guard: completed responses only.
+    /// A post-hoc guard: completed responses only, which it may reject or
+    /// mask; requests pass untouched.
     #[must_use]
     pub fn post_hoc(rule: Arc<dyn GuardRule>, fail_policy: FailPolicy) -> Self {
         Self {
@@ -215,6 +225,15 @@ impl Guard for Guardrail {
                 Ok(GuardVerdict::Reject(message)) => {
                     return Ok(GuardDecision::Reject(message));
                 }
+                // A guard that cannot rewrite text cannot honour a mask
+                // verdict: leaving the text unredacted with no signal is
+                // a data-leak failure mode, so the misconfiguration is
+                // decided by the fail policy instead.
+                Ok(GuardVerdict::Mask(_)) if self.mode != GuardMode::Buffered => {
+                    return self.rule_failure(&RuleError(
+                        "mask verdict from a non-masking guard".to_owned(),
+                    ));
+                }
                 Ok(GuardVerdict::Mask(_)) => {}
                 Err(error) => return self.rule_failure(&error),
             }
@@ -264,7 +283,9 @@ impl Guard for Guardrail {
     }
 
     async fn transform_response(&self, response: &mut CoreResponse) -> Result<(), EngineError> {
-        if self.mode != GuardMode::Buffered {
+        // Responses are complete when a post-hoc guard sees them, so
+        // masking is safe there: no chunk-boundary state to carry.
+        if self.mode == GuardMode::PreCall {
             return Ok(());
         }
         mask_response_texts(response, |text| async {
