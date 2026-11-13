@@ -18,5 +18,7 @@ with the official Windows node.exe and embeddable CPython (the full Node
 contract suite and the Python driver both pass; see the package READMEs);
 the Node package also carries an msvc binary (cargo-xwin), verified the same
 way. macOS artifacts are produced by zig cross-compilation (universal2 for
-both packages) and verified structurally; on-macOS install and contract
-runs happen in CI (the `bindings-macos` job).
+the Python wheel) and verified structurally. CI builds the Node binaries per
+platform and runs the contract suite against them on the native legs
+(`.github/workflows/node-binaries.yml`); every Python wheel is
+install-tested by `.github/workflows/python-wheels.yml`.

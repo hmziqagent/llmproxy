@@ -81,8 +81,9 @@ the engine and add no logic of their own, so they start once its API has stopped
   is checked to be `abi3`, and each OS wheel is pip-installed into a fresh
   venv (no Rust toolchain in the job) on ubuntu-22.04, windows-latest and
   macos-15 for CPython 3.9 and 3.13, with the pytest suite run against the
-  install; the `bindings-macos` job covers the Node binding only. aarch64
-  Windows is not built: it is optional and unverified.
+  install. The Node binaries are built per platform by
+  `.github/workflows/node-binaries.yml`. aarch64 Windows is not built: it
+  is optional and unverified.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
@@ -91,17 +92,17 @@ the engine and add no logic of their own, so they start once its API has stopped
   `ProxyError`s and an async-iterable `Stream` whose `cancel()` settles as
   `ClientCancelled`, whose iterator `return()` cancels on a `for await`
   early exit (`break` or a throw in the loop body) and which defines
-  `Symbol.asyncDispose` for `await using` on runtimes that have it. 22
-  `node --test` tests pass; `npm install` of the
-  packed tarball (`npm pack` → `freeoxide-llm-proxy-0.1.0.tgz`) loads the
-  prebuilt `llm-proxy.linux-x64-gnu.node` with no Rust toolchain. A
+  `Symbol.asyncDispose` for `await using` on runtimes that have it. The
+  `node --test` suite passes; the main npm package ships the loader
+  (`binding.js`/`binding.d.ts`) plus one optional
+  `@freeoxide/llm-proxy-<platform>` dependency per `napi.targets` entry
+  (the `npm/<platform>/` scaffolding is committed), so `npm install` pulls
+  the prebuilt binary for the running platform with no Rust toolchain. A
   Windows x64 binary (`llm-proxy.win32-x64-gnu.node`) is produced by
   mingw-w64 cross-compilation — the napi import library generated from the
   official `node.exe` exports (objdump export table → dlltool) — and
-  run-verified: the full 14-test contract suite passes under wine 10.0 with
-  the official node-v20.19.2 win-x64 `node.exe`, and `index.js` gained a
-  fallback that loads the gnu binary when the generated loader's msvc-first
-  path finds no msvc binary (official node.exe is MSVC-built). The npm name
+  run-verified: the full contract suite passed under wine 10.0 with the
+  official node-v20.19.2 win-x64 `node.exe`. The npm name
   is scoped
   (`@freeoxide/llm-proxy`) because the unscoped `llm-proxy` on npm belongs
   to an unrelated package. An msvc binary
@@ -109,17 +110,16 @@ the engine and add no logic of their own, so they start once its API has stopped
   cross-compilation (the MSVC CRT/SDK libraries are fetched from Microsoft;
   on msvc the napi symbols resolve dynamically from the host node.exe at
   load, so no node import library is needed) and run-verified the same way:
-  13/13 with only the msvc binary present, 13/13 with both Windows binaries
-  present, 13/13 through the gnu fallback (the suite held 13 tests when
-  these Windows runs were made; it has since grown to 14). The macOS
-  binary is a
-  darwin-universal build produced by zig cross-compilation (`cargo zigbuild
-  --target universal2-apple-darwin`): structurally verified as a fat
-  `x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
-  host node at load. On-macOS verification runs in CI: the `bindings-macos`
-  job builds the universal binary on a macOS runner, runs the contract
-  suite against it, and installs the packed npm tarball into a scratch
-  project (no Rust toolchain) as a load smoke test.
+  with only the msvc binary present, and with both Windows binaries
+  present. Every platform binary (`llm-proxy.<platform>.node` for the seven
+  `napi.targets` triples: darwin x64/arm64, Linux x64/arm64-gnu, Linux
+  x64-musl, Windows x64/arm64-msvc) is built in CI by
+  `.github/workflows/node-binaries.yml`; its native legs run the contract
+  suite against the uploaded artifacts (linux-x64-gnu, win32-x64-msvc,
+  darwin-arm64) and its cross-built legs are install-only. The darwin
+  per-arch packages replace the old darwin-universal binary: the
+  `bindings-macos` CI job and the msvc/gnu `require` fallback in `index.js`
+  were removed with the native msvc CI build.
 - **Shared tests (step 4).** `bindings/shared/cases.json` holds the shared
   cases: the plan-02 contract fixtures (Claude Code, the Anthropic SDK, the
   OpenAI SDK, Codex — captured and synthesized; provenance in the fixture

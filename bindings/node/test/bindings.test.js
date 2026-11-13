@@ -722,6 +722,17 @@ test('completing the loop normally does not cancel', async () => {
   }
 });
 
+// The CI binary legs (node-binaries.yml) run this suite against downloaded
+// prebuilt binaries; if the loader cannot find or load its platform binary,
+// every test in this file dies on the module require — this one exists so
+// that failure names the export surface directly.
+test('the installed package exports the surface', () => {
+  const pkg = require('..');
+  assert.equal(typeof pkg.Proxy, 'function');
+  assert.equal(typeof pkg.ProxyError, 'function');
+  assert.equal(typeof pkg.Stream, 'function');
+});
+
 test('usage events record the lifecycle when opted in', async () => {
   const upstream = await startUpstream(shared.upstream_responses.anthropic_json);
   try {

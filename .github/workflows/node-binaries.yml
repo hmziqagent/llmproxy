@@ -1,0 +1,168 @@
+name: Node binaries
+
+# Plan 10 item 10-11: every @napi-rs target in bindings/node/package.json
+# (napi.targets) is built in CI as a prebuilt llm-proxy.<platform>.node
+# artifact, and the main package ships the loader (binding.js/binding.d.ts)
+# plus optionalDependencies on one @freeoxide/llm-proxy-<platform> package
+# per target (napi pre-publish regenerates that list at publish time; the
+# npm/<platform>/ scaffolding is committed). The three native legs also run
+# the full Node contract suite against the artifact they built; the
+# cross-built legs are install-only: their binaries are uploaded and
+# install-tested by consumers, but not executed here. Cross-compilation
+# invocations for the pinned CLI (@napi-rs/cli 3.10.12): --use-napi-cross
+# drives the @napi-rs/cross-toolchain compilers shipped with the CLI for
+# both the aarch64-gnu and the x86_64-musl Linux targets, and a --target
+# build on a foreign triple never generates the loader files, so the
+# linux-x64-gnu leg builds it with a plain `npm run build`. The release
+# workflow (10-13) reuses this file through workflow_call.
+on:
+  pull_request:
+    paths:
+      - "bindings/node/**"
+      - "bindings/shared/**"
+      - "crates/**"
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: binary (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            build_mode: native-with-loader
+            build_targets: x86_64-unknown-linux-gnu
+            artifact: node-binary-linux-x64-gnu
+          # cross-built with @napi-rs/cross-toolchain; install-only, not run
+          - name: linux-aarch64-gnu
+            os: ubuntu-22.04
+            build_mode: napi-cross
+            build_targets: aarch64-unknown-linux-gnu
+            artifact: node-binary-linux-aarch64-gnu
+          # cross-built with @napi-rs/cross-toolchain; install-only, not run
+          - name: linux-x64-musl
+            os: ubuntu-22.04
+            build_mode: napi-cross
+            build_targets: x86_64-unknown-linux-musl
+            artifact: node-binary-linux-x64-musl
+          - name: darwin-x64-and-arm64
+            os: macos-15
+            build_mode: darwin
+            build_targets: x86_64-apple-darwin,aarch64-apple-darwin
+            artifact: node-binary-darwin
+          - name: win32-x64-and-arm64-msvc
+            os: windows-latest
+            build_mode: win32
+            build_targets: x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
+            artifact: node-binary-win32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          targets: ${{ matrix.build_targets }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install pinned dependencies
+        working-directory: bindings/node
+        run: npm ci
+      - name: Build ${{ matrix.name }} (cargo writes under target/<triple>/release; napi copies the artifact out)
+        working-directory: bindings/node
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ matrix.build_mode }}" = "native-with-loader" ]; then
+            npx napi build --platform --release --target ${{ matrix.build_targets }}
+            # A --target build skips the loader files; this host triple equals
+            # the target above, so this rebuild is incremental and produces
+            # binding.js/binding.d.ts for the main package.
+            npm run build
+          elif [ "${{ matrix.build_mode }}" = "napi-cross" ]; then
+            npx napi build --platform --release --target ${{ matrix.build_targets }} --use-napi-cross
+          elif [ "${{ matrix.build_mode }}" = "darwin" ]; then
+            npx napi build --platform --release --target x86_64-apple-darwin
+            npx napi build --platform --release --target aarch64-apple-darwin
+          else
+            npx napi build --platform --release --target x86_64-pc-windows-msvc
+            npx napi build --platform --release --target aarch64-pc-windows-msvc
+          fi
+          ls -la *.node
+      - name: List the artifact names in the run summary
+        working-directory: bindings/node
+        shell: bash
+        run: |
+          {
+            echo "### binaries (${{ matrix.name }})"
+            for f in *.node; do
+              echo "- \`$f\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the prebuilt binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bindings/node/*.node
+          if-no-files-found: error
+      - name: Upload the generated loader for the main package
+        if: matrix.build_mode == 'native-with-loader'
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-loader
+          path: |
+            bindings/node/binding.js
+            bindings/node/binding.d.ts
+          if-no-files-found: error
+
+  # The native legs of the plan done-when: node --test green against the
+  # uploaded artifacts on linux-x64-gnu, win32-x64-msvc and darwin-arm64.
+  # No Rust toolchain is installed in this job: the suite runs from the
+  # loader and binary artifacts alone (10-12 adds the enforced no-cargo
+  # guard for this path). The cross-built legs (linux-aarch64-gnu,
+  # linux-x64-musl, win32-arm64-msvc) are install-only and are not run here.
+  test:
+    name: node --test (${{ matrix.name }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            binary_artifact: node-binary-linux-x64-gnu
+          - name: win32-x64-msvc
+            os: windows-latest
+            binary_artifact: node-binary-win32
+          - name: darwin-arm64
+            os: macos-15
+            binary_artifact: node-binary-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install pinned dependencies
+        working-directory: bindings/node
+        run: npm ci
+      - name: Download the generated loader
+        uses: actions/download-artifact@v4
+        with:
+          name: node-loader
+          path: bindings/node
+      - name: Download the platform binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary_artifact }}
+          path: bindings/node
+      - name: Run the contract suite against the shipped artifacts
+        working-directory: bindings/node
+        run: node --test test/

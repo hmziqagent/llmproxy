@@ -1,0 +1,19 @@
+{
+  "name": "@freeoxide/llm-proxy-win32-x64-msvc",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "llm-proxy.win32-x64-msvc.node",
+  "files": [
+    "llm-proxy.win32-x64-msvc.node"
+  ],
+  "description": "Node bindings for the llm-proxy engine: translation, request execution, streaming and configuration from code.",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@freeoxide/llm-proxy-linux-x64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "llm-proxy.linux-x64-gnu.node",
+  "files": [
+    "llm-proxy.linux-x64-gnu.node"
+  ],
+  "description": "Node bindings for the llm-proxy engine: translation, request execution, streaming and configuration from code.",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

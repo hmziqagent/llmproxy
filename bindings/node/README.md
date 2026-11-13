@@ -17,6 +17,15 @@ toolchain is needed at install time:
 npm install @freeoxide/llm-proxy
 ```
 
+The main package ships the loader (`binding.js`/`binding.d.ts`) and declares
+one optional dependency per supported platform
+(`@freeoxide/llm-proxy-<platform>`, listed in `package.json`); npm installs
+only the one matching the running platform, and the loader requires from it
+when no binary sits next to the package. Every platform binary is built in
+CI by `.github/workflows/node-binaries.yml`, which also runs the contract
+suite against the built binaries on the native legs (Linux x64-gnu,
+Windows x64-msvc, macOS arm64).
+
 The local build produces the Linux binary
 (`llm-proxy.linux-x64-gnu.node`). A Windows x64 binary
 (`llm-proxy.win32-x64-gnu.node`) is produced by mingw-w64 cross-compilation:
@@ -28,9 +37,7 @@ the napi import library is generated from the official `node.exe` exports
 
 (`RUSTC_WRAPPER=` disables the host's rustc cache, which does not handle
 cross-compiler names.) The Windows binary links against `node.exe`'s
-`napi_*` exports; `index.js` falls back to it when the generated loader's
-msvc-first path finds no msvc binary (official node.exe is MSVC-built, and
-the gnu binary loads there too — the napi boundary is a plain C ABI).
+`napi_*` exports.
 Run-verified under wine 10.0 with the official node-v20.19.2 win-x64
 `node.exe`:
 
@@ -44,21 +51,8 @@ symbols resolve dynamically from the host `node.exe` at load):
     RUSTC_WRAPPER= cargo xwin build --release --target x86_64-pc-windows-msvc
     # llm_proxy_node.dll -> llm-proxy.win32-x64-msvc.node
 
-Run-verified the same way: 13/13 with only the msvc binary present, 13/13
-with both Windows binaries present, and 13/13 through the `index.js` gnu
-fallback.
-
-A macOS binary (`llm-proxy.darwin-universal.node`) is produced by zig
-cross-compilation — `RUSTC_WRAPPER= cargo zigbuild --release --target
-universal2-apple-darwin`, then the resulting `libllm_proxy_node.dylib` is
-copied under its loader name (zig supplies the macOS libc stubs; `llvm-lipo`
-as `lipo` merges the x86_64 and arm64 slices). Statically verified: a fat
-`x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
-host node at load (`-undefined dynamic_lookup`) and which links only system
-libraries. macOS runs happen in CI: the `bindings-macos` job builds the
-universal binary on a macOS runner, runs the full contract suite against it
-and installs the packed tarball into a scratch project with no Rust
-toolchain.
+Run-verified the same way: 13/13 with only the msvc binary present, and
+13/13 with both Windows binaries present.
 
 ## Use
 

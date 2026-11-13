@@ -4,21 +4,10 @@
 // native structured results into thrown ProxyErrors and an async-iterable
 // stream. No engine logic lives here.
 
-let native;
-try {
-  native = require('./binding.js');
-} catch (error) {
-  // The generated loader prefers the msvc binary and only tries the gnu one
-  // on GNU-built node distributions; this package ships both, so fall back
-  // to the gnu binary before giving up when the msvc path finds nothing
-  // (the gnu binary loads in MSVC-built node too — the napi boundary is a
-  // plain C ABI).
-  try {
-    native = require('./llm-proxy.win32-x64-gnu.node');
-  } catch {
-    throw error;
-  }
-}
+// The generated loader resolves this platform's prebuilt binary from the
+// package directory or from the matching @freeoxide/llm-proxy-<platform>
+// package (node-binaries.yml builds one per napi.targets entry).
+const native = require('./binding.js');
 
 class ProxyError extends Error {
   constructor(info) {
