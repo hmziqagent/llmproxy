@@ -186,12 +186,12 @@ jobs:
           staged=0
           for dir in npm/*/; do
             platform="$(basename "$dir")"
-            binary="llm-proxy.${platform}.node"
-            if [ ! -f "../binaries/${binary}" ]; then
-              echo "::error::no built binary for platform ${platform}: expected ../binaries/${binary}"
-              exit 1
-            fi
-            cp "../binaries/${binary}" "npm/${platform}/${binary}"
+          binary="llm-proxy.${platform}.node"
+          if [ ! -f "../../binaries/${binary}" ]; then
+            echo "::error::no built binary for platform ${platform}: expected ../../binaries/${binary}"
+            exit 1
+          fi
+          cp "../../binaries/${binary}" "npm/${platform}/${binary}"
             echo "staged npm/${platform}/${binary}"
             staged=$((staged + 1))
           done
