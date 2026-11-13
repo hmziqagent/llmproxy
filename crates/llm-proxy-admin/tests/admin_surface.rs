@@ -486,3 +486,80 @@ fn mcp_post(body: String, header_method: Option<&str>, header_name: Option<&str>
     }
     builder.body(Body::from(body)).expect("request builds")
 }
+
+/// The token-gated `/metrics` route (plan 07 step 7): the Prometheus
+/// exposition of the live runtime counters, behind the same admin token
+/// as every other route on the surface, answering a scraper's
+/// `text/plain` content type and never cacheable.
+#[tokio::test]
+async fn metrics_route_serves_prometheus_text_behind_the_admin_token() {
+    let metrics = Arc::new(llm_proxy_core::Metrics::new());
+    metrics.record_request(false);
+    metrics.record_failure();
+    let app = AdminSurface::new(ADMIN_TOKEN)
+        .metrics(Arc::clone(&metrics))
+        .router();
+
+    // No or wrong token: the same 401 as every other admin route.
+    for token in [None, Some("wrong-token")] {
+        let mut builder = Request::builder().uri("/metrics");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("request builds"))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "/metrics must sit behind the admin token"
+        );
+    }
+
+    let response = app.oneshot(get("/metrics")).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+        "the exposition answers a scraper's content type"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "authenticated metrics are never cacheable (backlog 37)"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("llm_proxy_requests_total 1"),
+        "the scraped exposition carries the live request counter: {text}"
+    );
+    assert!(
+        text.contains("llm_proxy_requests_failed_total 1"),
+        "the scraped exposition carries the live failure counter: {text}"
+    );
+}
+
+/// Without the metrics registry attached the surface keeps its exact
+/// shape: `/metrics` is not a route at all, like `/keys` without a key
+/// store.
+#[tokio::test]
+async fn without_metrics_attached_the_route_does_not_exist() {
+    let app = surface();
+    let response = app.oneshot(get("/metrics")).await.expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "/metrics must not exist unless the metrics registry is attached"
+    );
+}

@@ -352,6 +352,7 @@ async fn bind_admin_listener(
         }
         surface
             .config(std::sync::Arc::clone(&state.app_config_arc()))
+            .metrics(std::sync::Arc::clone(state.metrics()))
             .router()
     };
     #[cfg(not(feature = "admin-ui"))]

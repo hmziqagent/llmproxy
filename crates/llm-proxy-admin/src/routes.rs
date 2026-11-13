@@ -31,7 +31,7 @@ pub(crate) fn router(surface: AdminSurface) -> Router {
     let state = AdminState {
         surface: Arc::new(surface),
     };
-    Router::new()
+    let mut routes = Router::new()
         .route("/", get(ui::index))
         .route("/keys", get(list_keys).post(create_key))
         .route("/keys/{key_id}/revoke", post(revoke_key))
@@ -39,7 +39,14 @@ pub(crate) fn router(surface: AdminSurface) -> Router {
         .route("/usage/summary", get(usage_summary))
         .route("/usage/requests", get(usage_requests))
         .route("/usage/keys", get(usage_keys))
-        .route("/mcp", post(mcp::endpoint))
+        .route("/mcp", post(mcp::endpoint));
+    // Like `UsageApi`, the route does not exist unless the metrics
+    // registry was attached, so the surface shape is unchanged for
+    // embedders that never call `AdminSurface::metrics`.
+    if state.surface.metrics.is_some() {
+        routes = routes.route("/metrics", get(prometheus_metrics));
+    }
+    routes
         .layer(from_fn_with_state(auth, crate::auth::require_admin))
         .layer(TraceLayer::new_for_http())
         .layer(SetResponseHeaderLayer::overriding(
@@ -58,6 +65,25 @@ pub(crate) fn router(surface: AdminSurface) -> Router {
         ))
         .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+/// Prometheus exposition of the runtime counters (plan 07 step 7),
+/// behind the admin token like every other route on this surface. The
+/// route exists only when `AdminSurface::metrics` was called, so the
+/// missing-registry arm is unreachable through the router.
+async fn prometheus_metrics(State(state): State<AdminState>) -> Response {
+    let Some(metrics) = state.surface.metrics_ref() else {
+        return admin_error("no metrics were attached to this surface".to_owned());
+    };
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        metrics.get_snapshot().to_prometheus_text(),
+    )
+        .into_response()
 }
 
 async fn list_keys(State(state): State<AdminState>) -> Response {

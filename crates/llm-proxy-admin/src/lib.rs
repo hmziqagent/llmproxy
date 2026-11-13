@@ -32,13 +32,15 @@ use crate::auth::AdminAuth;
 
 /// The admin surface: what it serves depends on which pieces the builder
 /// was given — keys always need a [`ManagedKeys`], the usage views need
-/// the ledger reader, the config view needs the running [`AppConfig`].
+/// the ledger reader, the config view needs the running [`AppConfig`],
+/// and `/metrics` needs the runtime [`llm_proxy_core::Metrics`].
 #[derive(Clone)]
 pub struct AdminSurface {
     pub(crate) auth: Arc<AdminAuth>,
     pub(crate) keys: Option<Arc<ManagedKeys>>,
     pub(crate) config: Option<Arc<llm_proxy_core::AppConfig>>,
     pub(crate) usage: Option<Arc<UsageReader>>,
+    pub(crate) metrics: Option<Arc<llm_proxy_core::Metrics>>,
 }
 
 impl std::fmt::Debug for AdminSurface {
@@ -47,6 +49,7 @@ impl std::fmt::Debug for AdminSurface {
             .field("has_keys", &self.keys.is_some())
             .field("has_config", &self.config.is_some())
             .field("has_usage", &self.usage.is_some())
+            .field("has_metrics", &self.metrics.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -60,6 +63,7 @@ impl AdminSurface {
             keys: None,
             config: None,
             usage: None,
+            metrics: None,
         }
     }
 
@@ -84,10 +88,22 @@ impl AdminSurface {
         self
     }
 
+    /// Serve the token-gated `/metrics` route over the runtime counters
+    /// (plan 07 step 7): the Prometheus exposition of the scalar
+    /// counters, behind the same admin token. The route does not exist
+    /// unless the metrics registry is attached.
+    #[must_use]
+    pub fn metrics(mut self, metrics: Arc<llm_proxy_core::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// The admin router: the web UI at `/`, key management under `/keys`,
-    /// `/config`, the usage views under `/usage/*`, and the MCP tools
-    /// endpoint at `/mcp`. Admin auth, `no-store` and panic-catching are
-    /// applied here; every route is read-only except key management.
+    /// `/config`, the usage views under `/usage/*`, the MCP tools
+    /// endpoint at `/mcp`, and — when the metrics registry is attached —
+    /// the token-gated Prometheus exposition at `/metrics`. Admin auth,
+    /// `no-store` and panic-catching are applied here; every route is
+    /// read-only except key management.
     #[must_use = "the Router must be used with a server or merged into one"]
     pub fn router(self) -> Router {
         routes::router(self)
@@ -103,5 +119,9 @@ impl AdminSurface {
 
     pub(crate) fn usage_ref(&self) -> Option<&Arc<UsageReader>> {
         self.usage.as_ref()
+    }
+
+    pub(crate) fn metrics_ref(&self) -> Option<&Arc<llm_proxy_core::Metrics>> {
+        self.metrics.as_ref()
     }
 }
