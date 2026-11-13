@@ -13,6 +13,7 @@ What the proxy stores, where, and for how long. Prompts and responses are
 | Response bytes | No | — | — |
 | Body digests | SHA-256 of the raw request body, on ledger rows | with the row | with the row |
 | Caller identity | Key id or `"anonymous"`, on ledger rows | with the row | with the row |
+| Startup seed of day budgets and rpd | No — reads today's ledger rows back into memory, nothing new stored | read-only from the ledger | none |
 
 The ledger never carries prompt or response content: rows hold digests,
 token counts, costs, model names and error kinds. A test

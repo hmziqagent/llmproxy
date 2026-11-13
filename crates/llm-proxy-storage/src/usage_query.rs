@@ -224,6 +224,81 @@ pub struct RequestFilter {
     pub cursor: Option<(i64, String)>,
 }
 
+/// One caller's day-window totals read back from the `requests` table: the
+/// count of rows the caller paid for (served copies excluded) and the exact
+/// decimal sum of their `cost_total`. What startup seeding
+/// (`MemoryAdmissionBackend::seed_day`) feeds so a restart cannot reset a
+/// day budget or an rpd counter.
+#[derive(Debug, Serialize)]
+pub struct CallerDaySpend {
+    /// Authenticated caller identity; `None` for rows written without one.
+    pub caller: Option<String>,
+    /// Request rows in the window with `cache_hit = 0`; rows with a NULL
+    /// cost count here too.
+    pub requests: i64,
+    /// Exact sum of `cost_total` over the window's non-cache-hit rows.
+    pub spend: rust_decimal::Decimal,
+}
+
+/// Per-caller day-window spend over `requests` rows from `since_unix_ms`
+/// (00:00 UTC of the day being seeded). Costs are summed in Rust as exact
+/// decimals, never a SQL float; a cache hit is neither a paid request nor
+/// spend. Rows without a caller group under `None`.
+///
+/// # Errors
+///
+/// [`UsageQueryError`] when the ledger cannot be read or a stored cost is
+/// not a valid decimal.
+pub fn spend_since(
+    path: &Path,
+    since_unix_ms: i64,
+) -> Result<Vec<CallerDaySpend>, UsageQueryError> {
+    let conn = UsageReader::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT caller, \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 0 THEN 1 ELSE 0 END), 0) \
+         FROM requests \
+         WHERE COALESCE(received_at, completed_at) >= ?1 \
+         GROUP BY caller",
+    )?;
+    let mut rows: Vec<CallerDaySpend> = Vec::new();
+    let mapped = stmt.query_map([since_unix_ms], |row| {
+        Ok(CallerDaySpend {
+            caller: row.get(0)?,
+            requests: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            spend: rust_decimal::Decimal::ZERO,
+        })
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    // Exact decimal sums happen in Rust over the stored strings (the same
+    // discipline as `sum_costs_by_group`).
+    let mut stmt = conn.prepare(
+        "SELECT caller, cost_total FROM requests \
+         WHERE COALESCE(received_at, completed_at) >= ?1 \
+           AND COALESCE(cache_hit, 0) = 0 AND cost_total IS NOT NULL",
+    )?;
+    let mut spends: HashMap<Option<String>, rust_decimal::Decimal> = HashMap::new();
+    let mapped = stmt.query_map([since_unix_ms], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    for row in mapped {
+        let (caller, cost_total) = row?;
+        let entry = spends.entry(caller).or_insert(rust_decimal::Decimal::ZERO);
+        *entry += parse_cost(cost_total)?;
+    }
+    for row in &mut rows {
+        if let Some(total) = spends.get(&row.caller) {
+            row.spend = *total;
+        }
+    }
+    Ok(rows)
+}
+
 /// Read-only query interface over the SQLite usage ledger.
 #[derive(Debug, Clone)]
 pub struct UsageReader {
@@ -585,6 +660,111 @@ fn callers_sync(path: &Path) -> Result<Vec<CallerSummary>, UsageQueryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        EventBus, ProxyEvent, RequestReceived, ResponseCompleted, RetentionPolicy, SqliteEventBus,
+    };
+    use llm_proxy_protocol::core::{Cost, ModelRef, StopReason, Usage, UsageProvenance};
+    use rust_decimal::Decimal;
+
+    fn seed_day_row(
+        bus: &crate::SqliteEventBus,
+        id: &str,
+        caller: &str,
+        cost_total: Option<Decimal>,
+        cache_hit: bool,
+    ) {
+        let now = OffsetDateTime::now_utc();
+        bus.emit(&ProxyEvent::RequestReceived(RequestReceived {
+            request_id: id.to_owned(),
+            timestamp: now,
+            caller: caller.to_owned(),
+            provider: "prov-a".to_owned(),
+            route_kind: "messages".to_owned(),
+            client_protocol: "anthropic".to_owned(),
+            model: ModelRef {
+                requested: "claude-3".to_owned(),
+                upstream: None,
+            },
+            streaming: false,
+            body_hash: "digest".to_owned(),
+            session_id: None,
+        }));
+        bus.emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
+            request_id: id.to_owned(),
+            timestamp: now,
+            provider: "prov-a".to_owned(),
+            upstream_message_id: None,
+            model: ModelRef {
+                requested: "claude-3".to_owned(),
+                upstream: None,
+            },
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                provenance: UsageProvenance::ProviderReported,
+                ..Usage::default()
+            },
+            cost: cost_total.map(|total| Cost {
+                input: Decimal::ZERO,
+                output: Decimal::ZERO,
+                cache_creation: Decimal::ZERO,
+                cache_read: Decimal::ZERO,
+                reasoning: Decimal::ZERO,
+                total,
+            }),
+            stop_reason: StopReason::EndTurn,
+            latency_ms: 12,
+            credential_id: None,
+            cache_hit,
+        }));
+    }
+
+    #[tokio::test]
+    async fn spend_since_sums_exact_decimals_and_skips_cache_hits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(
+            &db,
+            RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: std::time::Duration::from_secs(3600),
+            },
+        )
+        .expect("open ledger");
+        let priced = Decimal::from_str_exact("0.000123456789012345678901234").expect("decimal");
+        seed_day_row(&bus, "r1", "key-a", Some(priced), false);
+        // A NULL cost contributes zero spend but still counts as a request.
+        seed_day_row(&bus, "r2", "key-a", None, false);
+        // A served copy charges nothing and is not a request the key paid for.
+        seed_day_row(
+            &bus,
+            "r3",
+            "key-a",
+            Some(Decimal::from_str_exact("5").expect("decimal")),
+            true,
+        );
+        tokio::task::spawn_blocking(move || EventBus::close(&bus))
+            .await
+            .expect("flush the ledger");
+
+        let since = OffsetDateTime::now_utc()
+            .replace_time(time::Time::MIDNIGHT)
+            .unix_timestamp()
+            .saturating_mul(1000);
+        let rows = spend_since(&db, since).expect("day-window spend query");
+
+        assert_eq!(rows.len(), 1, "one caller group");
+        assert_eq!(rows[0].caller.as_deref(), Some("key-a"));
+        assert_eq!(
+            rows[0].requests, 2,
+            "the cache hit is not a request the key paid for; the NULL cost still counts"
+        );
+        assert_eq!(
+            rows[0].spend, priced,
+            "the cost sum must keep full decimal precision and exclude the cache hit"
+        );
+    }
 
     #[test]
     fn read_only_connections_refuse_writes() {

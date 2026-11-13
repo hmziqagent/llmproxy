@@ -24,8 +24,10 @@ proposes three different admission models, and this plan replaces them with one.
 4. **One admission step (backlog 6, conflict 2).** Reserve, then settle or refund. A
    cost that can't be estimated goes to an explicit per-key policy. This lives in the
    `Admission` trait from plan 03, not in `llm-proxy-core`.
-5. **Limit windows (backlog 6).** Add RPM, TPM, RPD and per-key budgets, using the
-   attempt rows from plan 04.
+5. **Limit windows (backlog 6).** Add RPM, TPM, RPD and per-key budgets. Per-key
+   budgets and the rpd window are rebuilt from `requests` rows at startup when
+   `[storage]` is set; rpm/tpm windows restart empty; without `[storage]` everything
+   resets on restart.
 6. **What counts (conflict 8).** Budgets charge what providers bill, per attempt.
    Cache hits charge nothing and are recorded as hits.
 7. **Concurrency caps (backlog 30).** Limit in-flight requests per provider and model.

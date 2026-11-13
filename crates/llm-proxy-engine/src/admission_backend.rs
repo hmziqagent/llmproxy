@@ -284,6 +284,24 @@ impl MemoryAdmissionBackend {
             poisoned.into_inner()
         })
     }
+
+    /// Seeds one caller's day window with counts read back from durable
+    /// state at startup (the usage ledger): today's paid-request count and
+    /// spend, so a restart cannot reset a `usd_per_day` budget or an rpd
+    /// counter. Only the day window is seeded — minute windows cover 60
+    /// seconds, shorter than any restart gap, so rpm/tpm restart empty.
+    /// Seeding runs before the server accepts traffic, so the values replace
+    /// whatever the fresh window holds.
+    pub fn seed_day(&self, now: OffsetDateTime, caller: &str, requests: u64, spent: MicroUsd) {
+        let mut state = self.lock();
+        let key = state
+            .keys
+            .entry(caller.to_owned())
+            .or_insert_with(|| KeyState::fresh(now));
+        key.roll(now);
+        key.day.requests = requests;
+        key.day.spent = spent;
+    }
 }
 
 /// Seconds until the next calendar minute starts.

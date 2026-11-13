@@ -1085,4 +1085,70 @@ mod tests {
         assert!(empty.is_noop());
         assert!(!admission(budgeted("1")).is_noop());
     }
+
+    #[tokio::test]
+    async fn a_seeded_day_budget_refuses_when_spent() {
+        // Fixed epoch for both the seed and the windows, so the day
+        // boundary cannot move under the test (midnight UTC or otherwise).
+        const NOW: i64 = 1_700_000_000;
+        let today = OffsetDateTime::from_unix_timestamp(NOW).expect("timestamp");
+        let backend = Arc::new(MemoryAdmissionBackend::new());
+        // Startup seeding: today's ledger already shows the whole 1 USD
+        // budget spent (1_000_000 micro-USD) across 4 requests.
+        backend.seed_day(today, "key", 4, 1_000_000);
+        let admission = PolicyAdmission::over_backend(
+            HashMap::from([("key".to_owned(), budgeted("1"))]),
+            HashMap::from([(("p".to_owned(), "m".to_owned()), pricing("0.001", "0.001"))]),
+            HashMap::new(),
+            Arc::clone(&backend) as Arc<dyn AdmissionBackend>,
+        )
+        .with_clock(move || OffsetDateTime::from_unix_timestamp(NOW).expect("timestamp"));
+
+        let refused = admission
+            .reserve(&claim("key", "p", "m", 500, Some(500)))
+            .await
+            .expect_err("the seeded spend consumed the whole day budget");
+        assert!(matches!(refused, EngineError::BudgetExhausted { .. }));
+        assert_eq!(refused.status_code(), 402);
+
+        // The same seed dated yesterday rolls over: today starts empty.
+        backend.seed_day(
+            today - std::time::Duration::from_secs(86_400),
+            "key",
+            4,
+            1_000_000,
+        );
+        admission
+            .reserve(&claim("key", "p", "m", 500, Some(500)))
+            .await
+            .expect("yesterday's seeded spend must not carry into today");
+
+        // The seeded request count feeds the rpd window: at its cap, refuse.
+        let counted = Arc::new(MemoryAdmissionBackend::new());
+        counted.seed_day(today, "key", 3, 0);
+        let limited = PolicyAdmission::over_backend(
+            HashMap::from([(
+                "key".to_owned(),
+                KeyPolicy {
+                    limits: KeyWindowLimits {
+                        rpd: Some(3),
+                        ..KeyWindowLimits::default()
+                    },
+                    ..KeyPolicy::default()
+                },
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::clone(&counted) as Arc<dyn AdmissionBackend>,
+        )
+        .with_clock(move || OffsetDateTime::from_unix_timestamp(NOW).expect("timestamp"));
+        let refused = limited
+            .reserve(&claim("key", "p", "m", 10, Some(10)))
+            .await
+            .expect_err("the seeded day already used every rpd slot");
+        assert!(
+            matches!(&refused, EngineError::RateLimited { message, .. } if message.contains("rpd")),
+            "expected the seeded rpd counter to refuse, got {refused:?}"
+        );
+    }
 }

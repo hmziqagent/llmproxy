@@ -170,59 +170,80 @@ pub async fn load_toml_state_from_config(
     // as an equivalent file key, and the counters survive the swap.
     #[cfg(feature = "admin-ui")]
     let state = match managed {
-        Some(source) => {
-            let backend = std::sync::Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new())
-                as std::sync::Arc<dyn llm_proxy_engine::AdmissionBackend>;
-            // The same merged `[auth]` the state itself validated above;
-            // re-parsed so the pair owns its authenticator half from the
-            // start (the parse is PHC-string work, no hashing).
-            let initial_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
-                .context("rebuilding client auth for the swap pair")?;
-            let pair = std::sync::Arc::new(llm_proxy_server::SwappingAuthPair::new(
-                std::sync::Arc::new(initial_auth),
-                std::sync::Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
-                    &app_config.auth,
-                    &registry,
-                    std::sync::Arc::clone(&backend),
-                )),
-            ));
-            // The startup merge added the store's ids to the running
-            // config; record them so a hot reload can attribute the ids the
-            // file never had instead of blaming the file's own clients.
-            let base = base
-                .with_runtime_issued_keys(source.specs.iter().map(|(id, _)| id.clone()).collect())
-                .with_auth_pair(std::sync::Arc::clone(&pair));
-            let (state, replica_installer) = crate::replica::apply_replica(
-                &app_config,
-                &registry,
-                base,
-                Some(std::sync::Arc::clone(&pair)),
-            )
-            .await?;
-            let installer: AdmissionInstaller = match replica_installer {
-                Some(replica) => replica,
-                None => single_node_admission_installer(state.clone(), backend),
-            };
-            spawn_managed_key_refresh(
-                source.store,
-                source.file_auth,
-                source.specs,
-                pair,
-                installer,
-            );
-            state
-        }
+        Some(source) => managed_key_state(&app_config, &registry, base, source).await?,
         None => {
+            let base = seeded_single_node_admission(&app_config, &registry, base).await;
             crate::replica::apply_replica(&app_config, &registry, base, None)
                 .await?
                 .0
         }
     };
     #[cfg(not(feature = "admin-ui"))]
-    let state = crate::replica::apply_replica(&app_config, &registry, base, None)
-        .await?
-        .0;
+    let state = {
+        let base = seeded_single_node_admission(&app_config, &registry, base).await;
+        crate::replica::apply_replica(&app_config, &registry, base, None)
+            .await?
+            .0
+    };
 
+    Ok(state)
+}
+
+/// The managed-key arm of [`load_toml_state_from_config`]: one swappable
+/// (authenticator, admission rules) pair over an app-owned backend, seeded
+/// from the usage ledger when `[storage]` is set on a single node, plus the
+/// refresh loop that rebuilds both halves when the store's live key set
+/// changes. The seeded counters survive those swaps: every rebuild runs
+/// over this same backend.
+#[cfg(feature = "admin-ui")]
+async fn managed_key_state(
+    app_config: &AppConfig,
+    registry: &ProviderRegistry,
+    base: AppState,
+    source: ManagedKeySource,
+) -> Result<AppState> {
+    let memory_backend = std::sync::Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+    if let (Some(storage), None) = (&app_config.storage, &app_config.replica) {
+        seed_day_budgets(&memory_backend, &storage.path).await;
+    }
+    let backend = memory_backend as std::sync::Arc<dyn llm_proxy_engine::AdmissionBackend>;
+    // The same merged `[auth]` the state itself validated above; re-parsed
+    // so the pair owns its authenticator half from the start (the parse is
+    // PHC-string work, no hashing).
+    let initial_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
+        .context("rebuilding client auth for the swap pair")?;
+    let pair = std::sync::Arc::new(llm_proxy_server::SwappingAuthPair::new(
+        std::sync::Arc::new(initial_auth),
+        std::sync::Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
+            &app_config.auth,
+            registry,
+            std::sync::Arc::clone(&backend),
+        )),
+    ));
+    // The startup merge added the store's ids to the running config;
+    // record them so a hot reload can attribute the ids the file never had
+    // instead of blaming the file's own clients.
+    let base = base
+        .with_runtime_issued_keys(source.specs.iter().map(|(id, _)| id.clone()).collect())
+        .with_auth_pair(std::sync::Arc::clone(&pair));
+    let (state, replica_installer) = crate::replica::apply_replica(
+        app_config,
+        registry,
+        base,
+        Some(std::sync::Arc::clone(&pair)),
+    )
+    .await?;
+    let installer: AdmissionInstaller = match replica_installer {
+        Some(replica) => replica,
+        None => single_node_admission_installer(state.clone(), backend),
+    };
+    spawn_managed_key_refresh(
+        source.store,
+        source.file_auth,
+        source.specs,
+        pair,
+        installer,
+    );
     Ok(state)
 }
 
@@ -636,6 +657,84 @@ fn build_event_bus(
     }
 }
 
+/// Seeds the in-process admission backend's day windows from the usage
+/// ledger (plan 05 step 5): today's spend and rpd counts per caller, read
+/// from `requests` rows since 00:00 UTC, so a restart cannot reset a
+/// `usd_per_day` budget or an rpd counter. Only the day window is seeded —
+/// minute windows cover 60 seconds, shorter than any restart gap, so
+/// rpm/tpm restart empty. A failed read only warns: the ledger is also what
+/// `/usage` reads, so a broken store must not keep the proxy from serving.
+/// Replica stores are durable already and skip this (their admission is
+/// swapped in over a shared backend, which discards these counters).
+async fn seed_day_budgets(backend: &llm_proxy_engine::MemoryAdmissionBackend, ledger: &Path) {
+    let since_ms = time::OffsetDateTime::now_utc()
+        .replace_time(time::Time::MIDNIGHT)
+        .unix_timestamp()
+        .saturating_mul(1000);
+    let path = ledger.to_owned();
+    let rows =
+        match tokio::task::spawn_blocking(move || llm_proxy_storage::spend_since(&path, since_ms))
+            .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    "seeding daily budgets from the usage ledger failed; day budgets start at zero"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "seeding daily budgets task failed; day budgets start at zero"
+                );
+                return;
+            }
+        };
+    let callers = rows.len();
+    let now = time::OffsetDateTime::now_utc();
+    for row in &rows {
+        let Some(caller) = row.caller.as_deref() else {
+            continue;
+        };
+        backend.seed_day(
+            now,
+            caller,
+            u64::try_from(row.requests).unwrap_or(u64::MAX),
+            llm_proxy_engine::to_micro_usd(row.spend),
+        );
+    }
+    info!(callers, "seeded daily budgets from the usage ledger");
+}
+
+/// Single-node admission over an app-owned backend so the day windows can
+/// be seeded from the usage ledger before serving. Only the `[storage]`
+/// single-node case deviates from the engine's own default: without
+/// `[storage]` everything resets on restart anyway, and a `[replica]` store
+/// is the durable counter already. Rules stay identical to the default
+/// (`PolicyAdmission::from_config`).
+async fn seeded_single_node_admission(
+    app_config: &AppConfig,
+    registry: &ProviderRegistry,
+    base: AppState,
+) -> AppState {
+    let (Some(storage), None) = (&app_config.storage, &app_config.replica) else {
+        return base;
+    };
+    let backend = std::sync::Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+    let admission = llm_proxy_engine::PolicyAdmission::over_config_backend(
+        &app_config.auth,
+        registry,
+        std::sync::Arc::clone(&backend) as std::sync::Arc<dyn llm_proxy_engine::AdmissionBackend>,
+    );
+    if admission.is_noop() {
+        return base;
+    }
+    seed_day_budgets(&backend, &storage.path).await;
+    base.with_admission(std::sync::Arc::new(admission))
+}
+
 /// Emit the startup warnings naming the admin `/usage` mount posture.
 ///
 /// Warns when the admin surface is mounted on the main listener or when the
@@ -1038,6 +1137,146 @@ path = \"{}\"
             "absent [storage] must keep the no-op bus (today's behavior), got: {debug}"
         );
         llm_proxy_storage::EventBus::close(state.event_bus().as_ref());
+    }
+
+    /// Writes a real ledger with one caller's day: a paid 0.25 USD request
+    /// and a cache hit priced at 7.00 USD that the seed must ignore. The
+    /// flush runs on the blocking pool: `close` waits on the writer task,
+    /// which only progresses while the runtime thread stays free.
+    async fn seed_day_ledger(db_path: &std::path::Path) {
+        let bus = llm_proxy_storage::SqliteEventBus::open(
+            db_path,
+            llm_proxy_storage::RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: std::time::Duration::from_secs(3600),
+            },
+        )
+        .expect("seed ledger");
+        let now = time::OffsetDateTime::now_utc();
+        for (id, cost_total, cache_hit) in [
+            ("seed-1", Some(rust_decimal::Decimal::new(25, 2)), false),
+            ("seed-2", Some(rust_decimal::Decimal::new(700, 2)), true),
+        ] {
+            let received = llm_proxy_storage::ProxyEvent::RequestReceived(
+                llm_proxy_storage::RequestReceived {
+                    request_id: id.to_owned(),
+                    timestamp: now,
+                    caller: "laptop".to_owned(),
+                    provider: "prov-a".to_owned(),
+                    route_kind: "messages".to_owned(),
+                    client_protocol: "anthropic".to_owned(),
+                    model: llm_proxy_protocol::core::ModelRef {
+                        requested: "claude-3".to_owned(),
+                        upstream: None,
+                    },
+                    streaming: false,
+                    body_hash: "digest".to_owned(),
+                    session_id: None,
+                },
+            );
+            let completed = llm_proxy_storage::ProxyEvent::ResponseCompleted(
+                llm_proxy_storage::ResponseCompleted {
+                    request_id: id.to_owned(),
+                    timestamp: now,
+                    provider: "prov-a".to_owned(),
+                    upstream_message_id: None,
+                    model: llm_proxy_protocol::core::ModelRef {
+                        requested: "claude-3".to_owned(),
+                        upstream: None,
+                    },
+                    usage: llm_proxy_protocol::core::Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        provenance: llm_proxy_protocol::core::UsageProvenance::ProviderReported,
+                        ..llm_proxy_protocol::core::Usage::default()
+                    },
+                    cost: cost_total.map(|total| llm_proxy_protocol::core::Cost {
+                        input: rust_decimal::Decimal::ZERO,
+                        output: rust_decimal::Decimal::ZERO,
+                        cache_creation: rust_decimal::Decimal::ZERO,
+                        cache_read: rust_decimal::Decimal::ZERO,
+                        reasoning: rust_decimal::Decimal::ZERO,
+                        total,
+                    }),
+                    stop_reason: llm_proxy_protocol::core::StopReason::EndTurn,
+                    latency_ms: 12,
+                    credential_id: None,
+                    cache_hit,
+                },
+            );
+            llm_proxy_storage::EventBus::emit(&bus, &received);
+            llm_proxy_storage::EventBus::emit(&bus, &completed);
+        }
+        tokio::task::spawn_blocking(move || llm_proxy_storage::EventBus::close(&bus))
+            .await
+            .expect("flush the seed ledger");
+    }
+
+    #[tokio::test]
+    async fn load_toml_state_seeds_day_budgets_from_the_ledger_when_storage_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("usage.db");
+        seed_day_ledger(&db_path).await;
+
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[storage]
+path = "{}"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients.laptop]
+verifier = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$eEnjdfBL8hfvU2QuGOpow8Yq2Jyrr8GXKYgtAAsscSs"
+
+[auth.clients.laptop.budget]
+usd_per_day = "1.00"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let layer = build_log_layer(&LogFormat::Json, BufferWriter(std::sync::Arc::clone(&buf)));
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = load_toml_state(
+            &config,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("state with [storage] and a budgeted key");
+        drop(_guard);
+
+        let captured = String::from_utf8(buf.lock().expect("buffer lock not poisoned").clone())
+            .expect("captured bytes are UTF-8");
+        assert!(
+            captured.contains("seeded daily budgets from the usage ledger"),
+            "startup must seed day budgets from the ledger when [storage] is set: {captured}"
+        );
+        assert!(
+            captured.contains("\"callers\":1"),
+            "exactly one caller group must come out of the seed query (the cache hit is not a \
+             paid request): {captured}"
+        );
+        let closer = std::sync::Arc::clone(state.event_bus());
+        tokio::task::spawn_blocking(move || llm_proxy_storage::EventBus::close(&*closer))
+            .await
+            .expect("close the state's ledger");
     }
 
     fn write_provider_file(dir: &std::path::Path, egress: Option<&str>) {

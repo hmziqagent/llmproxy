@@ -18,8 +18,9 @@ mod usage_query;
 pub use sqlite::{RetentionPolicy, SqliteEventBus, StorageError, run_retention_pass};
 #[cfg(feature = "sqlite")]
 pub use usage_query::{
-    CallerSummary, CostTotals, GroupBy, MAX_PAGE_LIMIT, RequestFilter, RequestRow, RequestsPage,
-    SummaryGroup, TokenCounts, UsageQueryError, UsageReader, now_unix_millis,
+    CallerDaySpend, CallerSummary, CostTotals, GroupBy, MAX_PAGE_LIMIT, RequestFilter, RequestRow,
+    RequestsPage, SummaryGroup, TokenCounts, UsageQueryError, UsageReader, now_unix_millis,
+    spend_since,
 };
 
 /// One request/response lifecycle event, ready to persist or emit.
