@@ -1261,6 +1261,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_chat_subpaths_return_openai_shaped_404() {
+        let app = build_router(empty_state());
+        for uri in [
+            "/providers/mock-provider/v1/chat/typo",
+            "/providers/mock-provider/v1/chat",
+            "/providers/mock-provider/v1/chat/completions/extra",
+            "/providers/mock-provider/v1/chat/edits",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "status for {uri}");
+
+            let resp_body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+
+            assert!(
+                resp_body["error"]["message"].is_string(),
+                "{uri} must have an error.message string"
+            );
+            assert!(
+                resp_body.get("type").is_none() || resp_body["type"].is_null(),
+                "{uri} must not have the Anthropic 'type' field"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn empty_body_returns_openai_shaped_400() {
         let app = build_router(state_with_mock_provider_no_upstream());
         let req = Request::builder()

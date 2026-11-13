@@ -490,9 +490,11 @@ async fn normalize_error_responses(
     }
     rewritten
 }
-/// Path prefixes of the non-chat endpoint families (plan 09 step 7): all
-/// of them are OpenAI-dialect APIs.
+/// Path prefixes of the non-chat OpenAI-dialect endpoint families
+/// (plan 09 step 7, plus the completions/moderations text families).
 const OPENAI_FAMILY_PATHS: &[&str] = &[
+    "/v1/completions",
+    "/v1/moderations",
     "/v1/embeddings",
     "/v1/rerank",
     "/v1/audio/",
@@ -504,8 +506,10 @@ const OPENAI_FAMILY_PATHS: &[&str] = &[
 fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
     // The dialect of the path decides the error body shape for layer-level
     // failures (auth, limits, 404/405) that never reach a route handler.
-    if path.contains("/v1/chat/completions")
-        || path.contains("/v1/chat/edits")
+    // Everything under a `chat` segment is OpenAI-shaped, including unknown
+    // subpaths that only hit the 404/405 fallback (remodel plan).
+    if path.contains("/v1/chat/")
+        || path.ends_with("/v1/chat")
         || OPENAI_FAMILY_PATHS
             .iter()
             .any(|prefix| path.contains(prefix))
@@ -571,7 +575,49 @@ async fn method_not_allowed(State(state): State<AppState>, req: Request) -> impl
 
 #[cfg(test)]
 mod tests {
-    use super::cors_layer_for;
+    use super::{cors_layer_for, error_response, protocol_for_path};
+
+    #[test]
+    fn protocol_for_path_classifies_chat_prefixes_as_openai() {
+        for path in [
+            "/providers/p/v1/chat/completions",
+            "/providers/p/v1/chat/typo",
+            "/providers/p/v1/chat",
+            "/v1/chat/completions",
+            "/providers/p/v1/completions",
+            "/providers/p/v1/moderations",
+        ] {
+            assert_eq!(
+                protocol_for_path(path),
+                error_response::ClientProtocol::OpenAiChat,
+                "{path} must classify as OpenAI-shaped"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_for_path_keeps_non_chat_families() {
+        assert_eq!(
+            protocol_for_path("/providers/p/v1/messages"),
+            error_response::ClientProtocol::Anthropic
+        );
+        assert_eq!(
+            protocol_for_path("/providers/p/v1/messages/count_tokens"),
+            error_response::ClientProtocol::Anthropic
+        );
+        assert_eq!(
+            protocol_for_path("/providers/p/v1/responses"),
+            error_response::ClientProtocol::OpenAiResponses
+        );
+        assert_eq!(
+            protocol_for_path("/providers/p/v1beta/models/gemini:generateContent"),
+            error_response::ClientProtocol::Gemini
+        );
+        assert_eq!(
+            protocol_for_path("/api/tags"),
+            error_response::ClientProtocol::Ollama
+        );
+    }
 
     #[test]
     fn cors_layer_absent_when_origins_unset() {
