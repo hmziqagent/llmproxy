@@ -165,7 +165,10 @@ impl From<ProviderError> for BridgeError {
 pub struct BridgeConfig {
     /// The providers, in the same shape as `[[provider]]` TOML tables.
     pub providers: Vec<ProviderConfig>,
-    /// The whole-request timeout, overriding the 300 s default.
+    /// Bounds one request across every attempt (retry ladder included)
+    /// through the engine's `upstream_timeouts.total`; a streaming request
+    /// is bounded until its first event commits, afterwards the idle
+    /// timeout applies. Unset means no whole-request deadline.
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
     /// Record every usage row the engine emits and expose it through
@@ -438,8 +441,9 @@ impl Bridge {
     ///
     /// # Errors
     ///
-    /// [`BridgeError`] when the provider set fails validation, the transport
-    /// client cannot be built, or the runtime cannot start.
+    /// [`BridgeError`] when the provider set fails validation,
+    /// `request_timeout_secs` is not at least 1, the transport client
+    /// cannot be built, or the runtime cannot start.
     pub fn from_config(config: BridgeConfig) -> Result<Self, BridgeError> {
         let BridgeConfig {
             providers,
@@ -456,7 +460,26 @@ impl Bridge {
             .map_err(|error| BridgeError::config(error.to_string()))?;
         let mut server = embedded_server_config();
         if let Some(secs) = request_timeout_secs {
-            server.request_timeout = Duration::from_secs(secs);
+            if secs == 0 {
+                return Err(BridgeError::config(
+                    "request_timeout_secs must be at least 1".to_owned(),
+                ));
+            }
+            let total = Duration::from_secs(secs);
+            // The bridge never binds a port, so the daemon's per-request
+            // axum timeout cannot apply: make the knob real through the
+            // engine's whole-ladder deadline instead. A budget smaller than
+            // a phase shrinks the phases to fit (the caller asked for a
+            // short request) so cross-validation still holds.
+            server.request_timeout = total;
+            server.upstream_timeouts.total = Some(total);
+            server.upstream_timeouts.first_byte = server.upstream_timeouts.first_byte.min(total);
+            server.upstream_timeouts.connect = server
+                .upstream_timeouts
+                .connect
+                .min(server.upstream_timeouts.first_byte);
+            llm_proxy_core::validate_upstream_timeouts(&server.upstream_timeouts)
+                .map_err(|error| BridgeError::config(error.to_string()))?;
         }
         let app_config = AppConfig {
             server,

@@ -58,6 +58,9 @@ class CannedUpstream:
                         "body": body,
                     }
                 if upstream.canned["kind"] == "json":
+                    stall = upstream.canned.get("stall_ms") or 0
+                    if stall:
+                        time.sleep(stall / 1000.0)
                     payload = json.dumps(upstream.canned["body"]).encode()
                     self.send_response(200)
                     self.send_header("content-type", "application/json")
@@ -231,6 +234,36 @@ def test_failures_raise_proxy_error_with_status_and_kind(shared=load_shared()):
         proxy.execute("anthropic-upstream", "anthropic_messages", {"no": "model"})
     assert bad_body.value.status == 400
     assert bad_body.value.kind == "InvalidRequest"
+
+
+def test_request_timeout_is_enforced(shared=load_shared()):
+    """``request_timeout_secs`` bounds the whole request: an upstream that
+    accepts the connection and then stalls for 30 s must surface as a
+    ProxyError within the budget, not wait out the stall."""
+    upstream = CannedUpstream(
+        {
+            "kind": "json",
+            "stall_ms": 30_000,
+            "body": shared["upstream_responses"]["anthropic_json"]["body"],
+        }
+    )
+    provider = provider_for(shared, "anthropic-upstream", upstream.base_url)
+    proxy = Proxy(
+        {"providers": [provider], "record_usage": False, "request_timeout_secs": 1}
+    )
+    body = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    started = time.monotonic()
+    with pytest.raises(ProxyError) as stalled:
+        proxy.execute("anthropic-upstream", "anthropic_messages", body)
+    assert time.monotonic() - started < 5, "the whole-request deadline ended the stall"
+    assert stalled.value.kind == "UpstreamTimeout"
+    assert stalled.value.status == 504
+    assert stalled.value.should_retry is True
 
 
 def test_cancellation_stops_delivery_and_settles_client_cancelled(shared=load_shared()):

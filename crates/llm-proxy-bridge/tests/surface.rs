@@ -317,10 +317,114 @@ fn invalid_configuration_is_rejected_with_names() {
     assert_eq!(error.kind, "InvalidConfig");
 }
 
+#[test]
+fn request_timeout_secs_zero_is_a_config_error() {
+    let mut config = offline_bridge_config();
+    config["request_timeout_secs"] = json!(0);
+    let error = Bridge::from_json(&config).expect_err("a zero request timeout is a config error");
+    assert_eq!(error.kind, "InvalidConfig");
+    assert!(
+        error
+            .message
+            .contains("request_timeout_secs must be at least 1")
+    );
+}
+
+/// Serves nothing for 30 s, then a JSON body: a non-streaming execute parks
+/// on it, the shape a whole-request deadline has to cut short.
+async fn spawn_stalling_json_upstream() -> String {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"id":"msg_stall","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-5","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "stalling json upstream stopped");
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn request_timeout_secs_bounds_a_stalled_execute() {
+    let base_url = spawn_stalling_json_upstream().await;
+    let config = json!({
+        "request_timeout_secs": 1,
+        "providers": [{
+            "name": "stallco",
+            "api_key": "operator-key",
+            "auth_style": "bearer",
+            "adapters": {
+                "messages": {
+                    "protocol": "anthropic_messages",
+                    "endpoint": format!("{base_url}/v1/messages")
+                }
+            },
+            "routes": { "messages": "messages" }
+        }]
+    });
+    let bridge = Bridge::from_json(&config).expect("bridge builds");
+
+    let started = std::time::Instant::now();
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(5),
+        bridge.execute(
+            "stallco",
+            "anthropic_messages",
+            &anthropic_body(),
+            &ExecuteOptions::default(),
+        ),
+    )
+    .await
+    .expect("the whole-request deadline must end a stalled execute within 5s");
+    let error = attempt.expect_err("a stalled upstream must fail the execute");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline fired while the request was still parked"
+    );
+
+    // A bare single-provider route has no retry ladder, so the deadline
+    // surfaces raw: kind UpstreamTimeout, status 504, and the 504 policy row
+    // says a client retry may fit the window.
+    assert_eq!(error.kind, "UpstreamTimeout");
+    assert_eq!(error.status, 504);
+    assert!(error.should_retry);
+    assert_eq!(error.retry_after, None);
+}
+
+#[tokio::test]
+async fn an_unset_request_timeout_leaves_the_engine_defaults() {
+    let upstream = spawn_fake_upstream().await;
+    let bridge = Bridge::from_json(&bridge_config(&upstream, false)).expect("bridge builds");
+
+    let response = bridge
+        .execute(
+            "acme",
+            "anthropic_messages",
+            &anthropic_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("a fast request still succeeds with no whole-request deadline");
+    assert_eq!(response["id"], "msg_bridge_1");
+}
+
 /// Translation does no I/O: the provider endpoints point at an unroutable
 /// address and nothing fails.
-fn offline_bridge() -> Bridge {
-    let config = json!({
+fn offline_bridge_config() -> Value {
+    json!({
         "providers": [{
             "name": "offline",
             "api_key": "k",
@@ -330,8 +434,11 @@ fn offline_bridge() -> Bridge {
             },
             "routes": { "messages": "a" }
         }]
-    });
-    Bridge::from_json(&config).expect("bridge builds")
+    })
+}
+
+fn offline_bridge() -> Bridge {
+    Bridge::from_json(&offline_bridge_config()).expect("bridge builds")
 }
 
 #[test]

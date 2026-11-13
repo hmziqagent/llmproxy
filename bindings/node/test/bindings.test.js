@@ -49,12 +49,21 @@ class CannedUpstream {
       }
       this.capture = { headers, body };
       if (this.canned.kind === 'json') {
-        const payload = JSON.stringify(this.canned.body);
-        res.writeHead(this.canned.status || 200, {
-          'content-type': 'application/json',
-          ...this.canned.headers,
-        });
-        res.end(payload);
+        const respond = () => {
+          const payload = JSON.stringify(this.canned.body);
+          res.writeHead(this.canned.status || 200, {
+            'content-type': 'application/json',
+            ...this.canned.headers,
+          });
+          res.end(payload);
+        };
+        if (this.canned.stall_ms) {
+          // unref'd so a stalled request cannot keep the test process alive
+          // after the suite finishes.
+          setTimeout(respond, this.canned.stall_ms).unref();
+        } else {
+          respond();
+        }
       } else {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         const events = this.canned.events;
@@ -266,6 +275,44 @@ test('failures throw ProxyError with status and kind', async () => {
         assert.equal(failure.kind, 'InvalidRequest');
         return true;
       }
+    );
+  } finally {
+    upstream.stop();
+  }
+});
+
+// request_timeout_secs bounds the whole request: an upstream that accepts
+// the connection and then stalls for 30 s must surface as a ProxyError
+// within the budget, not wait out the stall.
+test('request_timeout_secs is enforced', async () => {
+  const upstream = await startUpstream({
+    kind: 'json',
+    stall_ms: 30_000,
+    body: shared.upstream_responses.anthropic_json.body,
+  });
+  try {
+    const provider = providerFor('anthropic-upstream', upstream.baseUrl);
+    const proxy = new Proxy({ providers: [provider], request_timeout_secs: 1 });
+    const body = {
+      model: 'claude-sonnet-4-5',
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+
+    const started = Date.now();
+    await assert.rejects(
+      proxy.execute('anthropic-upstream', 'anthropic_messages', body),
+      (error) => {
+        assert.ok(error instanceof ProxyError);
+        assert.equal(error.kind, 'UpstreamTimeout');
+        assert.equal(error.status, 504);
+        assert.equal(error.shouldRetry, true);
+        return true;
+      }
+    );
+    assert.ok(
+      Date.now() - started < 5_000,
+      'the whole-request deadline ended the stall'
     );
   } finally {
     upstream.stop();
