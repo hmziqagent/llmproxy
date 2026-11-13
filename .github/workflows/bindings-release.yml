@@ -47,6 +47,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # tomllib is stdlib only from Python 3.11 and the ubuntu-22.04 image
+      # ships 3.10.12, so the version checks pin the interpreter they run on.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Assert every binding version string is the same version
         shell: bash
         run: |
