@@ -28,12 +28,7 @@ impl DiscoveryClient {
     /// Build a discovery client with short, independent timeouts; errors if the
     /// HTTP client cannot be constructed.
     pub fn try_new() -> Result<Self, ProviderError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .redirect(crate::client::same_origin_redirect_policy())
-            .build()
-            .map_err(crate::client::provider_error_from_reqwest)?;
+        let http = build_client(None)?;
         Ok(Self { http })
     }
 
@@ -51,6 +46,14 @@ impl DiscoveryClient {
             ))
         })?;
 
+        // Model discovery carries the provider's API key, so it is provider
+        // upstream traffic like chat: an `[provider.egress]` proxy must carry
+        // it too (discovery is infrequent, so the client is built per call).
+        let http = match provider.egress.as_ref() {
+            Some(egress) => build_client(Some(&egress.proxy))?,
+            None => self.http.clone(),
+        };
+
         let mut url = Url::parse(&discovery.endpoint).map_err(|error| {
             ProviderError::InvalidConfig(format!("invalid discovery endpoint: {error}"))
         })?;
@@ -59,7 +62,7 @@ impl DiscoveryClient {
         let mut previous_token: Option<String> = None;
 
         for _ in 0..discovery.max_pages {
-            let value = self.fetch_page(provider, &url).await?;
+            let value = self.fetch_page(&http, provider, &url).await?;
             dropped += parse_models(discovery.kind, &value, &mut models)?;
             if models.len() > discovery.max_models {
                 return Err(ProviderError::InvalidConfig(format!(
@@ -121,6 +124,7 @@ impl DiscoveryClient {
     )]
     async fn fetch_page(
         &self,
+        http: &Client,
         provider: &ProviderConfig,
         url: &Url,
     ) -> Result<Value, ProviderError> {
@@ -133,7 +137,7 @@ impl DiscoveryClient {
             if attempt > 0 {
                 tokio::time::sleep(Self::RETRY_BACKOFF).await;
             }
-            let request = self.build_request(provider, discovery, url);
+            let request = self.build_request(http, provider, discovery, url);
             match self.send_once(request, discovery.max_response_bytes).await {
                 Ok(value) => return Ok(value),
                 Err(error) if Self::is_transient(&error) => {
@@ -170,11 +174,12 @@ impl DiscoveryClient {
 
     fn build_request(
         &self,
+        http: &Client,
         provider: &ProviderConfig,
         discovery: &ProviderDiscoveryConfig,
         url: &Url,
     ) -> RequestBuilder {
-        let mut request = self.http.get(url.clone());
+        let mut request = http.get(url.clone());
         // Self-loop marker (backlog 32): a discovery endpoint that points
         // back at an llm-proxy must be answered 508 instead of looping.
         request = request.header(llm_proxy_core::HOP_HEADER, llm_proxy_core::HOP_HEADER_VALUE);
@@ -349,6 +354,25 @@ fn next_page(
             .map(|token| ("pageToken", token.to_owned()))),
         _ => Ok(None),
     }
+}
+
+/// Build the discovery HTTP client: direct when `proxy` is `None`, otherwise
+/// routed through the configured `[provider.egress]` forward proxy, with the
+/// same timeouts and same-origin redirect policy either way.
+fn build_client(proxy: Option<&str>) -> Result<Client, ProviderError> {
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(crate::client::same_origin_redirect_policy());
+    if let Some(proxy_url) = proxy {
+        crate::client::validate_egress_proxy_url(proxy_url)?;
+        let proxy =
+            reqwest::Proxy::all(proxy_url).map_err(crate::client::provider_error_from_reqwest)?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(crate::client::provider_error_from_reqwest)
 }
 
 impl Default for DiscoveryClient {
@@ -851,5 +875,51 @@ mod tests {
             Some("Bearer "),
         )
         .await;
+    }
+
+    async fn record_absolute_uri_target(
+        State(seen): State<Arc<std::sync::Mutex<Option<String>>>>,
+        uri: axum::http::Uri,
+    ) -> Json<Value> {
+        *seen.lock().expect("seen-target lock") = Some(uri.to_string());
+        Json(json!({"data": [{"id": "m"}], "has_more": false}))
+    }
+
+    #[tokio::test]
+    async fn discovery_goes_through_the_provider_egress_proxy() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let app = Router::new()
+            .fallback(record_absolute_uri_target)
+            .with_state(Arc::clone(&seen));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let proxy_base = format!("http://{address}");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                tracing::trace!(%error, "test egress proxy stopped");
+            }
+        });
+
+        let mut provider = discovery_provider(
+            "http://upstream.invalid/models".to_owned(),
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+        provider.egress = Some(llm_proxy_core::ProviderEgressConfig { proxy: proxy_base });
+
+        let client = DiscoveryClient::try_new().expect("client");
+        let models = client
+            .discover(&provider)
+            .await
+            .expect("discovery must reach upstream.invalid through the provider egress proxy");
+
+        assert_eq!(models[0].id, "m");
+        let seen_target = seen.lock().expect("seen-target lock").clone();
+        assert!(
+            seen_target
+                .as_deref()
+                .is_some_and(|target| target.contains("upstream.invalid")),
+            "the proxy stub must see the absolute upstream.invalid target, got {seen_target:?}"
+        );
     }
 }

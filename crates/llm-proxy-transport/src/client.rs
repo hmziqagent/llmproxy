@@ -405,7 +405,7 @@ fn pooled_http_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
 
 const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
 
-fn validate_egress_proxy_url(proxy_url: &str) -> Result<(), ProviderError> {
+pub(crate) fn validate_egress_proxy_url(proxy_url: &str) -> Result<(), ProviderError> {
     let url = proxy_url.trim();
     let (scheme, rest) = url.split_once("://").ok_or_else(|| {
         ProviderError::InvalidConfig(format!(
