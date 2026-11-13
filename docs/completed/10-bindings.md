@@ -82,8 +82,8 @@ the engine and add no logic of their own, so they start once its API has stopped
   venv (no Rust toolchain in the job) on ubuntu-22.04, windows-latest and
   macos-15 for CPython 3.9 and 3.13, with the pytest suite run against the
   install. The Node binaries are built per platform by
-  `.github/workflows/node-binaries.yml`. aarch64 Windows is not built: it
-  is optional and unverified. Both workflows also run a `clean-install`
+  `.github/workflows/node-binaries.yml`, Windows arm64-msvc included.
+  Both workflows also run a `clean-install`
   job on ubuntu-22.04, windows-latest and macos-15 that removes every Rust
   toolchain from the runner and fails if cargo/rustc/rustup stay
   resolvable, then does the consumer install — the wheel with
