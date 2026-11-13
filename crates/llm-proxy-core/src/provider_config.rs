@@ -2514,33 +2514,25 @@ fn validate_catalog(
 }
 
 fn validate_routes(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
-    for (route_kind, adapter_name) in [
-        (
-            "chat_completions",
-            provider.routes.chat_completions.as_ref(),
-        ),
-        ("messages", provider.routes.messages.as_ref()),
-        ("responses", provider.routes.responses.as_ref()),
-        (
-            "generate_content",
-            provider.routes.generate_content.as_ref(),
-        ),
-    ] {
-        let Some(adapter_name) = adapter_name else {
+    for kind in ProviderRouteKind::ALL {
+        let Some(adapter_name) = provider.routes.get(kind) else {
             continue;
         };
-        let aname = adapter_name.trim();
-        if aname.is_empty() {
+        if adapter_name.trim().is_empty() {
             return Err(ConfigValidationError::EmptyRouteAdapterName {
                 provider: name.to_owned(),
-                route_kind: route_kind.to_owned(),
+                route_kind: kind.config_key().to_owned(),
             });
         }
-        if !provider.adapters.contains_key(aname) {
+        // The registry resolves `provider.routes.get(kind)` to
+        // `provider.adapters.get(adapter_name)` with the value verbatim, so
+        // the existence check must compare the same exact string. A
+        // whitespace-padded name is therefore simply unknown here.
+        if !provider.adapters.contains_key(adapter_name) {
             return Err(ConfigValidationError::UnknownRouteAdapter {
                 provider: name.to_owned(),
-                route_kind: route_kind.to_owned(),
-                adapter: aname.to_owned(),
+                route_kind: kind.config_key().to_owned(),
+                adapter: adapter_name.to_owned(),
             });
         }
     }
@@ -3474,6 +3466,107 @@ mod tests {
                 .count();
             assert_eq!(others, 1, "{kind:?}'s key sets only {kind:?}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_route_pointing_at_missing_adapter() {
+        for kind in ProviderRouteKind::ALL {
+            let provider: ProviderFile = toml::from_str(&format!(
+                r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+{} = "ghost"
+"#,
+                kind.config_key()
+            ))
+            .expect("provider config");
+            let err = validate_provider_config(&provider.provider, None)
+                .expect_err("a route naming an unknown adapter must fail at config load");
+            assert_eq!(
+                err,
+                ConfigValidationError::UnknownRouteAdapter {
+                    provider: "example".to_owned(),
+                    route_kind: kind.config_key().to_owned(),
+                    adapter: "ghost".to_owned(),
+                },
+                "{kind:?} must reject a dangling adapter reference"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_route_adapter_name() {
+        for kind in ProviderRouteKind::ALL {
+            for value in ["", "  "] {
+                let provider: ProviderFile = toml::from_str(&format!(
+                    r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+{} = "{}"
+"#,
+                    kind.config_key(),
+                    value
+                ))
+                .expect("provider config");
+                let err = validate_provider_config(&provider.provider, None)
+                    .expect_err("an empty route adapter name must fail at config load");
+                assert_eq!(
+                    err,
+                    ConfigValidationError::EmptyRouteAdapterName {
+                        provider: "example".to_owned(),
+                        route_kind: kind.config_key().to_owned(),
+                    },
+                    "{kind:?} must reject the empty route adapter name {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_route_adapter_name_with_surrounding_whitespace() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = " chat "
+"#,
+        )
+        .expect("provider config");
+        let err = validate_provider_config(&provider.provider, None).expect_err(
+            "route lookup uses the untrimmed adapter name, so a padded name must fail at load",
+        );
+        assert_eq!(
+            err,
+            ConfigValidationError::UnknownRouteAdapter {
+                provider: "example".to_owned(),
+                route_kind: "chat_completions".to_owned(),
+                adapter: " chat ".to_owned(),
+            }
+        );
     }
 
     #[test]

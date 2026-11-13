@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{AppConfig, load_app_config};
 
@@ -84,13 +84,8 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     if registry.is_empty() {
         println!("  (no providers loaded)");
     } else {
-        let route_errors: Vec<String> = registry.iter().flat_map(print_provider_routes).collect();
-
-        if !route_errors.is_empty() {
-            bail!(
-                "config has {} route resolution error(s)",
-                route_errors.len()
-            );
+        for provider in registry.iter() {
+            print_provider_routes(provider);
         }
     }
 
@@ -126,27 +121,27 @@ fn configured_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<(&'static
         .collect()
 }
 
-fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<String> {
+/// Print every route `provider` configures as `route_key -> adapter/protocol`.
+///
+/// Display only: `validate_provider_config` already refused dangling or
+/// empty route adapter names when the file was loaded, so this never runs
+/// as the route-existence guard.
+fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) {
     println!("{}:", provider.name);
 
     let route_entries = configured_routes(provider);
 
     if route_entries.is_empty() {
         println!("  (no routes configured)");
-        return Vec::new();
+        return;
     }
 
-    let mut errors = Vec::new();
     for (route_kind, adapter_name) in route_entries {
-        if let Some(adapter) = provider.adapters.get(adapter_name) {
-            println!("  {route_kind} -> {adapter_name}/{}", adapter.protocol);
-        } else {
-            let msg = format!("  {route_kind} -> ERROR: unknown adapter \"{adapter_name}\"");
-            println!("{msg}");
-            errors.push(msg);
+        match provider.adapters.get(adapter_name) {
+            Some(adapter) => println!("  {route_kind} -> {adapter_name}/{}", adapter.protocol),
+            None => println!("  {route_kind} -> {adapter_name}"),
         }
     }
-    errors
 }
 
 #[cfg(test)]
