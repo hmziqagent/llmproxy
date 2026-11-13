@@ -2350,10 +2350,13 @@ endpoint = "{endpoint}"
     }
 
     /// The audit's live repro, issued while the daemon is running: a key
-    /// created through the admin surface's store connection with tpm=60,
+    /// created through the admin surface's store connection with tpm=110,
     /// behind an upstream that reports prompt_tokens=50 per embeddings
     /// call — three tiny calls must answer 200, 200, 429 exactly like the
-    /// equivalent file key.
+    /// equivalent file key. Each 48-byte JSON body reserves 12 estimated
+    /// input tokens at admission (chars/4), so the second call projects
+    /// 50 settled + 12 reserved (admitted) and the third 100 + 12
+    /// (refused) — reported usage is what pushes it over.
     #[tokio::test]
     #[cfg(feature = "endpoint-families")]
     async fn a_runtime_issued_managed_keys_tpm_is_enforced() {
@@ -2384,7 +2387,7 @@ endpoint = "{endpoint}"
 
         let issued = admin_view(dir.path())
             .create(&llm_proxy_admin::KeyPolicyInput {
-                tpm: Some(60),
+                tpm: Some(110),
                 ..llm_proxy_admin::KeyPolicyInput::default()
             })
             .expect("runtime issuance");
@@ -2416,7 +2419,8 @@ endpoint = "{endpoint}"
         assert_eq!(
             third.status(),
             StatusCode::TOO_MANY_REQUESTS,
-            "third call crosses the runtime-issued tpm of 60 (50 charged per call)"
+            "third call crosses the runtime-issued tpm of 110 (50 charged per call, 12 \
+             reserved at admission)"
         );
     }
 

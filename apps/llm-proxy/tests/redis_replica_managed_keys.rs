@@ -30,14 +30,16 @@ mod tests {
     const EFFECT_DEADLINE: Duration = Duration::from_secs(20);
 
     /// The embeddings answer the fake upstream serves: `prompt_tokens` of
-    /// 50 per call against a runtime-issued tpm of 60 gives 200, 200, 429.
+    /// 50 per call against a runtime-issued tpm of 110 gives 200, 200, 429
+    /// (each 48-byte call also reserves 12 estimated input tokens, so the
+    /// third call projects 100 settled + 12 reserved and is refused).
     const EMBEDDINGS_BODY: &str = r#"{"object":"list","data":[{"object":"embedding","index":0,
         "embedding":[0.1,0.2]}],"model":"text-embedding-3-small",
         "usage":{"prompt_tokens":50,"total_tokens":50}}"#;
 
     /// The request body the proxy client sends: tiny, so the reserve-time
-    /// estimate stays well under the tpm and only the reported usage of 50
-    /// per call moves the shared counter.
+    /// estimate (12 tokens at chars/4) stays well under the tpm and only
+    /// the reported usage of 50 per call moves the shared counter.
     const EMBEDDINGS_REQUEST: &str = r#"{"model":"text-embedding-3-small","input":"hi"}"#;
 
     async fn spawn_json_upstream(body: &'static str) -> std::net::SocketAddr {
@@ -243,7 +245,7 @@ path = "{usage}"
 
         let issued = admin_view(dir.path())
             .create(&llm_proxy_admin::KeyPolicyInput {
-                tpm: Some(60),
+                tpm: Some(110),
                 ..llm_proxy_admin::KeyPolicyInput::default()
             })
             .expect("runtime issuance");
@@ -258,7 +260,7 @@ path = "{usage}"
         assert_eq!(second.status(), StatusCode::OK);
 
         // The store settles asynchronously (the settle write is a spawned
-        // roundtrip), so the tpm of 60 bites once the two 50-token charges
+        // roundtrip), so the tpm of 110 bites once the two 50-token charges
         // land — the same 200/200/429 shape the in-process backend gives,
         // arrived at by polling rather than by the third call racing the
         // settles.
