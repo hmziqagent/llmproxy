@@ -156,19 +156,27 @@ async fn fixture(bind_port: u16) -> Fixture {
     }
 }
 
-async fn post(app: &Router, token: Option<&str>, body: &str) -> Response {
+async fn post_with_authorization(
+    app: &Router,
+    authorization: Option<String>,
+    body: &str,
+) -> Response {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/mcp")
         .header(header::CONTENT_TYPE, "application/json")
         .header("mcp-protocol-version", "2026-07-28");
-    if let Some(token) = token {
-        builder = builder.header("authorization", format!("Bearer {token}"));
+    if let Some(authorization) = authorization {
+        builder = builder.header("authorization", authorization);
     }
     app.clone()
         .oneshot(builder.body(Body::from(body.to_owned())).expect("request"))
         .await
         .expect("response")
+}
+
+async fn post(app: &Router, token: Option<&str>, body: &str) -> Response {
+    post_with_authorization(app, token.map(|token| format!("Bearer {token}")), body).await
 }
 
 async fn json_of(response: Response) -> serde_json::Value {
@@ -199,6 +207,88 @@ async fn its_own_tokens_guard_the_endpoint() {
     )
     .await;
     assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_bearer_scheme_is_case_insensitive() {
+    let fixture = fixture(3980).await;
+    let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    // RFC 7235 schemes are case-insensitive; any case of `bearer` with a
+    // valid token authenticates.
+    for accepted in ["bearer gateway-token", "BEARER gateway-token"] {
+        let response = post_with_authorization(&fixture.app, Some(accepted.to_owned()), ping).await;
+        assert_eq!(response.status(), StatusCode::OK, "header {accepted:?}");
+    }
+    // A bare scheme, an empty token and a foreign scheme are all refused.
+    for refused in ["Bearer", "Bearer ", "Basic gateway-token"] {
+        let response = post_with_authorization(&fixture.app, Some(refused.to_owned()), ping).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "header {refused:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_token_that_shares_a_prefix_with_a_valid_one_is_refused() {
+    let fixture = fixture(3981).await;
+    for near_miss in ["gateway", "gateway-tok", "gateway-token-but-longer"] {
+        let response = post(
+            &fixture.app,
+            Some(near_miss),
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "token {near_miss:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn with_several_tokens_each_one_authenticates_as_its_own_id() {
+    let (upstream_url, upstream_headers) = spawn_fake_upstream().await;
+    let admission = Arc::new(RecordingAdmission::default());
+    let bus = Arc::new(RecordingBus::new());
+    let mut config = gateway_config(upstream_url, 3982);
+    config
+        .tokens
+        .push(SecretString::from("second-gateway-token"));
+    let gateway = McpGateway::new(
+        config,
+        Arc::clone(&admission) as Arc<dyn Admission>,
+        Arc::clone(&bus) as Arc<dyn EventBus>,
+        Arc::new(ProxyClient::try_new().expect("client")),
+    );
+    let fixture = Fixture {
+        app: gateway.router(),
+        admission,
+        bus,
+        upstream_headers,
+    };
+
+    for (token, id) in [
+        ("gateway-token", "mcp-token-0"),
+        ("second-gateway-token", "mcp-token-1"),
+    ] {
+        let response = post(
+            &fixture.app,
+            Some(token),
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call",
+            "params":{"name":"docs__echo","arguments":{"text":"hi"}}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "token {token} ({id})");
+    }
+    let reserves = fixture.admission.reserves.lock().await;
+    assert_eq!(
+        *reserves,
+        vec!["mcp-token-0/echo".to_owned(), "mcp-token-1/echo".to_owned()],
+        "each token is charged under its own caller id, got {reserves:?}"
+    );
 }
 
 #[tokio::test]

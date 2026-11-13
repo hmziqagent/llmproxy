@@ -42,11 +42,15 @@ use llm_proxy_core::McpGatewayConfig;
 use llm_proxy_engine::Admission;
 use llm_proxy_storage::EventBus;
 use llm_proxy_transport::ProxyClient;
+use sha2::{Digest, Sha256};
 
 /// The gateway: config plus the shared admission step, usage sink and
 /// transport, and its own session table.
 pub struct McpGateway {
     pub(crate) config: McpGatewayConfig,
+    /// Each configured token's SHA-256 digest; the plaintext is never
+    /// retained or compared (same posture as the admin token).
+    token_digests: Vec<[u8; 32]>,
     pub(crate) admission: Arc<dyn Admission>,
     pub(crate) bus: Arc<dyn EventBus>,
     pub(crate) transport: Arc<ProxyClient>,
@@ -82,6 +86,12 @@ impl McpGateway {
         bus: Arc<dyn EventBus>,
         transport: Arc<ProxyClient>,
     ) -> Self {
+        use secrecy::ExposeSecret;
+        let token_digests = config
+            .tokens
+            .iter()
+            .map(|token| Sha256::digest(token.expose_secret().as_bytes()).into())
+            .collect();
         let upstreams = config
             .upstreams
             .iter()
@@ -89,6 +99,7 @@ impl McpGateway {
             .collect();
         Self {
             config,
+            token_digests,
             admission,
             bus,
             transport,
@@ -119,12 +130,18 @@ impl McpGateway {
     /// list: token *ids* are the list index (`mcp-token-<n>`), which is
     /// what admission charges and usage rows record.
     pub(crate) fn token_id(&self, presented: Option<&str>) -> Option<String> {
-        use secrecy::ExposeSecret;
         let presented = presented?;
-        self.config
-            .tokens
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        // Compare against every stored digest without short-circuiting
+        // between tokens, so timing does not reveal the token's position.
+        let matches: Vec<bool> = self
+            .token_digests
             .iter()
-            .position(|token| token.expose_secret() == presented)
+            .map(|expected| constant_time_eq(&digest, expected))
+            .collect();
+        matches
+            .iter()
+            .position(|matched| *matched)
             .map(|index| format!("mcp-token-{index}"))
     }
 
@@ -153,6 +170,20 @@ impl McpGateway {
     pub(crate) fn upstreams(&self) -> &[UpstreamMcp] {
         &self.upstreams
     }
+}
+
+/// Byte-wise constant-time equality, duplicated from
+/// `crates/llm-proxy-admin/src/auth.rs` so the mcp crate does not depend
+/// on the admin crate.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -186,6 +217,26 @@ mod tests {
             Some("mcp-token-1")
         );
         assert_eq!(gateway.token_id(Some("wrong")), None);
+        assert_eq!(gateway.token_id(None), None);
+    }
+
+    #[test]
+    fn a_wrong_length_or_absent_token_matches_nothing() {
+        use secrecy::SecretString;
+        let config = McpGatewayConfig {
+            bind: "127.0.0.1:3913".parse().expect("addr"),
+            tokens: vec![SecretString::from("alpha-token")],
+            upstreams: Vec::new(),
+            session_ttl: std::time::Duration::from_secs(60),
+        };
+        let gateway = McpGateway::new(
+            config,
+            Arc::new(llm_proxy_engine::AllowAllAdmission),
+            Arc::new(llm_proxy_storage::NoopBus),
+            Arc::new(ProxyClient::try_new().expect("client")),
+        );
+        assert_eq!(gateway.token_id(Some("alpha")), None);
+        assert_eq!(gateway.token_id(Some("alpha-token-and-more")), None);
         assert_eq!(gateway.token_id(None), None);
     }
 

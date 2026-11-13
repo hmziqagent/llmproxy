@@ -84,11 +84,7 @@ pub(crate) async fn method_not_allowed() -> Response {
 /// The gateway's own bearer auth: `[mcp]` tokens, never the proxy's
 /// client keys.
 fn authenticate(gateway: &McpGateway, headers: &HeaderMap) -> Result<String, Box<Response>> {
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned));
-    match gateway.token_id(presented.as_deref()) {
+    match gateway.token_id(bearer_token(headers)) {
         Some(token_id) => Ok(token_id),
         None => Err(Box::new(
             (
@@ -97,6 +93,23 @@ fn authenticate(gateway: &McpGateway, headers: &HeaderMap) -> Result<String, Box
             )
                 .into_response(),
         )),
+    }
+}
+
+/// The same Authorization-header parse as
+/// `crates/llm-proxy-admin/src/auth.rs::bearer_token` (case-insensitive
+/// scheme, trimmed non-empty token); duplicated rather than depending on
+/// the admin crate.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?;
+    let header_value = value.to_str().ok()?;
+    let mut parts = header_value.splitn(2, ' ');
+    match (parts.next(), parts.next()) {
+        (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("bearer") => {
+            let token = token.trim();
+            (!token.is_empty()).then_some(token)
+        }
+        _ => None,
     }
 }
 
