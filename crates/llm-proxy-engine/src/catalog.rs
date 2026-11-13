@@ -1,5 +1,6 @@
 //! Runtime provider model catalog cache and refresh coordination.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -7,7 +8,8 @@ use std::time::Instant;
 
 use llm_proxy_adapters::ProviderError;
 use llm_proxy_core::{
-    CatalogFile, CatalogFileMetadata, ProviderConfig, StaticModelCatalogEntry, merge_catalog,
+    CatalogFile, CatalogFileMetadata, ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig,
+    StaticModelCatalogEntry, merge_catalog,
 };
 use llm_proxy_transport::DiscoveryClient;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -101,11 +103,10 @@ impl ModelCatalogService {
         provider: &ProviderConfig,
         refresh_live: bool,
     ) -> Result<Vec<StaticModelCatalogEntry>, ProviderError> {
-        let config_ref = provider.catalog.as_ref();
+        let config = catalog_config(provider).into_owned();
         self.load_disk_cache(provider).await?;
-        let discovery_enabled = config_ref
-            .is_some_and(|c| !matches!(c.mode, llm_proxy_core::ProviderCatalogMode::Static))
-            && provider.discovery.is_some();
+        let discovery_enabled =
+            !matches!(config.mode, ProviderCatalogMode::Static) && provider.discovery.is_some();
         if refresh_live && discovery_enabled && !self.cache_is_fresh(provider).await {
             if let Err(error) = self.refresh(provider).await {
                 let stale = self
@@ -115,7 +116,7 @@ impl ModelCatalogService {
                     .get(&provider.name)
                     .map(|file| file.catalog.models.clone())
                     .unwrap_or_default();
-                let merged = merge_catalog(&config_ref.cloned().unwrap_or_default(), &stale);
+                let merged = merge_catalog(&config, &stale);
                 if merged.is_empty() {
                     return Err(error);
                 }
@@ -130,10 +131,7 @@ impl ModelCatalogService {
             .get(&provider.name)
             .map(|file| file.catalog.models.clone())
             .unwrap_or_default();
-        Ok(merge_catalog(
-            &config_ref.cloned().unwrap_or_default(),
-            &discovered,
-        ))
+        Ok(merge_catalog(&config, &discovered))
     }
 
     /// O(1) catalog-enforcement membership check for `upstream_model`:
@@ -320,10 +318,7 @@ impl ModelCatalogService {
     }
 
     async fn cache_is_fresh(&self, provider: &ProviderConfig) -> bool {
-        let ttl = provider
-            .catalog
-            .as_ref()
-            .map_or_else(std::time::Duration::default, |c| c.cache_ttl);
+        let ttl = catalog_config(provider).cache_ttl;
         let ttl_secs = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
         self.cache
             .read()
@@ -389,6 +384,17 @@ impl ModelCatalogService {
         self.bump_cache_generation(&provider.name);
         Ok(())
     }
+}
+
+/// The provider's effective catalog configuration: an absent
+/// `[provider.catalog]` section defaults to advisory hybrid with the 24h TTL,
+/// matching `id_index_for`, the CLI `models` command and the plan's hybrid
+/// default.
+fn catalog_config(provider: &ProviderConfig) -> Cow<'_, ProviderCatalogConfig> {
+    provider.catalog.as_ref().map_or_else(
+        || Cow::Owned(ProviderCatalogConfig::default()),
+        Cow::Borrowed,
+    )
 }
 
 fn normalized_ids(merged: &[StaticModelCatalogEntry]) -> HashSet<String> {
@@ -507,8 +513,7 @@ mod tests {
 
     use axum::{Router, extract::State, http::StatusCode, routing::get};
     use llm_proxy_core::{
-        AuthStyle, ProviderCatalogConfig, ProviderCatalogMode, ProviderDiscoveryConfig,
-        ProviderDiscoveryKind, ProviderRoutesConfig,
+        AuthStyle, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderRoutesConfig,
     };
 
     use super::*;
@@ -1019,6 +1024,48 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/models"), count)
+    }
+
+    #[tokio::test]
+    async fn live_refresh_runs_when_catalog_section_is_omitted() {
+        let (endpoint, count) = succeeding_server(vec!["live-model"]).await;
+        let mut provider = provider(endpoint);
+        provider.catalog = None;
+        let service = ModelCatalogService::new(None);
+
+        let models = service.catalog(&provider, true).await.unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "refresh=live must reach the discovery endpoint"
+        );
+        assert_eq!(models.len(), 1, "the discovered model must be returned");
+        assert_eq!(models[0].id, "live-model");
+    }
+
+    #[tokio::test]
+    async fn fresh_default_ttl_cache_is_not_refetched_when_catalog_section_is_omitted() {
+        let directory = temp_dir();
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write_catalog_atomic(&directory, &catalog_file(&now)).unwrap();
+        let (endpoint, count) = succeeding_server(vec!["live-model"]).await;
+        let mut provider = provider(endpoint);
+        provider.catalog = None;
+        let service = ModelCatalogService::new(Some(directory.clone()));
+
+        service.catalog(&provider, true).await.unwrap();
+        service.catalog(&provider, true).await.unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a cache fresh under the default TTL must not be refetched"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
