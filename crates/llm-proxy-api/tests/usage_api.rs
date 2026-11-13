@@ -276,6 +276,134 @@ mod tests {
         );
     }
 
+    /// Seeds one ledger with three provider groups: all priced (prov-a),
+    /// all unpriced (prov-free), and prov-mixed — one priced completion and
+    /// one unpriced completion — for the summary's `cost_partial` flag.
+    async fn seed_with_mixed_pricing_group() -> Ledger {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(
+            &path,
+            llm_proxy_storage::RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: std::time::Duration::from_secs(3600),
+            },
+        )
+        .expect("open ledger");
+        let t0 = OffsetDateTime::now_utc();
+        let second = std::time::Duration::from_secs(1);
+        let events = [
+            received_event("mix-a", "laptop", "prov-a", "claude-3", t0),
+            completed_event(
+                "mix-a",
+                "prov-a",
+                "claude-3",
+                t0 + second,
+                "0.1000000000000000000000001",
+            ),
+            received_event(
+                "mix-free",
+                "tablet",
+                "prov-free",
+                "free-model",
+                t0 + second * 2,
+            ),
+            completed_event_without_cost("mix-free", "prov-free", "free-model", t0 + second * 2),
+            received_event(
+                "mix-priced",
+                "phone",
+                "prov-mixed",
+                "claude-3",
+                t0 + second * 3,
+            ),
+            completed_event(
+                "mix-priced",
+                "prov-mixed",
+                "claude-3",
+                t0 + second * 4,
+                "0.0400000000000000000000004",
+            ),
+            received_event(
+                "mix-unpriced",
+                "phone",
+                "prov-mixed",
+                "free-model",
+                t0 + second * 5,
+            ),
+            completed_event_without_cost(
+                "mix-unpriced",
+                "prov-mixed",
+                "free-model",
+                t0 + second * 6,
+            ),
+        ];
+        for event in &events {
+            bus.emit(event);
+        }
+        let closer = std::sync::Arc::new(bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close joined");
+        Ledger {
+            _dir: dir,
+            path,
+            t0,
+        }
+    }
+
+    /// Plan 05 step 9: a group mixing priced and unpriced completions must
+    /// not present its priced-only sum as the full cost.
+    #[tokio::test]
+    async fn a_group_mixing_priced_and_unpriced_rows_flags_its_cost_partial() {
+        let ledger = seed_with_mixed_pricing_group().await;
+        let (status, body) = get_json(
+            app_for(&ledger.path),
+            "/usage/summary?group_by=provider",
+            Some(ADMIN_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let groups = body["groups"].as_array().expect("groups array");
+        let find = |key: &str| {
+            groups
+                .iter()
+                .find(|g| g["key"] == key)
+                .unwrap_or_else(|| panic!("group {key} missing: {groups:?}"))
+        };
+
+        let mixed = find("prov-mixed");
+        assert_eq!(mixed["requests"], 2);
+        assert_eq!(
+            mixed["cost"]["total"], "0.0400000000000000000000004",
+            "cost covers only the priced row's exact decimal"
+        );
+        assert_eq!(mixed["unpriced"], 1);
+        assert_eq!(
+            mixed["cost_partial"], true,
+            "a priced-only sum next to an unpriced completion is partial"
+        );
+
+        let prov_a = find("prov-a");
+        assert_eq!(prov_a["unpriced"], 0);
+        assert_eq!(
+            prov_a["cost_partial"], false,
+            "a fully priced group's sum is complete"
+        );
+
+        let prov_free = find("prov-free");
+        assert!(
+            prov_free["cost"].is_null(),
+            "an all-unpriced group keeps null cost, got {}",
+            prov_free["cost"]
+        );
+        assert_eq!(prov_free["unpriced"], 1);
+        assert_eq!(
+            prov_free["cost_partial"], false,
+            "null cost has nothing to be partial about"
+        );
+    }
+
     async fn get_json(app: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
         let mut builder = Request::builder().uri(uri);
         if let Some(token) = token {

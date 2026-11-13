@@ -126,6 +126,9 @@ pub struct SummaryGroup {
     /// happened on an unpriced model. Served copies never count: they
     /// charge nothing by design, so they are not unpriced either.
     pub unpriced: i64,
+    /// `cost` covers only priced rows when true: the group also carries
+    /// unpriced completions, so the total is partial, not the full cost.
+    pub cost_partial: bool,
     /// Requests answered from the response cache (plan 05 step 6): they
     /// cost nothing by design.
     pub cache_hits: i64,
@@ -429,6 +432,7 @@ fn summary_sync(
                 },
                 cost: None,
                 unpriced: row.get(8)?,
+                cost_partial: false,
                 cache_hits: row.get(9)?,
             })
         })?;
@@ -443,6 +447,11 @@ fn summary_sync(
         if let Some(group_row) = groups.iter_mut().find(|g| g.key == group_key) {
             group_row.cost = Some(cost_totals_from(total));
         }
+    }
+    // A priced sum sitting next to unpriced completions is incomplete: flag
+    // it so a partial total is never presented as the full cost.
+    for group in &mut groups {
+        group.cost_partial = group.cost.is_some() && group.unpriced > 0;
     }
     Ok(groups)
 }
