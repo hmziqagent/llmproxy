@@ -5,12 +5,14 @@
 mod tests {
 
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
 
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        extract::ConnectInfo,
+        http::{Request, StatusCode, header},
     };
     use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
@@ -67,6 +69,12 @@ mod tests {
     }
 
     fn state_with_provider() -> AppState {
+        state_with_provider_at_rate(100, false)
+    }
+
+    /// The same fixture with the test's own rate-limit posture: limiter state
+    /// lives in each `AppState`, so every rate-limit test builds its own.
+    fn state_with_provider_at_rate(rate_limit_rpm: u32, trust_forwarded_headers: bool) -> AppState {
         let provider = ProviderConfig {
             name: "mock-provider".to_owned(),
             api_key: secrecy::SecretString::from("test-key"),
@@ -113,8 +121,8 @@ mod tests {
                     hot_reload: false,
                     allowed_origins: None,
                     server_name: "test-proxy".to_owned(),
-                    rate_limit_rpm: 100,
-                    trust_forwarded_headers: false,
+                    rate_limit_rpm,
+                    trust_forwarded_headers,
                     cache: Default::default(),
                     idempotency: Default::default(),
                     metrics: Default::default(),
@@ -1390,6 +1398,126 @@ mod tests {
             count_events(&bus, "response_failed"),
             1,
             "an inside-pipeline failure must emit exactly ONE ResponseFailed (no double-emit)"
+        );
+    }
+
+    fn count_tokens_from(addr: SocketAddr, bearer: Option<&str>) -> Request<Body> {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages/count_tokens")
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let mut request = builder
+            .body(Body::from(body.to_string()))
+            .expect("valid request");
+        request.extensions_mut().insert(ConnectInfo(addr));
+        request
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_direct_loopback_is_not_rate_limited() {
+        let app = build_router(state_with_provider_at_rate(1, false));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().expect("valid loopback address");
+        for count in 1..=5 {
+            let resp = app
+                .clone()
+                .oneshot(count_tokens_from(addr, None))
+                .await
+                .expect("response");
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "direct unauthenticated loopback request {count} must bypass the rpm=1 limiter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_loopback_clients_are_rate_limited() {
+        let app = build_router(state_with_provider_at_rate(1, false));
+        let addr: SocketAddr = "10.0.0.5:1234".parse().expect("valid address");
+        let first = app
+            .clone()
+            .oneshot(count_tokens_from(addr, None))
+            .await
+            .expect("response");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first rpm=1 request must pass"
+        );
+        let second = app
+            .oneshot(count_tokens_from(addr, None))
+            .await
+            .expect("response");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a non-loopback caller must be limited at rpm=1"
+        );
+        assert!(
+            second.headers().contains_key(header::RETRY_AFTER),
+            "a 429 must carry a retry-after header"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_loopback_caller_is_rate_limited() {
+        let state = state_with_provider_at_rate(1, false)
+            .with_client_auth(Arc::new(client_auth_for("laptop", "sekrit-token")));
+        let app = build_router(state);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().expect("valid loopback address");
+        let bearer = Some("laptop.sekrit-token");
+        let first = app
+            .clone()
+            .oneshot(count_tokens_from(addr, bearer))
+            .await
+            .expect("response");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first rpm=1 request must pass"
+        );
+        let second = app
+            .oneshot(count_tokens_from(addr, bearer))
+            .await
+            .expect("response");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an authenticated loopback caller must not inherit the direct-loopback exemption"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_exemption_is_off_when_forwarded_headers_are_trusted() {
+        let app = build_router(state_with_provider_at_rate(1, true));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().expect("valid loopback address");
+        let first = app
+            .clone()
+            .oneshot(count_tokens_from(addr, None))
+            .await
+            .expect("response");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first rpm=1 request must pass"
+        );
+        let second = app
+            .oneshot(count_tokens_from(addr, None))
+            .await
+            .expect("response");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "trusting forwarded headers must turn the direct-loopback exemption off"
         );
     }
 }
