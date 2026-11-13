@@ -1,0 +1,223 @@
+name: Bindings release
+
+# Plan 10 item 10-13: nothing built or published the bindings on a tag, and
+# the binding version strings (bindings/python/pyproject.toml,
+# bindings/python/Cargo.toml, bindings/node/package.json,
+# bindings/node/Cargo.toml and every bindings/node/npm/*/package.json) were
+# separately maintained copies. A `bindings-v*` tag releases both bindings:
+# the `versions` job fails unless every copy equals the tag version, then the
+# CI build workflows (10-10 python-wheels.yml, 10-11 node-binaries.yml) are
+# reused through workflow_call, and the artifacts are published with PyPI
+# trusted publishing and npm provenance. The cargo-dist release.yml for the
+# daemon is generated and untouched by this workflow.
+#
+# A maintainer must configure once, outside this repository (no tokens are
+# committed here):
+#   - PyPI: a trusted publisher for this repo, workflow
+#     bindings-release.yml, environment `pypi`; job publish-pypi needs no
+#     token secret (OIDC, permissions id-token: write).
+#   - npm: environment `npm` with a repository secret `NPM_TOKEN` holding a
+#     publish token for the @freeoxide scope; provenance uses the
+#     id-token: write permission granted below. The npm scope @freeoxide must
+#     exist; the unscoped `llm-proxy` name belongs to someone else
+#     (bindings/README.md), so only the scoped name is published.
+# `workflow_dispatch` defaults to dry_run: true: the same pipeline runs with
+# twine check and npm publish --dry-run and touches no registry, so a branch
+# can exercise versions, builds and packaging checks before a real tag.
+
+on:
+  push:
+    tags:
+      - "bindings-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip registry publishing: run twine check and npm publish --dry-run only"
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    name: every binding version matches the bindings-v* tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert every binding version string is the same version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python3 -c 'import tomllib; print(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["project"]["version"])')"
+          case "$expected" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error file=bindings/python/pyproject.toml::not a semver version: $expected"; exit 1 ;;
+          esac
+          failed=0
+          check() {
+            local file="$1" version="$2"
+            if [ "$version" != "$expected" ]; then
+              echo "::error file=$file::version is $version, expected $expected (bindings/python/pyproject.toml)"
+              failed=1
+            else
+              echo "$file: $version"
+            fi
+          }
+          check bindings/python/pyproject.toml "$expected"
+          check bindings/python/Cargo.toml "$(python3 -c 'import tomllib; print(tomllib.load(open("bindings/python/Cargo.toml", "rb"))["package"]["version"])')"
+          check bindings/node/package.json "$(python3 -c 'import json; print(json.load(open("bindings/node/package.json"))["version"])')"
+          check bindings/node/Cargo.toml "$(python3 -c 'import tomllib; print(tomllib.load(open("bindings/node/Cargo.toml", "rb"))["package"]["version"])')"
+          shopt -s nullglob
+          npm_packages=(bindings/node/npm/*/package.json)
+          if [ "${#npm_packages[@]}" -eq 0 ]; then
+            echo "::error::no bindings/node/npm/*/package.json found"
+            exit 1
+          fi
+          for file in "${npm_packages[@]}"; do
+            check "$file" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$file")"
+          done
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            case "$GITHUB_REF_NAME" in
+              bindings-v*) tag_version="${GITHUB_REF_NAME#bindings-v}" ;;
+              *) echo "::error::release ref $GITHUB_REF_NAME is not a bindings-v* tag"; exit 1 ;;
+            esac
+            if [ -z "$tag_version" ] || [ "$tag_version" != "$expected" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match binding version $expected"
+              exit 1
+            fi
+            echo "tag $GITHUB_REF_NAME matches binding version $expected"
+          else
+            echo "workflow_dispatch: checking that all version strings agree (pyproject.toml is the reference)"
+          fi
+          exit "$failed"
+
+  # Local reusable-workflow calls must be on the same commit; a completed
+  # call means every job inside the called workflow passed, including the
+  # 3-OS install matrix and the no-Rust clean-install guard (10-12).
+  python-wheels:
+    name: build wheels, sdist and the install matrix
+    needs: [versions]
+    uses: ./.github/workflows/python-wheels.yml
+
+  node-binaries:
+    name: build the prebuilt platform binaries
+    needs: [versions]
+    uses: ./.github/workflows/node-binaries.yml
+
+  publish-pypi:
+    name: publish the wheels and sdist to PyPI
+    needs: [versions, python-wheels]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Download every wheel
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Download the sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: List the distributions to be published
+        run: ls -la dist/
+      - name: twine check the distributions
+        run: |
+          python -m pip install --quiet twine
+          python -m twine check dist/*
+      - name: Publish to PyPI (trusted publishing)
+        if: inputs.dry_run != true
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  publish-npm:
+    name: publish the npm packages
+    needs: [versions, node-binaries]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+      - name: Install pinned dependencies (the @napi-rs/cli that runs pre-publish)
+        working-directory: bindings/node
+        run: npm ci
+      - name: Download the generated loader for the main package
+        uses: actions/download-artifact@v4
+        with:
+          name: node-loader
+          path: bindings/node
+      - name: Download every prebuilt binary
+        uses: actions/download-artifact@v4
+        with:
+          pattern: node-binary-*
+          merge-multiple: true
+          path: binaries
+      - name: Stage each binary into its npm/<platform> package
+        working-directory: bindings/node
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          staged=0
+          for dir in npm/*/; do
+            platform="$(basename "$dir")"
+            binary="llm-proxy.${platform}.node"
+            if [ ! -f "../binaries/${binary}" ]; then
+              echo "::error::no built binary for platform ${platform}: expected ../binaries/${binary}"
+              exit 1
+            fi
+            cp "../binaries/${binary}" "npm/${platform}/${binary}"
+            echo "staged npm/${platform}/${binary}"
+            staged=$((staged + 1))
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no bindings/node/npm/*/ platform package found"
+            exit 1
+          fi
+      # napi prepublish validates every platform package (name, files list,
+      # the staged llm-proxy.<platform>.node) and syncs the root
+      # optionalDependencies with the pinned @napi-rs/cli.
+      - name: Run the pinned @napi-rs/cli pre-publish step
+        working-directory: bindings/node
+        run: npx napi prepublish
+      - name: Publish the platform packages, then the main package
+        working-directory: bindings/node
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            publish_args=(--dry-run)
+          else
+            publish_args=(--provenance --access public)
+          fi
+          shopt -s nullglob
+          for dir in npm/*/; do
+            echo "publishing @freeoxide/llm-proxy-$(basename "$dir")"
+            ( cd "$dir" && npm publish "${publish_args[@]}" )
+          done
+          # Last, so the platform packages it depends on already exist.
+          echo "publishing @freeoxide/llm-proxy"
+          npm publish "${publish_args[@]}"
