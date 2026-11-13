@@ -222,10 +222,7 @@ fn metrics_rows(
             "server.metrics.otlp.endpoint",
             server.metrics.otlp.as_ref().map_or_else(
                 || "disabled".to_owned(),
-                |otlp| {
-                    llm_proxy_core::provider_config::endpoint_without_query(&otlp.endpoint)
-                        .to_owned()
-                },
+                |otlp| llm_proxy_core::provider_config::endpoint_for_display(&otlp.endpoint),
             ),
             source_of(table, &["server", "metrics", "otlp", "endpoint"]),
         ),

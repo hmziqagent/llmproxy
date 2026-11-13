@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_adapters::request::{AuthHeaders, ProxyRequest};
 use llm_proxy_core::{
-    AppConfig, ProviderConfig, ProviderRouteKind, provider_config::endpoint_without_query,
+    AppConfig, ProviderConfig, ProviderRouteKind, provider_config::endpoint_for_display,
 };
 use tokio::net::TcpStream as TokioTcpStream;
 
@@ -167,7 +167,10 @@ async fn reachability(provider: &ProviderConfig, name: &str, endpoint: &str) -> 
             provider: provider.name.clone(),
             check,
             outcome: Outcome::Fail,
-            detail: format!("endpoint has no host:port: {endpoint}"),
+            detail: format!(
+                "endpoint has no host:port: {}",
+                endpoint_for_display(endpoint)
+            ),
             fix: Some("fix the endpoint URL in the provider's [provider.adapters]".to_owned()),
         };
     };
@@ -408,7 +411,7 @@ async fn probe_check(provider: &ProviderConfig, config: &AppConfig) -> CheckOutc
     };
     let detail_prefix = format!(
         "model {model} at {}",
-        endpoint_without_query(&adapter.endpoint)
+        endpoint_for_display(&adapter.endpoint)
     );
     match client.send(request).await {
         Ok(_) => CheckOutcome {

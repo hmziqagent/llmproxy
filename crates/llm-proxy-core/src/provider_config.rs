@@ -1501,6 +1501,34 @@ pub fn endpoint_without_query(endpoint: &str) -> &str {
         .map_or(endpoint, |(base, _query)| base)
 }
 
+/// An endpoint URL fit for human-facing output (errors, doctor rows): the
+/// userinfo (`user:pass@`) is stripped from the authority and the query
+/// string and fragment are dropped — all three are places credentials hide
+/// (`http://user:pass@host`, a Gemini-style `?key=` parameter). The scheme,
+/// host and path stay so the operator can still find the adapter the error
+/// is about.
+#[must_use]
+pub fn endpoint_for_display(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        // No scheme means no authority, so no userinfo to strip; the query
+        // and fragment can still carry secrets.
+        return endpoint
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let path = rest
+        .strip_prefix(authority)
+        .unwrap_or_default()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    format!("{scheme}://{host}{path}")
+}
+
 /// The kind of client-facing route being requested.
 ///
 /// Each variant corresponds to an inbound endpoint that the proxy exposes.
@@ -2398,7 +2426,7 @@ fn validate_adapters(
             return Err(ConfigValidationError::InvalidEndpointScheme {
                 provider: name.to_owned(),
                 adapter: adapter_name.clone(),
-                endpoint: adapter_cfg.endpoint.clone(),
+                endpoint: endpoint_for_display(&adapter_cfg.endpoint),
             });
         }
         validate_cleartext_endpoint(name, adapter_name, &adapter_cfg.endpoint)?;
@@ -2468,7 +2496,7 @@ fn validate_discovery(provider: &ProviderConfig, name: &str) -> Result<(), Confi
         return Err(ConfigValidationError::InvalidEndpointScheme {
             provider: name.to_owned(),
             adapter: "discovery".to_owned(),
-            endpoint: discovery.endpoint.clone(),
+            endpoint: endpoint_for_display(&discovery.endpoint),
         });
     }
     validate_cleartext_endpoint(name, "discovery", &discovery.endpoint)?;
@@ -2634,7 +2662,7 @@ fn validate_cleartext_endpoint(
         return Err(ConfigValidationError::CleartextCredentials {
             provider: provider.to_owned(),
             adapter: adapter.to_owned(),
-            endpoint: endpoint.to_owned(),
+            endpoint: endpoint_for_display(endpoint),
             host: host.to_owned(),
         });
     }
@@ -3801,6 +3829,56 @@ chat_completions = "chat"
             message.contains("https"),
             "the error must name the fix: {message}"
         );
+    }
+
+    /// A cleartext or invalid-scheme error is exactly when an endpoint is
+    /// most likely to carry credentials — userinfo in the authority or a
+    /// Gemini-style `?key=` in the query — so the Display string must keep
+    /// the host but never echo the secrets (fix-brief 07-14).
+    #[test]
+    fn cleartext_error_does_not_echo_userinfo_or_query() {
+        let echo_adapter_endpoint = |endpoint: &str| {
+            let mut provider = make_minimal_provider("echo");
+            let Some(adapter) = provider.adapters.get_mut("chat") else {
+                panic!("minimal provider has a chat adapter");
+            };
+            adapter.endpoint = endpoint.to_owned();
+            validate_provider_config(&provider, None)
+                .expect_err("a credential-bearing endpoint must be refused")
+        };
+        let assert_no_secrets = |message: &str, secrets: &[&str]| {
+            for secret in secrets {
+                assert!(
+                    !message.contains(secret),
+                    "the error must not echo {secret:?}: {message}"
+                );
+            }
+        };
+
+        let error =
+            echo_adapter_endpoint("http://alice:s3cret@api.example.com/v1/chat?key=TOPSECRET");
+        assert!(
+            matches!(error, ConfigValidationError::CleartextCredentials { .. }),
+            "got: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("api.example.com"),
+            "the host must stay in the error so the operator can find the adapter: {message}"
+        );
+        assert_no_secrets(&message, &["alice", "s3cret", "TOPSECRET", "?key="]);
+
+        let error = echo_adapter_endpoint("ftp://bob:pw@h/x?k=v");
+        assert!(
+            matches!(error, ConfigValidationError::InvalidEndpointScheme { .. }),
+            "got: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid endpoint scheme"),
+            "the invalid-scheme error must fire: {message}"
+        );
+        assert_no_secrets(&message, &["bob", "pw", "k=v", "?k="]);
     }
 
     #[test]

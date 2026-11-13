@@ -139,7 +139,7 @@ pub fn self_loop_problems<'a>(
                          Point the endpoint at the upstream provider, not at this proxy",
                         endpoint.provider,
                         endpoint.adapter,
-                        crate::provider_config::endpoint_without_query(endpoint.url),
+                        crate::provider_config::endpoint_for_display(endpoint.url),
                         listener
                     ));
                     break;
@@ -286,6 +286,32 @@ mod tests {
             "http://no-such-host.invalid:8080/v1/chat/completions",
         )];
         assert!(self_loop_problems(&providers, &listeners_of(&[8080])).is_empty());
+    }
+
+    /// The self-loop refusal is user-facing startup output; the endpoint's
+    /// userinfo must not leak into it (fix-brief 07-14).
+    #[test]
+    fn a_self_loop_message_does_not_echo_userinfo() {
+        let providers = [provider_with_endpoint(
+            "loopy",
+            "http://u:p@127.0.0.1:8080/x",
+        )];
+        let problems = self_loop_problems(&providers, &listeners_of(&[8080]));
+        assert_eq!(
+            problems.len(),
+            1,
+            "userinfo does not stop the endpoint from being a self loop: {problems:?}"
+        );
+        assert!(
+            !problems[0].contains("u:p"),
+            "the message must not echo the endpoint userinfo: {}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains("127.0.0.1:8080"),
+            "the host must stay so the operator can find the adapter: {}",
+            problems[0]
+        );
     }
 
     #[test]
