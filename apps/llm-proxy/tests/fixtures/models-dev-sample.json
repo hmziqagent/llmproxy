@@ -23,6 +23,12 @@
         "name": "Free Tier",
         "limit": { "context": 8000, "output": 4000 },
         "cost": {}
+      },
+      "input-only-preview": {
+        "id": "input-only-preview",
+        "name": "Input Priced Preview",
+        "limit": { "context": 128000, "output": 16000 },
+        "cost": { "input": 1.5 }
       }
     }
   }

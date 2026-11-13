@@ -90,13 +90,14 @@ pub async fn cmd_pricing_sync(
     let catalogue = fetch_catalogue(&url).await?;
 
     for (file, models_dev_id) in &targets {
-        let entries = pricing_entries(&catalogue, models_dev_id)?;
+        let (entries, skipped) = pricing_entries(&catalogue, models_dev_id)?;
         if entries.is_empty() {
             println!(
                 "  {}: no priced models for models.dev id \"{}\"; file left unchanged",
                 file.display(),
                 models_dev_id
             );
+            print_skipped_partial(&skipped);
             continue;
         }
         let preview = describe(&entries);
@@ -107,6 +108,7 @@ pub async fn cmd_pricing_sync(
                 entries.len(),
                 preview
             );
+            print_skipped_partial(&skipped);
             continue;
         }
         let source =
@@ -119,8 +121,23 @@ pub async fn cmd_pricing_sync(
             entries.len(),
             preview
         );
+        print_skipped_partial(&skipped);
     }
     Ok(())
+}
+
+/// Reports the models a sync left unpriced because the catalogue prices only
+/// one of their input/output dimensions, so the omission is visible instead
+/// of a silent `$0` dimension.
+fn print_skipped_partial(skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!(
+        "    skipped {} model(s) with a partial price (unpriced): {}",
+        skipped.len(),
+        skipped.join(", ")
+    );
 }
 
 fn provider_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -148,13 +165,19 @@ async fn fetch_catalogue(url: &str) -> Result<Value> {
 }
 
 /// The priced models one models.dev provider declares, as per-token USD
-/// decimals keyed by upstream model id. Models without a `cost.input` or
-/// `cost.output` are skipped (unpriced, never `$0`).
+/// decimals keyed by upstream model id, plus the model ids skipped because
+/// only one of `cost.input` and `cost.output` is priced: a partial price
+/// would silently charge `$0` for the missing dimension, so the model stays
+/// unpriced and is reported instead. Models without any priced dimension at
+/// all are also left out (unpriced, never `$0`), but are not partial prices.
 ///
 /// # Errors
 ///
 /// `anyhow` when the catalogue entry for `models_dev_id` is malformed.
-fn pricing_entries(catalogue: &Value, models_dev_id: &str) -> Result<Vec<(String, ModelPricing)>> {
+fn pricing_entries(
+    catalogue: &Value,
+    models_dev_id: &str,
+) -> Result<(Vec<(String, ModelPricing)>, Vec<String>)> {
     let Some(provider) = catalogue.get(models_dev_id) else {
         bail!("the catalogue has no provider \"{models_dev_id}\"");
     };
@@ -164,29 +187,41 @@ fn pricing_entries(catalogue: &Value, models_dev_id: &str) -> Result<Vec<(String
         );
     };
     let mut entries = Vec::new();
+    let mut skipped = Vec::new();
     for (model_id, model) in models {
         let Some(cost) = model.get("cost") else {
             continue;
         };
         let input = per_token(cost.get("input"))?;
         let output = per_token(cost.get("output"))?;
-        if input.is_none() && output.is_none() {
-            // No priced dimensions at all: unpriced, not free.
-            continue;
+        match (input, output) {
+            (Some(input), Some(output)) => entries.push((
+                model_id.clone(),
+                ModelPricing {
+                    input,
+                    output,
+                    // Cache dimensions absent from the catalogue stay 0: a
+                    // model that reports no cache pricing reports no cache
+                    // tokens.
+                    cache_creation: per_token(cost.get("cache_write"))?.unwrap_or(Decimal::ZERO),
+                    cache_read: per_token(cost.get("cache_read"))?.unwrap_or(Decimal::ZERO),
+                    // models.dev prices reasoning as output, so there is no
+                    // separate reasoning dimension to carry.
+                    reasoning: Decimal::ZERO,
+                },
+            )),
+            (Some(_), None) | (None, Some(_)) => {
+                // Exactly one dimension priced: writing the other as a
+                // silent $0 would misprice every request, so the model is
+                // unpriced and reported as skipped.
+                skipped.push(model_id.clone());
+            }
+            (None, None) => {} // no priced dimensions at all: unpriced, not free
         }
-        entries.push((
-            model_id.clone(),
-            ModelPricing {
-                input: input.unwrap_or(Decimal::ZERO),
-                output: output.unwrap_or(Decimal::ZERO),
-                cache_creation: per_token(cost.get("cache_write"))?.unwrap_or(Decimal::ZERO),
-                cache_read: per_token(cost.get("cache_read"))?.unwrap_or(Decimal::ZERO),
-                reasoning: Decimal::ZERO,
-            },
-        ));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(entries)
+    skipped.sort();
+    Ok((entries, skipped))
 }
 
 /// One catalogue price (USD per million tokens) as an exact per-token
@@ -289,7 +324,7 @@ mod tests {
 
     #[test]
     fn per_million_prices_become_exact_per_token_decimals() {
-        let entries = pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
+        let (entries, _) = pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
         let map = entries_as_map(&entries);
         let claude = map
             .get(&ModelId::new("claude-sonnet-4-5"))
@@ -305,7 +340,8 @@ mod tests {
 
     #[test]
     fn unpriced_models_stay_unpriced_never_zero() {
-        let entries = pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
+        let (entries, skipped) =
+            pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
         let map = entries_as_map(&entries);
         assert!(
             !map.contains_key(&ModelId::new("unpriced-preview")),
@@ -314,6 +350,49 @@ mod tests {
         assert!(
             !map.contains_key(&ModelId::new("no-cost-dimensions")),
             "a model whose cost has no priced dimensions stays unpriced"
+        );
+        assert!(
+            !skipped.contains(&"unpriced-preview".to_owned()),
+            "a model with no cost object has no partial price to report"
+        );
+        assert!(
+            !skipped.contains(&"no-cost-dimensions".to_owned()),
+            "a model with no priced dimensions is unpriced, not partially priced"
+        );
+        assert!(
+            map.values()
+                .all(|pricing| pricing.input != Decimal::ZERO && pricing.output != Decimal::ZERO),
+            "no synced entry may carry a silent $0 dimension: {map:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_priced_on_one_dimension_only_stays_unpriced() {
+        let (entries, skipped) =
+            pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
+        let map = entries_as_map(&entries);
+        assert!(
+            !map.contains_key(&ModelId::new("input-only-preview")),
+            "a model priced on input only must not gain an entry that charges $0 for output"
+        );
+        assert_eq!(
+            skipped,
+            vec!["input-only-preview".to_owned()],
+            "the partially priced model is listed as skipped"
+        );
+        let rewritten = apply_pricing(
+            "[provider]\nname = \"x\"\napi_key = \"k\"\nauth_style = \"bearer\"\n",
+            &entries,
+            "https://example.test",
+        )
+        .expect("rewrite");
+        let parsed: ProviderFile = toml::from_str(&rewritten).expect("rewritten file parses");
+        assert!(
+            !parsed
+                .provider
+                .pricing
+                .contains_key(&ModelId::new("input-only-preview")),
+            "the rewritten TOML has no entry for the partially priced model: {rewritten}"
         );
     }
 
@@ -355,9 +434,13 @@ mod tests {
                 }
             }
         });
-        let entries = pricing_entries(&catalogue, "tiny")
+        let (entries, skipped) = pricing_entries(&catalogue, "tiny")
             .expect("the sync survives a price serde_json renders as 1e-6");
         let map = entries_as_map(&entries);
+        assert!(
+            skipped.is_empty(),
+            "both models are fully priced, got {skipped:?}"
+        );
         assert_eq!(map.len(), 2, "both models are priced, got {map:?}");
         let cheap = map
             .get(&ModelId::new("cheap-model"))
@@ -444,7 +527,7 @@ models_dev_id = "anthropic"
     fn written_prices_round_trip_through_the_config_parser() {
         // Values written as strings must reparse as the same decimals —
         // the config layer rejects unquoted floats by design.
-        let entries = pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
+        let (entries, _) = pricing_entries(&sample_catalogue(), "anthropic").expect("entries");
         let rewritten = apply_pricing(
             "[provider]\nname = \"x\"\napi_key = \"k\"\nauth_style = \"bearer\"\n",
             &entries,
