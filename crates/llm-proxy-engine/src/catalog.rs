@@ -347,6 +347,12 @@ impl ModelCatalogService {
         if self.cache.read().await.contains_key(&provider.name) {
             return Ok(());
         }
+        let dir_metadata = match tokio::fs::symlink_metadata(cache_dir).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(invalid_cache(&error)),
+        };
+        ensure_cache_dir_is_safe(cache_dir, &dir_metadata)?;
         let path = cache_dir.join(format!("{}.toml", provider.name));
         let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) => metadata,
@@ -422,6 +428,22 @@ fn invalid_cache(error: &std::io::Error) -> ProviderError {
     ProviderError::InvalidConfig(format!("catalog cache I/O failed: {error}"))
 }
 
+/// Reject a cache directory that is a symlink or not a directory. Shared by
+/// the sync write path and the async read path so both enforce the same
+/// posture with the same message.
+fn ensure_cache_dir_is_safe(
+    cache_dir: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), ProviderError> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProviderError::InvalidConfig(format!(
+            "catalog cache directory must be a non-symlink directory: {}",
+            cache_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 fn now_rfc3339() -> Result<String, ProviderError> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -443,12 +465,7 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
     }
     std::fs::create_dir_all(cache_dir).map_err(|error| invalid_cache(&error))?;
     let metadata = std::fs::symlink_metadata(cache_dir).map_err(|error| invalid_cache(&error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ProviderError::InvalidConfig(format!(
-            "catalog cache directory must be a non-symlink directory: {}",
-            cache_dir.display()
-        )));
-    }
+    ensure_cache_dir_is_safe(cache_dir, &metadata)?;
     let destination = cache_dir.join(format!("{}.toml", file.catalog.provider));
     if destination.exists() {
         let metadata =
@@ -774,6 +791,62 @@ mod tests {
         );
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A cache directory that is itself a symlink must be rejected on the read
+    /// path, not followed: reads must not parse whatever `<provider>.toml`
+    /// lives behind the link.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn load_disk_cache_rejects_symlinked_cache_dir() {
+        let base = temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real");
+        write_catalog_atomic(&real, &catalog_file("2026-06-10T00:00:00Z")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let service = ModelCatalogService::new(Some(link.clone()));
+        let endpoint_unused = "http://catalog-endpoint-unused.invalid/models".to_owned();
+        let result = service.catalog(&provider(endpoint_unused), false).await;
+
+        assert!(
+            result.is_err(),
+            "a symlinked cache dir must be rejected instead of being followed"
+        );
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("non-symlink directory"),
+            "error should name the cache-dir requirement, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A cache directory path that is a regular file must be rejected on the
+    /// read path, the same posture the write path already enforces.
+    #[tokio::test]
+    async fn load_disk_cache_rejects_cache_dir_that_is_a_file() {
+        let base = temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("plain-file");
+        std::fs::write(&file, "not a directory").unwrap();
+
+        let service = ModelCatalogService::new(Some(file.clone()));
+        let provider = minimal_provider("test-provider");
+        let result = service.load_disk_cache(&provider).await;
+
+        assert!(
+            result.is_err(),
+            "a cache dir that is a regular file must be rejected"
+        );
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("non-symlink directory"),
+            "error should name the cache-dir requirement, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
