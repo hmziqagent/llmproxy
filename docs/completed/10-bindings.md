@@ -141,7 +141,7 @@ the engine and add no logic of their own, so they start once its API has stopped
   stamps with a marker). The Python and Node suites replay the same cases
   against their own fake upstreams and compare to the same snapshots: the
   same fixtures give the same results through Rust, Python and Node
-  (16 tests through Python and Node; the Rust bridge drives the same cases
+  (13 tests through Python and Node; the Rust bridge drives the same cases
   inside 4 aggregate tests). Streaming and cancellation are
   exercised in all three: events flow incrementally, `cancel()` stops
   delivery, the `ClientCancelled` usage row lands, and the proxy stays
