@@ -119,8 +119,8 @@ jobs:
 
   # The install matrix is the plan's acceptance proof: `import llm_proxy`
   # from the wheel and the whole contract suite on Linux, Windows and macOS
-  # for Python 3.9 and 3.13. Nothing in this job may install Rust; 10-12
-  # adds the enforced no-cargo check for this install path.
+  # for Python 3.9 and 3.13. Nothing in this job installs Rust; the
+  # clean-install job below enforces that with an explicit no-cargo guard.
   test-install:
     name: install (${{ matrix.os }} / Python ${{ matrix.python-version }})
     needs: build
@@ -162,3 +162,77 @@ jobs:
           "$PY" -m pip install --no-index --find-links dist llm-proxy
           "$PY" -m pip install pytest
           "$PY" -m pytest bindings/python/tests -q
+
+  # Plan 10 item 10-12: the done-when "pip install works on each platform
+  # with no Rust toolchain" is enforced, not assumed. This job has no
+  # setup-rust step, removes every Rust toolchain the runner image ships,
+  # and fails if cargo/rustc/rustup stay resolvable, so a wheel that only
+  # works because Rust was in reach cannot pass here. --only-binary=:all:
+  # makes an sdist build (which would need Rust) fail the job instead of
+  # silently compiling, and --no-index keeps llm-proxy pinned to the wheel
+  # downloaded from the build job.
+  clean-install:
+    name: clean install, no Rust toolchain (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-15]
+        include:
+          - os: ubuntu-22.04
+            artifact: wheels-ubuntu-22.04-x86_64-gnu
+          - os: windows-latest
+            artifact: wheels-windows-latest-x64
+          - os: macos-15
+            artifact: wheels-macos-15-universal2
+    steps:
+      - name: Remove every Rust toolchain and fail if one stays resolvable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          sudo rm -rf /usr/local/cargo /usr/local/rustup 2>/dev/null || true
+          sudo rm -f /usr/local/bin/rustc /usr/local/bin/cargo /usr/local/bin/rustup 2>/dev/null || true
+          command -v cargo rustc rustup || true
+          ! command -v cargo && ! command -v rustc && ! command -v rustup
+      - name: Remove every Rust toolchain and fail if one stays resolvable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo","$env:USERPROFILE\.rustup" -ErrorAction SilentlyContinue
+          if (Get-Command cargo,rustc -ErrorAction SilentlyContinue) { throw "cargo is still on PATH" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Install the wheel and run one no-network translate_request
+        shell: bash
+        run: |
+          python -m venv .venv-clean
+          if [ -x .venv-clean/bin/python ]; then
+            PY=.venv-clean/bin/python
+          else
+            PY=.venv-clean/Scripts/python.exe
+          fi
+          "$PY" -m pip install --no-index --only-binary=:all: --find-links dist llm-proxy
+          "$PY" -c "
+          import llm_proxy
+          proxy = llm_proxy.Proxy({'providers': [{
+              'name': 'x', 'api_key': 'k', 'auth_style': 'bearer',
+              'adapters': {'a': {'protocol': 'anthropic_messages',
+                                 'endpoint': 'http://127.0.0.1:9/v1/messages'}},
+              'routes': {'messages': 'a'},
+          }]})
+          out = proxy.translate_request(
+              {'model': 'claude-sonnet-4-5', 'max_tokens': 8,
+               'messages': [{'role': 'user', 'content': 'hi'}]},
+              'anthropic_messages', 'openai_chat_completions')
+          assert out and out['model'] == 'claude-sonnet-4-5', out
+          assert llm_proxy.__version__, 'empty llm_proxy.__version__'
+          print('llm_proxy', llm_proxy.__version__, '- installed from the wheel with no Rust toolchain')
+          "

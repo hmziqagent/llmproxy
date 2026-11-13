@@ -83,7 +83,14 @@ the engine and add no logic of their own, so they start once its API has stopped
   macos-15 for CPython 3.9 and 3.13, with the pytest suite run against the
   install. The Node binaries are built per platform by
   `.github/workflows/node-binaries.yml`. aarch64 Windows is not built: it
-  is optional and unverified.
+  is optional and unverified. Both workflows also run a `clean-install`
+  job on ubuntu-22.04, windows-latest and macos-15 that removes every Rust
+  toolchain from the runner and fails if cargo/rustc/rustup stay
+  resolvable, then does the consumer install — the wheel with
+  `pip --no-index --only-binary=:all:` (an sdist build fails instead of
+  compiling), the npm main package plus its platform package from local
+  tarballs — and runs one no-network `translate_request`/`translateRequest`
+  smoke against the installed package.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on

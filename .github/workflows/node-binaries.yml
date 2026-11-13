@@ -124,9 +124,10 @@ jobs:
   # The native legs of the plan done-when: node --test green against the
   # uploaded artifacts on linux-x64-gnu, win32-x64-msvc and darwin-arm64.
   # No Rust toolchain is installed in this job: the suite runs from the
-  # loader and binary artifacts alone (10-12 adds the enforced no-cargo
-  # guard for this path). The cross-built legs (linux-aarch64-gnu,
-  # linux-x64-musl, win32-arm64-msvc) are install-only and are not run here.
+  # loader and binary artifacts alone (the clean-install job below adds
+  # the enforced no-cargo guard for the consumer install path). The
+  # cross-built legs (linux-aarch64-gnu, linux-x64-musl, win32-arm64-msvc)
+  # are install-only and are not run here.
   test:
     name: node --test (${{ matrix.name }})
     needs: build
@@ -166,3 +167,107 @@ jobs:
       - name: Run the contract suite against the shipped artifacts
         working-directory: bindings/node
         run: node --test test/
+
+  # Plan 10 item 10-12: the done-when "npm install works on each platform
+  # with no Rust toolchain" is enforced, not assumed. This job has no
+  # setup-rust step, removes every Rust toolchain the runner image ships,
+  # and fails if cargo/rustc/rustup stay resolvable. It then does exactly
+  # what a consumer does: packs the main package and its platform package
+  # into tarballs, installs both into an empty project and loads the
+  # prebuilt binary. npm_config_ignore_scripts keeps the install from
+  # running any lifecycle script that could reach a compiler.
+  clean-install:
+    name: clean install, no Rust toolchain (${{ matrix.name }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            binary_artifact: node-binary-linux-x64-gnu
+            npm_dir: linux-x64-gnu
+            binary: llm-proxy.linux-x64-gnu.node
+          - name: win32-x64-msvc
+            os: windows-latest
+            binary_artifact: node-binary-win32
+            npm_dir: win32-x64-msvc
+            binary: llm-proxy.win32-x64-msvc.node
+          - name: darwin-arm64
+            os: macos-15
+            binary_artifact: node-binary-darwin
+            npm_dir: darwin-arm64
+            binary: llm-proxy.darwin-arm64.node
+    env:
+      npm_config_ignore_scripts: "true"
+    steps:
+      - name: Remove every Rust toolchain and fail if one stays resolvable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          sudo rm -rf /usr/local/cargo /usr/local/rustup 2>/dev/null || true
+          sudo rm -f /usr/local/bin/rustc /usr/local/bin/cargo /usr/local/bin/rustup 2>/dev/null || true
+          command -v cargo rustc rustup || true
+          ! command -v cargo && ! command -v rustc && ! command -v rustup
+      - name: Remove every Rust toolchain and fail if one stays resolvable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo","$env:USERPROFILE\.rustup" -ErrorAction SilentlyContinue
+          if (Get-Command cargo,rustc -ErrorAction SilentlyContinue) { throw "cargo is still on PATH" }
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Download the generated loader
+        uses: actions/download-artifact@v4
+        with:
+          name: node-loader
+          path: bindings/node
+      - name: Download the platform binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary_artifact }}
+          path: binaries
+      - name: Stage the platform binary into its npm package
+        shell: bash
+        run: |
+          set -e
+          cp "binaries/${{ matrix.binary }}" \
+            "bindings/node/npm/${{ matrix.npm_dir }}/${{ matrix.binary }}"
+      - name: Pack the main package and the platform package
+        shell: bash
+        working-directory: bindings/node
+        run: |
+          set -e
+          npm pack
+          ( cd "npm/${{ matrix.npm_dir }}" && npm pack )
+          ls freeoxide-llm-proxy-0.1.0.tgz "npm/${{ matrix.npm_dir }}"/freeoxide-llm-proxy-*.tgz
+      - name: Install both local tarballs and load the binary, no Rust on PATH
+        shell: bash
+        run: |
+          set -e
+          mkdir -p npm-smoke
+          cd npm-smoke
+          npm init -y >/dev/null
+          npm install \
+            "../bindings/node/freeoxide-llm-proxy-0.1.0.tgz" \
+            "../bindings/node/npm/${{ matrix.npm_dir }}/freeoxide-llm-proxy-${{ matrix.npm_dir }}-0.1.0.tgz"
+          node -e "
+            const { Proxy } = require('@freeoxide/llm-proxy');
+            const proxy = new Proxy({ providers: [{
+              name: 'x', api_key: 'k', auth_style: 'bearer',
+              adapters: { a: { protocol: 'anthropic_messages',
+                               endpoint: 'http://127.0.0.1:9/v1/messages' } },
+              routes: { messages: 'a' },
+            }] });
+            const out = proxy.translateRequest(
+              { model: 'claude-sonnet-4-5', max_tokens: 8,
+                messages: [{ role: 'user', content: 'hi' }] },
+              'anthropic_messages', 'openai_chat_completions');
+            if (!out || out.model !== 'claude-sonnet-4-5') process.exit(1);
+            console.log('@freeoxide/llm-proxy installed from local tarballs, no Rust toolchain');
+          "
