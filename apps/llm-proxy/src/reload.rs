@@ -335,17 +335,20 @@ server_name = "reload-test"
         path
     }
 
-    async fn spawn_echo_upstream(delay: Duration) -> (String, std::net::SocketAddr) {
+    async fn spawn_echo_upstream(delay: Duration, tokens: u32) -> (String, std::net::SocketAddr) {
         let app = Router::new().route(
             "/{*path}",
             axum::routing::post(move || async move {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
+                let body = format!(
+                    r#"{{"id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"upstream says hi"}}],"model":"m","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":{tokens},"output_tokens":2}}}}"#,
+                );
                 (
                     StatusCode::OK,
                     [("content-type", "application/json")],
-                    r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"upstream says hi"}],"model":"m","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}}"#,
+                    body,
                 )
             }),
         );
@@ -415,9 +418,11 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_provider_swap_leaves_in_flight_requests_on_other_providers_running() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // slow upstream for provider "slow", fast for "quick".
-        let (slow_endpoint, _slow_addr) = spawn_echo_upstream(Duration::from_millis(800)).await;
-        let (quick_endpoint, _quick_addr) = spawn_echo_upstream(Duration::ZERO).await;
+        // slow upstream for provider "slow", fast for "quick". The usage
+        // values differ (3 / 5 / 7) so the assertions can tell which
+        // upstream actually served.
+        let (slow_endpoint, _slow_addr) = spawn_echo_upstream(Duration::from_millis(800), 3).await;
+        let (quick_endpoint, _quick_addr) = spawn_echo_upstream(Duration::ZERO, 5).await;
         write_provider(dir.path(), "slow", &slow_endpoint, 1);
         write_provider(dir.path(), "quick", &quick_endpoint, 2);
         let _config = write_config(dir.path(), "");
@@ -438,8 +443,15 @@ server_name = "reload-test"
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Sanity: the old quick upstream is distinguishable — it serves 5.
+        let before = engine
+            .execute(engine_request("quick"))
+            .await
+            .expect("the pre-reload request reaches the old quick upstream");
+        assert_eq!(before.core.usage.input_tokens, 5);
+
         // Change ONLY the quick provider: point it at a new upstream.
-        let (new_quick_endpoint, _new_addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (new_quick_endpoint, _new_addr) = spawn_echo_upstream(Duration::ZERO, 7).await;
         write_provider(dir.path(), "quick", &new_quick_endpoint, 3);
         let report = reload_registry(&state, &dir.path().join("config.toml"), None)
             .await
@@ -463,7 +475,7 @@ server_name = "reload-test"
             .execute(engine_request("quick"))
             .await
             .expect("the reloaded provider serves");
-        assert_eq!(response.core.usage.input_tokens, 3);
+        assert_eq!(response.core.usage.input_tokens, 7);
     }
 
     /// Restart-required refusal: a `[server]` change refuses the reload and
@@ -471,7 +483,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_server_change_refuses_the_reload_and_applies_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let _initial = write_config(dir.path(), "");
 
@@ -541,7 +553,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_broken_provider_file_refuses_the_whole_reload() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "good", &endpoint, 1);
         write_provider(dir.path(), "also-good", &endpoint, 2);
         let path = write_config(dir.path(), "");
@@ -572,7 +584,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_refused_engine_build_leaves_the_serving_config_snapshot_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         write_config(dir.path(), "");
         let state = state_for(dir.path()).await;
@@ -610,7 +622,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn adding_and_removing_providers_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "keep", &endpoint, 1);
         write_provider(dir.path(), "drop-me", &endpoint, 2);
         let path = write_config(dir.path(), "");
@@ -640,7 +652,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_bind_edit_is_refused_as_restart_required_not_masked() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let _startup_config = write_config(dir.path(), "");
 
@@ -689,7 +701,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_cli_port_override_masks_only_the_port_across_reloads() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let path = write_config(dir.path(), "");
 
@@ -721,7 +733,7 @@ server_name = "reload-test"
     #[tokio::test]
     async fn a_same_id_verifier_rotation_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let path = {
             let p = dir.path().join("config.toml");
@@ -792,7 +804,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
         use llm_proxy_engine::ConfigSource;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let path = write_config(dir.path(), "");
         let state = state_for(dir.path()).await;
@@ -840,7 +852,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
     #[tokio::test]
     async fn a_managed_keys_auth_diff_is_attributed_not_blamed_on_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         // Startup: the merged running config holds the operator key and the
         // store-issued key; the file below already lacks the store's id.
@@ -881,7 +893,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
     #[tokio::test]
     async fn a_removed_file_key_is_not_attributed_to_managed_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         write_auth_config(dir.path(), &[("laptop", PHC_A), ("phone", PHC_B)]);
         let state = state_for(dir.path())
@@ -911,7 +923,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
     #[tokio::test]
     async fn a_key_store_edit_is_refused_as_restart_required() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let dir_path = dir.path().display().to_string();
         let config = |key_store: &str| {
