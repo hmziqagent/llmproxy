@@ -124,6 +124,15 @@ mod tests {
             .unwrap()
     }
 
+    fn get_with_host(path: &'static str, host: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -286,11 +295,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    /// Client-keys mode carries a credential a browser page does not hold, so the
-    /// guard stands down there: the request reaches the auth middleware instead.
-    #[tokio::test]
-    async fn the_guard_stands_down_under_client_keys_auth() {
-        let auth = AuthConfig {
+    /// The client-keys fixture: a mode under which the host guard stands
+    /// down because a browser page holds no credential.
+    fn client_keys_auth() -> AuthConfig {
+        AuthConfig {
             mode: AuthMode::ClientKeys,
             clients: std::collections::HashMap::from([(
                 "laptop".to_owned(),
@@ -300,8 +308,14 @@ mod tests {
             )]),
             admin: None,
             legacy_bare_tokens: false,
-        };
-        let app = build_router(state(None, auth));
+        }
+    }
+
+    /// Client-keys mode carries a credential a browser page does not hold, so the
+    /// guard stands down there: the request reaches the auth middleware instead.
+    #[tokio::test]
+    async fn the_guard_stands_down_under_client_keys_auth() {
+        let app = build_router(state(None, client_keys_auth()));
         let response = app
             .oneshot(post_messages(&[
                 ("host", "rebind.attacker.example:3456"),
@@ -313,6 +327,58 @@ mod tests {
             response.status(),
             StatusCode::UNAUTHORIZED,
             "under client keys the auth middleware answers, not the host guard"
+        );
+    }
+
+    /// The lightweight routes (`/health`, `/ready`, `/version`) sit behind
+    /// the same host guard as the API surface (plan 07 step 8): a rebound
+    /// Host must not read the build info or server name. Probes stay
+    /// unauthenticated — the guard stands down under client-keys auth — and
+    /// a loopback Host still serves the routes.
+    #[tokio::test]
+    async fn lightweight_routes_refuse_a_rebound_host_under_anonymous_auth() {
+        let app = build_router(state(None, AuthConfig::default()));
+        for path in ["/version", "/health", "/ready"] {
+            let response = app
+                .clone()
+                .oneshot(get_with_host(path, "rebind.attacker.example:3456"))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "GET {path} on a rebound host must be refused"
+            );
+            let body = body_json(response).await;
+            assert_eq!(
+                body["error"]["type"], "forbidden_request_source",
+                "the refusal must identify itself: {body}"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(get_with_host("/version", "127.0.0.1:3456"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a loopback Host still serves the lightweight routes"
+        );
+
+        // Client-keys mode: the guard stands down (see
+        // `the_guard_stands_down_under_client_keys_auth`), so unauthenticated
+        // load-balancer probes keep working even with a foreign Host.
+        let app = build_router(state(None, client_keys_auth()));
+        let response = app
+            .oneshot(get_with_host("/health", "rebind.attacker.example:3456"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "health probes must stay unauthenticated under client-keys auth"
         );
     }
 

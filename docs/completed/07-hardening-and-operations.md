@@ -51,11 +51,13 @@ at any time.
 All eleven steps landed, each with regression tests:
 
 1. `crates/llm-proxy-server/src/host_guard.rs` — under `auth.mode = "none"` the
-   API routes refuse a `Host` that does not name this listener, a browser
+   API routes and the lightweight `/health`, `/ready`, `/version` routes
+   refuse a `Host` that does not name this listener, a browser
    `Origin` that is neither this proxy nor an operator-listed origin, and a
    `Sec-Fetch-Site` from another site. `Origin` is judged only on requests
    carrying Fetch Metadata, because captured CLI traffic sends an `Origin`
-   with no browser markers. Client-keys mode stands down.
+   with no browser markers. Client-keys mode stands down (probes stay
+   unauthenticated).
 2. `ConfigValidationError::CleartextCredentials` — `http://` adapter and
    discovery endpoints to off-machine hosts are refused at load (loopback
    literals and `localhost` exempt); `validate` and startup share the check.

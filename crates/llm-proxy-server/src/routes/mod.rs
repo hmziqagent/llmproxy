@@ -81,6 +81,10 @@ pub fn router(state: AppState) -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
+                .layer(from_fn_with_state(
+                    state.clone(),
+                    crate::host_guard::enforce_host_origin,
+                ))
                 .layer(trace),
         );
 
