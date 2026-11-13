@@ -63,8 +63,11 @@ proposes three different admission models, and this plan replaces them with one.
   `Retry-After`). The allowlist verdict also runs on its own at pipeline
   slot 2 (`Admission::authorize`), ahead of the idempotency replay, the
   cache and single-flight, so a key restricted at runtime is not served an
-  answer stored for it earlier. Settlement charges exactly what the provider
-  billed and refunds a failure before any usage.
+  answer stored for it earlier. Under failover the ladder re-keys the
+  reservation to the member about to serve — the in-flight slot moves and
+  the budget reservation is re-priced at that member's rates, refused with
+  402 when the pricier estimate would not fit. Settlement charges exactly
+  what the provider billed and refunds a failure before any usage.
 - Preflight estimates input tokens once (shared with admission) and warns by
   default; enforce mode rejects only past the configured margin.
 - `llm-proxy pricing-sync` writes per-token pricing from models.dev into

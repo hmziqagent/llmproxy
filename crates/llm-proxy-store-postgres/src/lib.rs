@@ -37,8 +37,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_proxy_engine::{
-    AdmissionBackend, EngineError, KeyPolicy, LeaseId, PolicyAdmission, ReservationDemand,
-    Settlement,
+    AdmissionBackend, EngineError, KeyPolicy, LeaseId, MicroUsd, PolicyAdmission,
+    ReservationDemand, Settlement,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -636,6 +636,67 @@ impl PostgresAdmissionBackend {
         Ok(())
     }
 
+    /// The rekey's re-pricing half (fix 05-7) inside `tx`: refuse with
+    /// `BudgetExhausted` when the grown reservation alone would exceed the
+    /// caller's day budget, otherwise move the reservation on the lease's
+    /// own day row — the day settlement releases it from. A refusal leaves
+    /// the whole move to the caller's transaction rollback.
+    async fn check_rekey_budget(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        // The lease as locked: caller, its reservation day and the USD it
+        // still holds there.
+        lease: (&str, &PgDate, i64),
+        new: MicroUsd,
+        budget_usd_per_day: Option<MicroUsd>,
+    ) -> Result<(), EngineError> {
+        let (caller, lease_day, old_reserved) = lease;
+        let now = OffsetDateTime::now_utc();
+        let today = pg_date(now.date());
+        let held = if lease_day == &today { old_reserved } else { 0 };
+        let day_row = tx
+            .query_opt(
+                "SELECT spent_usd, reserved_usd FROM admission_days \
+                 WHERE caller = $1 AND day = $2",
+                &[&caller, &today],
+            )
+            .await
+            .map_err(|error| store_error(&error))?;
+        let (spent, reserved_today) = day_row.map_or((0, 0), |day_row| {
+            (day_row.get::<_, i64>(0), day_row.get::<_, i64>(1))
+        });
+        let without = reserved_today.saturating_sub(held);
+        let projected = without.saturating_add(new);
+        if let Some(budget) = budget_usd_per_day
+            && new > held
+            && spent.saturating_add(projected) > budget
+        {
+            return Err(EngineError::BudgetExhausted {
+                message: format!(
+                    "daily budget of {} USD would be exceeded for this key (spent {}, \
+                     reserved in flight {}, this request {})",
+                    llm_proxy_engine::from_micro_usd(budget).normalize(),
+                    llm_proxy_engine::from_micro_usd(spent).normalize(),
+                    llm_proxy_engine::from_micro_usd(without).normalize(),
+                    llm_proxy_engine::from_micro_usd(new).normalize(),
+                ),
+                retry_after: Some(until_next_day(now)),
+            });
+        }
+        let delta = new - old_reserved;
+        if delta != 0 {
+            tx.execute(
+                "UPDATE admission_days \
+                 SET reserved_usd = GREATEST(reserved_usd + $1, 0) \
+                 WHERE caller = $2 AND day = $3",
+                &[&delta, &caller, lease_day],
+            )
+            .await
+            .map_err(|error| store_error(&error))?;
+        }
+        Ok(())
+    }
+
     /// Inserts the lease row for an admission that passed every check;
     /// the purge drops it after the TTL even if the owning replica
     /// crashes mid-request.
@@ -745,6 +806,8 @@ impl AdmissionBackend for PostgresAdmissionBackend {
         model: &str,
         member_cap: Option<u32>,
         model_cap: Option<u32>,
+        new_estimate_usd: Option<MicroUsd>,
+        budget_usd_per_day: Option<MicroUsd>,
     ) -> Result<(), EngineError> {
         let id = parse_lease_id(lease).map_err(|error| EngineError::Internal(error.to_string()))?;
         let mut conn = self
@@ -758,7 +821,8 @@ impl AdmissionBackend for PostgresAdmissionBackend {
             .map_err(|error| store_error(&error))?;
         let row = tx
             .query_opt(
-                "SELECT member, model, holds_member_slot, holds_model_slot \
+                "SELECT member, model, holds_member_slot, holds_model_slot, \
+                 caller, reserved_usd, day \
                  FROM admission_leases WHERE id = $1 FOR UPDATE",
                 &[&id],
             )
@@ -776,9 +840,26 @@ impl AdmissionBackend for PostgresAdmissionBackend {
         let old_model: String = row.get(1);
         let held_member_slot: bool = row.get(2);
         let held_model_slot: bool = row.get(3);
+        let caller: String = row.get(4);
+        let old_reserved: i64 = row.get(5);
+        let lease_day: PgDate = row.get(6);
         if old_member == member && old_model == model {
             tx.rollback().await.map_err(|error| store_error(&error))?;
             return Ok(());
+        }
+
+        // Re-price the day reservation inside this transaction (fix 05-7):
+        // the whole move rolls back when the grown reservation would exceed
+        // the budget. The reservation counts against the day it was made
+        // on — the day settlement releases it from.
+        if let Some(new) = new_estimate_usd {
+            self.check_rekey_budget(
+                &tx,
+                (&caller, &lease_day, old_reserved),
+                new,
+                budget_usd_per_day,
+            )
+            .await?;
         }
 
         self.acquire_member_slot(&tx, member, member_cap).await?;
@@ -804,12 +885,13 @@ impl AdmissionBackend for PostgresAdmissionBackend {
         }
         tx.execute(
             "UPDATE admission_leases SET member = $1, model = $2, \
-             holds_member_slot = $3, holds_model_slot = $4 WHERE id = $5",
+             holds_member_slot = $3, holds_model_slot = $4, reserved_usd = $5 WHERE id = $6",
             &[
                 &member,
                 &model,
                 &member_cap.is_some(),
                 &model_cap.is_some(),
+                &new_estimate_usd.unwrap_or(old_reserved),
                 &id,
             ],
         )

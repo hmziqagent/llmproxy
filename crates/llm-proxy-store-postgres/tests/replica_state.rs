@@ -298,3 +298,164 @@ async fn usage_events_append_to_the_shared_table() {
         .await
         .expect("the event reaches the shared table");
 }
+
+/// Per-member output prices in USD per token, for the rekey-repricing
+/// mirror of the in-process backend (fix 05-7).
+fn reprice_pricing(a_output: &str, b_output: &str) -> HashMap<(String, String), ModelPricing> {
+    HashMap::from([
+        (
+            ("a".to_owned(), "m".to_owned()),
+            ModelPricing {
+                input: "0".parse().expect("decimal"),
+                output: a_output.parse().expect("decimal"),
+                ..ModelPricing::default()
+            },
+        ),
+        (
+            ("b".to_owned(), "m".to_owned()),
+            ModelPricing {
+                input: "0".parse().expect("decimal"),
+                output: b_output.parse().expect("decimal"),
+                ..ModelPricing::default()
+            },
+        ),
+    ])
+}
+
+/// The shared database mirrors the in-process reference: a failover to a
+/// pricier member grows the day reservation to the new member's estimate,
+/// and a reservation that alone would exceed the budget refuses, leaving
+/// the lease on its original estimate.
+#[tokio::test]
+#[ignore = "needs a live Postgres; set LLM_PROXY_TEST_POSTGRES"]
+async fn a_rekey_to_a_pricier_member_moves_the_shared_day_reservation() {
+    let store = store().await;
+    let caller = format!("rekey-{}", OffsetDateTime::now_utc().unix_timestamp_nanos());
+    let keys = HashMap::from([(
+        caller.clone(),
+        llm_proxy_engine::KeyPolicy {
+            budget: Some(KeyBudgetConfig {
+                usd_per_day: "0.011".parse().expect("decimal"),
+                unestimatable: UnestimatableCostPolicy::Reject,
+                assumed_max_output_tokens: 100,
+            }),
+            ..llm_proxy_engine::KeyPolicy::default()
+        },
+    )]);
+    let admission = std::sync::Arc::new(replica_admission(
+        keys,
+        reprice_pricing("0.000002", "0.00002"),
+        HashMap::new(),
+        store,
+    ));
+
+    // a's estimate (0.001) fits twice; the lease then fails over to b,
+    // whose estimate (0.01) fills the budget exactly.
+    let first = admission
+        .reserve(&claim(&caller))
+        .await
+        .expect("a's estimate fits");
+    admission
+        .reserve(&claim(&caller))
+        .await
+        .expect("a's estimate fits twice");
+
+    admission
+        .rekey(&first, "b", "m")
+        .await
+        .expect("b's pricier estimate still fits once");
+
+    let refused = admission
+        .reserve(&claim(&caller))
+        .await
+        .expect_err("a's estimate no longer fits beside b's");
+    assert_eq!(refused.status_code(), 402);
+
+    // Settlement releases what the lease now holds: b's estimate. The
+    // settlement write is fire-and-forget, so poll until the refund lands.
+    admission.settle(
+        &first,
+        &AdmissionOutcome {
+            succeeded: false,
+            usage: None,
+            cost: None,
+        },
+    );
+    let released = async {
+        loop {
+            if admission.reserve(&claim(&caller)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), released)
+        .await
+        .expect("the refund released b's re-priced estimate");
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; set LLM_PROXY_TEST_POSTGRES"]
+async fn a_rekey_that_would_exceed_the_shared_budget_is_refused() {
+    let store = store().await;
+    let caller = format!(
+        "rekey-refused-{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let keys = HashMap::from([(
+        caller.clone(),
+        llm_proxy_engine::KeyPolicy {
+            budget: Some(KeyBudgetConfig {
+                usd_per_day: "0.01".parse().expect("decimal"),
+                unestimatable: UnestimatableCostPolicy::Reject,
+                assumed_max_output_tokens: 100,
+            }),
+            ..llm_proxy_engine::KeyPolicy::default()
+        },
+    )]);
+    let admission = std::sync::Arc::new(replica_admission(
+        keys,
+        reprice_pricing("0.000002", "0.00004"),
+        HashMap::new(),
+        store,
+    ));
+
+    let ticket = admission
+        .reserve(&claim(&caller))
+        .await
+        .expect("a's estimate fits");
+    let refused = admission
+        .rekey(&ticket, "b", "m")
+        .await
+        .expect_err("b's estimate alone would exceed the budget");
+    assert!(matches!(refused, EngineError::BudgetExhausted { .. }));
+
+    // Nothing moved: a's estimate still fits beside the untouched
+    // reservation.
+    admission
+        .reserve(&claim(&caller))
+        .await
+        .expect("a's estimate still fits beside the untouched reservation");
+
+    // Settlement releases the original estimate, not b's; poll until the
+    // fire-and-forget write lands.
+    admission.settle(
+        &ticket,
+        &AdmissionOutcome {
+            succeeded: false,
+            usage: None,
+            cost: None,
+        },
+    );
+    let released = async {
+        loop {
+            if admission.reserve(&claim(&caller)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), released)
+        .await
+        .expect("the refund released the original estimate");
+}

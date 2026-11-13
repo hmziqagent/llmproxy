@@ -723,6 +723,131 @@ async fn a_streaming_pool_failover_respects_the_serving_members_concurrency_cap(
     first.await.expect("held request joins");
 }
 
+/// A request from a named caller — the pool tests use "anonymous", but the
+/// budget rules key on the caller.
+fn pool_request_from(route: &str, caller: &str, request_id: &str) -> EngineRequest {
+    let mut core = core_request("claude-sonnet-4-6");
+    if let Some(message) = core.messages.first_mut()
+        && let Some(CoreContent::Text { text, .. }) = message.content.first_mut()
+    {
+        *text = format!("hello {request_id}");
+    }
+    EngineRequest::new(
+        route,
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core,
+        InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    )
+    .with_request_id(request_id)
+    .with_caller(caller.to_owned())
+    .with_body_hash(format!("hash-{request_id}"))
+}
+
+/// Fix 05-7 end to end: the failover ladder re-prices the budget
+/// reservation at the member it moves to. The pricey member's estimate
+/// alone would breach the budget, so the ladder refuses it (402) instead
+/// of serving — and settling — above the budget; the failed request
+/// charged nothing, which a follow-up cheap request proves by fitting.
+#[tokio::test]
+async fn a_failover_to_a_pricier_member_never_settles_above_the_budget() {
+    let failing = spawn_upstream(upstream_always_500()).await;
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let ok_two = spawn_upstream(upstream_always_ok()).await;
+
+    let mut cheap = pool_member("cheap", failing, None);
+    cheap.pricing.insert(
+        llm_proxy_core::ModelId::new("claude-sonnet-4-6"),
+        llm_proxy_core::ModelPricing {
+            input: "0.00001".parse().expect("decimal"),
+            output: "0.00001".parse().expect("decimal"),
+            ..llm_proxy_core::ModelPricing::default()
+        },
+    );
+    let mut pricey = pool_member("pricey", ok, None);
+    pricey.pricing.insert(
+        llm_proxy_core::ModelId::new("claude-sonnet-4-6"),
+        llm_proxy_core::ModelPricing {
+            input: "0.001".parse().expect("decimal"),
+            output: "0.001".parse().expect("decimal"),
+            ..llm_proxy_core::ModelPricing::default()
+        },
+    );
+    let mut cheap_direct = pool_member("cheap-direct", ok_two, None);
+    cheap_direct.pricing = cheap.pricing.clone();
+
+    let registry = ProviderRegistry::from_parts(
+        vec![cheap, pricey, cheap_direct],
+        vec![PoolConfig {
+            name: "pooled".to_owned(),
+            members: vec!["cheap".to_owned(), "pricey".to_owned()],
+            retry: RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::ZERO,
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            affinity: Default::default(),
+            health: Default::default(),
+        }],
+    )
+    .expect("registry with pool");
+    let auth = llm_proxy_core::AuthConfig {
+        mode: llm_proxy_core::AuthMode::ClientKeys,
+        clients: HashMap::from([(
+            "laptop".to_owned(),
+            ClientKeySpec::Policy {
+                verifier: secrecy::SecretString::from("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"),
+                allow_models: Vec::new(),
+                allow_providers: Vec::new(),
+                limits: None,
+                budget: Some(KeyBudgetConfig {
+                    usd_per_day: "0.004".parse().expect("decimal"),
+                    unestimatable: llm_proxy_core::UnestimatableCostPolicy::Reject,
+                    assumed_max_output_tokens: 5,
+                }),
+            },
+        )]),
+        admin: None,
+        legacy_bare_tokens: false,
+    };
+    let admission = Arc::new(PolicyAdmission::from_config(&auth, &registry));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+
+    let error = engine
+        .execute(pool_request_from("pooled", "laptop", "failover-budget"))
+        .await
+        .expect_err("the pricey member alone would breach the budget");
+    let EngineError::RetryExhausted { last, .. } = &error else {
+        panic!("expected an exhausted ladder, got {error:?}");
+    };
+    assert!(
+        matches!(**last, EngineError::BudgetExhausted { .. }),
+        "the ladder's last error is the budget refusal, got {last:?}"
+    );
+    assert_eq!(error.status_code(), 402);
+
+    // The failed ladder settled nothing above the budget: a cheap request
+    // from the same key still fits.
+    engine
+        .execute(pool_request_from("cheap-direct", "laptop", "after-refusal"))
+        .await
+        .expect("the budget still holds the cheap estimate");
+}
+
 #[tokio::test]
 async fn per_key_allowlists_are_enforced_through_the_engine() {
     let ok = spawn_upstream(upstream_always_ok()).await;

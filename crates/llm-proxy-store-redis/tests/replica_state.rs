@@ -819,3 +819,163 @@ async fn a_lease_settled_twice_releases_its_counters_once() {
         "the in-flight slot is released once, not twice"
     );
 }
+
+/// Per-member output prices in USD per token, for the rekey-repricing
+/// mirror of the in-process backend (fix 05-7).
+fn reprice_pricing(a_output: &str, b_output: &str) -> HashMap<(String, String), ModelPricing> {
+    HashMap::from([
+        (
+            ("a".to_owned(), "m".to_owned()),
+            ModelPricing {
+                input: "0".parse().expect("decimal"),
+                output: a_output.parse().expect("decimal"),
+                ..ModelPricing::default()
+            },
+        ),
+        (
+            ("b".to_owned(), "m".to_owned()),
+            ModelPricing {
+                input: "0".parse().expect("decimal"),
+                output: b_output.parse().expect("decimal"),
+                ..ModelPricing::default()
+            },
+        ),
+    ])
+}
+
+fn resv_key(prefix: &str, now: OffsetDateTime) -> String {
+    format!("{}:ad:resv:key:{}", prefix, day_stamp(now))
+}
+
+/// The shared store mirrors the in-process reference: a failover to a
+/// pricier member grows the day reservation to the new member's estimate,
+/// a reservation that no longer fits refuses, and settlement releases the
+/// re-priced amount.
+#[tokio::test]
+async fn a_rekey_to_a_pricier_member_moves_the_shared_day_reservation() {
+    let server = TestRedis::start().expect("bind the in-process test Redis");
+    let store = RedisStore::connect(&server.url(), "reprice")
+        .await
+        .expect("connect");
+    let admission = PolicyAdmission::over_backend(
+        budgeted("0.011"),
+        reprice_pricing("0.000002", "0.00002"),
+        HashMap::new(),
+        Arc::new(RedisAdmissionBackend::new(store.clone())),
+    );
+
+    // a's estimate (0.001) fits twice; the lease then fails over to b,
+    // whose estimate (0.01) fills the budget exactly.
+    let first = admission
+        .reserve(&claim("key", "a", "m"))
+        .await
+        .expect("a's estimate fits");
+    admission
+        .reserve(&claim("key", "a", "m"))
+        .await
+        .expect("a's estimate fits twice");
+    let day = resv_key("reprice", OffsetDateTime::now_utc());
+    assert_eq!(server.get(&day).as_deref(), Some("2000"));
+
+    admission
+        .rekey(&first, "b", "m")
+        .await
+        .expect("b's pricier estimate still fits once");
+    assert_eq!(
+        server.get(&day).as_deref(),
+        Some("11000"),
+        "the shared reservation moved to b's estimate"
+    );
+
+    let refused = admission
+        .reserve(&claim("key", "a", "m"))
+        .await
+        .expect_err("a's estimate no longer fits beside b's");
+    assert_eq!(refused.status_code(), 402);
+
+    // Settlement releases what the lease now holds: b's estimate.
+    let backend = RedisAdmissionBackend::new(store);
+    backend
+        .settle_async(
+            first
+                .lease
+                .as_ref()
+                .expect("the redis backend issues a lease"),
+            &Settlement {
+                now: OffsetDateTime::now_utc(),
+                succeeded: false,
+                usage_tokens: None,
+                charged_usd: None,
+            },
+        )
+        .await
+        .expect("settle");
+    assert_eq!(server.get(&day).as_deref(), Some("1000"));
+    admission
+        .reserve(&claim("key", "a", "m"))
+        .await
+        .expect("the refund released b's re-priced estimate");
+}
+
+/// A failover whose re-priced reservation alone would exceed the shared
+/// budget is refused, and the lease keeps its original reservation.
+#[tokio::test]
+async fn a_rekey_that_would_exceed_the_shared_budget_is_refused() {
+    let server = TestRedis::start().expect("bind the in-process test Redis");
+    let store = RedisStore::connect(&server.url(), "refused")
+        .await
+        .expect("connect");
+    let admission = PolicyAdmission::over_backend(
+        budgeted("0.01"),
+        reprice_pricing("0.000002", "0.00004"),
+        HashMap::new(),
+        Arc::new(RedisAdmissionBackend::new(store.clone())),
+    );
+
+    let ticket = admission
+        .reserve(&claim("key", "a", "m"))
+        .await
+        .expect("a's estimate fits");
+    let refused = admission
+        .rekey(&ticket, "b", "m")
+        .await
+        .expect_err("b's estimate alone would exceed the budget");
+    assert!(matches!(
+        refused,
+        llm_proxy_engine::EngineError::BudgetExhausted { .. }
+    ));
+
+    let day = resv_key("refused", OffsetDateTime::now_utc());
+    assert_eq!(
+        server.get(&day).as_deref(),
+        Some("1000"),
+        "the refused rekey left the reservation at a's estimate"
+    );
+    admission
+        .reserve(&claim("key", "a", "m"))
+        .await
+        .expect("a's estimate still fits beside the untouched reservation");
+
+    // Settlement releases the original estimate, not b's.
+    let backend = RedisAdmissionBackend::new(store);
+    backend
+        .settle_async(
+            ticket
+                .lease
+                .as_ref()
+                .expect("the redis backend issues a lease"),
+            &Settlement {
+                now: OffsetDateTime::now_utc(),
+                succeeded: false,
+                usage_tokens: None,
+                charged_usd: None,
+            },
+        )
+        .await
+        .expect("settle");
+    assert_eq!(
+        server.get(&day).as_deref(),
+        Some("1000"),
+        "the original estimate was released, the second lease's stands"
+    );
+}

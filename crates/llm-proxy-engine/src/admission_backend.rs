@@ -163,11 +163,24 @@ pub trait AdmissionBackend: std::fmt::Debug + Send + Sync {
 
     /// Move the reservation's in-flight slot to `member`/`model` (failover):
     /// release the old slot, check and acquire the new one, atomically.
+    /// When `new_estimate_usd` differs from the reservation's estimate, the
+    /// day budget reservation moves by the difference in the same unit:
+    /// refused with [`EngineError::BudgetExhausted`] when the grown
+    /// reservation would exceed `budget_usd_per_day`, leaving the old slot
+    /// and reservation untouched.
     ///
     /// # Errors
     ///
     /// [`EngineError::Overloaded`] when the new member or model is at its
-    /// cap, in which case the ladder skips it and the old slot stands.
+    /// cap, [`EngineError::BudgetExhausted`] when the re-priced reservation
+    /// would exceed the budget — in both cases the ladder skips the member
+    /// and the old reservation stands.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the four slot parameters plus the re-priced estimate and the budget it is \
+                  checked against are one atomic move; bundling them would hide a \
+                  backend's obligations"
+    )]
     async fn rekey(
         &self,
         lease: &LeaseId,
@@ -175,6 +188,8 @@ pub trait AdmissionBackend: std::fmt::Debug + Send + Sync {
         model: &str,
         member_cap: Option<u32>,
         model_cap: Option<u32>,
+        new_estimate_usd: Option<MicroUsd>,
+        budget_usd_per_day: Option<MicroUsd>,
     ) -> Result<(), EngineError>;
 }
 
@@ -523,9 +538,19 @@ impl AdmissionBackend for MemoryAdmissionBackend {
         model: &str,
         member_cap: Option<u32>,
         model_cap: Option<u32>,
+        new_estimate_usd: Option<MicroUsd>,
+        budget_usd_per_day: Option<MicroUsd>,
     ) -> Result<(), EngineError> {
         let mut state = self.lock();
-        let (old_member, old_model, held_member_slot, held_model_slot) = {
+        let (
+            old_member,
+            old_model,
+            held_member_slot,
+            held_model_slot,
+            caller,
+            lease_day,
+            old_reserved,
+        ) = {
             let Some(lease_record) = state.leases.get(lease.as_str()) else {
                 tracing::warn!(
                     lease = lease.as_str(),
@@ -541,6 +566,9 @@ impl AdmissionBackend for MemoryAdmissionBackend {
                 lease_record.model.clone(),
                 lease_record.holds_member_slot,
                 lease_record.holds_model_slot,
+                lease_record.caller.clone(),
+                lease_record.day,
+                lease_record.reserved_usd,
             )
         };
         if let Some(cap) = member_cap {
@@ -554,6 +582,40 @@ impl AdmissionBackend for MemoryAdmissionBackend {
             let inflight = state.inflight_models.get(&key).copied().unwrap_or(0);
             if inflight >= cap {
                 return Err(model_saturated(model, member, cap));
+            }
+        }
+        // Re-price the day reservation before any counter moves (fix 05-7):
+        // a refusal here leaves the old member's slot and reservation
+        // standing. The lease's reservation only counts against the day it
+        // was made on (the same rule settlement releases it by).
+        if let Some(new) = new_estimate_usd {
+            let now = OffsetDateTime::now_utc();
+            if let Some(key) = state.keys.get_mut(&caller)
+                && key.day.day == lease_day
+                && lease_day == now.date()
+            {
+                let without = key.day.reserved.saturating_sub(old_reserved);
+                let projected = without.saturating_add(new);
+                if let Some(budget) = budget_usd_per_day
+                    && new > old_reserved
+                    && key.day.spent.saturating_add(projected) > budget
+                {
+                    return Err(EngineError::BudgetExhausted {
+                        message: format!(
+                            "daily budget of {} USD would be exceeded for this key (spent {}, \
+                             reserved in flight {}, this request {})",
+                            from_micro_usd(budget).normalize(),
+                            from_micro_usd(key.day.spent).normalize(),
+                            from_micro_usd(without).normalize(),
+                            from_micro_usd(new).normalize(),
+                        ),
+                        retry_after: Some(until_next_day(now)),
+                    });
+                }
+                key.day.reserved = projected;
+            }
+            if let Some(lease_record) = state.leases.get_mut(lease.as_str()) {
+                lease_record.reserved_usd = new;
             }
         }
         if held_member_slot && let Some(count) = state.inflight_members.get_mut(&old_member) {

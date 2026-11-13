@@ -262,9 +262,13 @@ pub trait Admission: Debug + Send + Sync {
     /// Move the reservation's in-flight slot to the member the ladder is
     /// about to try (failover or a cooldown reorder, plan 05 step 7): the
     /// serving member's concurrency cap is checked and its slot held, and
-    /// the previously reserved member's slot is released. Fails when the
-    /// new member's cap is saturated, in which case the ladder skips that
-    /// member. The default keeps whatever `reserve` keyed on.
+    /// the previously reserved member's slot is released. The reservation's
+    /// budget estimate is re-priced at the serving member's rates, so a
+    /// failover to a pricier member grows the day reservation (and a
+    /// pricier estimate that no longer fits refuses like a saturated cap).
+    /// Fails when the new member's cap is saturated or the re-priced
+    /// reservation would exceed the budget, in which case the ladder skips
+    /// that member. The default keeps whatever `reserve` keyed on.
     async fn rekey(
         &self,
         ticket: &AdmissionTicket,
@@ -317,6 +321,13 @@ pub struct AdmissionTicket {
     /// The caller the reservation was made for, so settlement diagnostics
     /// can name it without the backend knowing the policy tables.
     pub caller: Option<String>,
+    /// The input estimate the reservation was priced from, so
+    /// [`Admission::rekey`] can re-price it at the serving member's rates
+    /// on failover.
+    pub estimated_input_tokens: u64,
+    /// The request's `max_tokens`, when it set one — the other input the
+    /// failover re-pricing needs.
+    pub max_output_tokens: Option<u64>,
 }
 
 /// Releases a reservation whose holder was dropped before settling: the

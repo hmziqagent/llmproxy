@@ -446,6 +446,8 @@ impl Admission for PolicyAdmission {
             reserved: Some(reserved_tokens),
             lease: Some(lease),
             caller: Some(claim.caller.to_owned()),
+            estimated_input_tokens: claim.estimated_input_tokens,
+            max_output_tokens: claim.max_output_tokens,
         })
     }
 
@@ -479,8 +481,13 @@ impl Admission for PolicyAdmission {
 
     /// Step 7 under failover: the in-flight slot moves to the member the
     /// ladder is about to try, so a capped member is capped however the
-    /// request reached it. The whole move — release, saturation check,
-    /// acquire — happens atomically in the backend, so counts never drift.
+    /// request reached it, and the day reservation is re-priced at that
+    /// member's rates — the estimate `reserve` made was keyed to the first
+    /// candidate's prices, so a pricier member grows the reservation (402
+    /// when it no longer fits) instead of letting the final charge exceed
+    /// it (fix 05-7). The whole move — release, saturation and budget
+    /// checks, acquire — happens atomically in the backend, so counts never
+    /// drift.
     async fn rekey(
         &self,
         ticket: &AdmissionTicket,
@@ -491,8 +498,43 @@ impl Admission for PolicyAdmission {
             return Ok(());
         };
         let (member_cap, model_cap) = self.caps_for(member, model);
+        // Re-price from the token inputs the reservation was made with. An
+        // unpriced member under the rejecting policy refuses here, so the
+        // ladder skips it like a saturated cap.
+        let (budget_usd_per_day, new_estimate_usd) = match ticket
+            .caller
+            .as_deref()
+            .and_then(|caller| self.keys.get(caller))
+            .and_then(|policy| policy.budget.as_ref())
+        {
+            Some(budget) => {
+                let claim = AdmissionClaim {
+                    caller: ticket.caller.as_deref().unwrap_or_default(),
+                    provider: member,
+                    member,
+                    model,
+                    requested_model: model,
+                    body_hash: "",
+                    estimated_input_tokens: ticket.estimated_input_tokens,
+                    max_output_tokens: ticket.max_output_tokens,
+                };
+                (
+                    Some(to_micro_usd(budget.usd_per_day)),
+                    Some(self.estimate_usd(&claim, budget)?),
+                )
+            }
+            None => (None, None),
+        };
         self.backend
-            .rekey(lease, member, model, member_cap, model_cap)
+            .rekey(
+                lease,
+                member,
+                model,
+                member_cap,
+                model_cap,
+                new_estimate_usd,
+                budget_usd_per_day,
+            )
             .await
     }
 }
@@ -1018,6 +1060,114 @@ mod tests {
             .rekey(&second, "b", "m")
             .await
             .expect("settlement freed b, the member the lease ended on");
+        admission.settle(
+            &second,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_to_a_pricier_member_reprices_the_reservation() {
+        // a charges 1 USD per Mtok of output, b charges 10. The 0.011 USD
+        // budget fits a's estimate (0.001) twice plus b's (0.01) exactly
+        // once: once the lease sits on b, a third a-priced reservation must
+        // be refused — the reservation moved with the serving member.
+        let admission = PolicyAdmission::new(
+            HashMap::from([("key".to_owned(), budgeted("0.011"))]),
+            HashMap::from([
+                (("a".to_owned(), "m".to_owned()), pricing("0", "0.000001")),
+                (("b".to_owned(), "m".to_owned()), pricing("0", "0.00001")),
+            ]),
+            HashMap::new(),
+        );
+        let first = admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect("a's estimate fits");
+        let second = admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect("a's estimate fits twice");
+
+        admission
+            .rekey(&first, "b", "m")
+            .await
+            .expect("b's pricier estimate still fits once");
+
+        let refused = admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect_err("the reservation grew to b's pricier estimate");
+        assert_eq!(refused.status_code(), 402);
+
+        // Settling releases what the lease now holds: b's estimate, not a's.
+        admission.settle(
+            &first,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
+        admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect("the refund released b's re-priced estimate");
+        admission.settle(
+            &second,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_to_a_member_that_would_exceed_the_budget_is_refused() {
+        // b's estimate (0.02) alone exceeds the 0.01 USD budget: the move is
+        // refused and the lease keeps its original a-priced reservation.
+        let admission = PolicyAdmission::new(
+            HashMap::from([("key".to_owned(), budgeted("0.01"))]),
+            HashMap::from([
+                (("a".to_owned(), "m".to_owned()), pricing("0", "0.000001")),
+                (("b".to_owned(), "m".to_owned()), pricing("0", "0.00002")),
+            ]),
+            HashMap::new(),
+        );
+        let ticket = admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect("a's estimate fits");
+        let refused = admission
+            .rekey(&ticket, "b", "m")
+            .await
+            .expect_err("b's estimate alone would exceed the budget");
+        assert!(matches!(refused, EngineError::BudgetExhausted { .. }));
+
+        // Nothing moved: a's estimate still fits beside the untouched
+        // reservation.
+        let second = admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect("the refused rekey left the reservation at a's estimate");
+        // A later settle refunds the original estimate.
+        admission.settle(
+            &ticket,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
+        admission
+            .reserve(&claim("key", "a", "m", 0, Some(1000)))
+            .await
+            .expect("the refund restored the original reservation");
         admission.settle(
             &second,
             &AdmissionOutcome {

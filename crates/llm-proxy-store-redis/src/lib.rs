@@ -461,6 +461,120 @@ impl RedisAdmissionBackend {
         Ok(())
     }
 
+    /// Acquires the new member/model in-flight slots for a rekey; on
+    /// saturation the slots taken so far roll back, so a refusal leaves
+    /// nothing behind.
+    async fn acquire_rekey_slots(
+        &self,
+        conn: &mut ConnectionManager,
+        member: &str,
+        model: &str,
+        member_cap: Option<u32>,
+        model_cap: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if let Some(cap) = member_cap {
+            let key = self.member_slot_key(member);
+            let count: i64 = conn
+                .incr(&key, 1)
+                .await
+                .map_err(|error| store_error(&error))?;
+            if count > i64::from(cap) {
+                let _: i64 = conn
+                    .decr(&key, 1)
+                    .await
+                    .map_err(|error| store_error(&error))?;
+                return Err(EngineError::Overloaded {
+                    message: format!("provider \"{member}\" is at its in-flight cap of {cap}"),
+                    retry_after: Some(Duration::from_secs(1)),
+                });
+            }
+        }
+        if let Some(cap) = model_cap {
+            let key = self.model_slot_key(member, model);
+            let count: i64 = conn
+                .incr(&key, 1)
+                .await
+                .map_err(|error| store_error(&error))?;
+            if count > i64::from(cap) {
+                let _: i64 = conn
+                    .decr(&key, 1)
+                    .await
+                    .map_err(|error| store_error(&error))?;
+                if member_cap.is_some() {
+                    let member_key = self.member_slot_key(member);
+                    let _: i64 = conn
+                        .decr(&member_key, 1)
+                        .await
+                        .map_err(|error| store_error(&error))?;
+                }
+                return Err(EngineError::Overloaded {
+                    message: format!(
+                        "model \"{model}\" on \"{member}\" is at its in-flight cap of {cap}"
+                    ),
+                    retry_after: Some(Duration::from_secs(1)),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Undoes the slots `acquire_rekey_slots` took for `member`/`model` —
+    /// the budget-refusal half of a rekey.
+    async fn release_acquired_slots(
+        &self,
+        conn: &mut ConnectionManager,
+        member: &str,
+        model: &str,
+        member_cap: Option<u32>,
+        model_cap: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if member_cap.is_some() {
+            let key = self.member_slot_key(member);
+            let _: i64 = conn
+                .decr(&key, 1)
+                .await
+                .map_err(|error| store_error(&error))?;
+        }
+        if model_cap.is_some() {
+            let key = self.model_slot_key(member, model);
+            let _: i64 = conn
+                .decr(&key, 1)
+                .await
+                .map_err(|error| store_error(&error))?;
+        }
+        Ok(())
+    }
+
+    /// Moves a rekey's day reservation by `new - record.reserved_usd` on
+    /// the lease's own day key, so settle and the reaper release exactly
+    /// what the lease now holds.
+    async fn move_day_reservation(
+        &self,
+        conn: &mut ConnectionManager,
+        record: &LeaseRecord,
+        new: MicroUsd,
+    ) -> Result<(), EngineError> {
+        let delta = new - record.reserved_usd;
+        if delta != 0 {
+            let key = self.reserved_key(&record.caller, &record.day);
+            if conn
+                .exists(&key)
+                .await
+                .map_err(|error| store_error(&error))?
+            {
+                let _: i64 = conn
+                    .incr(&key, delta)
+                    .await
+                    .map_err(|error| store_error(&error))?;
+                let _: bool = conn
+                    .expire(&key, DAY_TTL.as_secs() as i64)
+                    .await
+                    .map_err(|error| store_error(&error))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The window and budget checks of one admission (rpm, rpd, tpm, the
     /// daily budget), each a reserve-check-roll-back sequence on the same
     /// connection; a refusal leaves no counter behind.
@@ -828,6 +942,8 @@ impl AdmissionBackend for RedisAdmissionBackend {
         model: &str,
         member_cap: Option<u32>,
         model_cap: Option<u32>,
+        new_estimate_usd: Option<MicroUsd>,
+        budget_usd_per_day: Option<MicroUsd>,
     ) -> Result<(), EngineError> {
         let mut conn = self.store.conn.clone();
         let record_key = self.lease_key(lease);
@@ -850,48 +966,52 @@ impl AdmissionBackend for RedisAdmissionBackend {
         }
 
         // Acquire the new slots first; on saturation nothing has moved.
-        if let Some(cap) = member_cap {
-            let key = self.member_slot_key(member);
-            let count: i64 = conn
-                .incr(&key, 1)
+        self.acquire_rekey_slots(&mut conn, member, model, member_cap, model_cap)
+            .await?;
+
+        // Re-price the day reservation before anything else moves (fix
+        // 05-7): on a budget refusal the slots acquired above roll back and
+        // the old reservation stands. The lease's reservation counts
+        // against the day it was made on — the day settlement releases it
+        // from.
+        if let Some(new) = new_estimate_usd {
+            let now = OffsetDateTime::now_utc();
+            let today = day_stamp(now);
+            let held = if record.day == today {
+                record.reserved_usd
+            } else {
+                0
+            };
+            let reserved_today: Option<i64> = conn
+                .get(self.reserved_key(&record.caller, &today))
                 .await
                 .map_err(|error| store_error(&error))?;
-            if count > i64::from(cap) {
-                let _: i64 = conn
-                    .decr(&key, 1)
-                    .await
-                    .map_err(|error| store_error(&error))?;
-                return Err(EngineError::Overloaded {
-                    message: format!("provider \"{member}\" is at its in-flight cap of {cap}"),
-                    retry_after: Some(Duration::from_secs(1)),
-                });
-            }
-        }
-        if let Some(cap) = model_cap {
-            let key = self.model_slot_key(member, model);
-            let count: i64 = conn
-                .incr(&key, 1)
+            let spent: Option<i64> = conn
+                .get(self.spent_key(&record.caller, &today))
                 .await
                 .map_err(|error| store_error(&error))?;
-            if count > i64::from(cap) {
-                let _: i64 = conn
-                    .decr(&key, 1)
-                    .await
-                    .map_err(|error| store_error(&error))?;
-                if member_cap.is_some() {
-                    let member_key = self.member_slot_key(member);
-                    let _: i64 = conn
-                        .decr(&member_key, 1)
-                        .await
-                        .map_err(|error| store_error(&error))?;
-                }
-                return Err(EngineError::Overloaded {
+            let without = reserved_today.unwrap_or(0).saturating_sub(held);
+            let projected = without.saturating_add(new);
+            if let Some(budget) = budget_usd_per_day
+                && new > held
+                && spent.unwrap_or(0).saturating_add(projected) > budget
+            {
+                self.release_acquired_slots(&mut conn, member, model, member_cap, model_cap)
+                    .await?;
+                return Err(EngineError::BudgetExhausted {
                     message: format!(
-                        "model \"{model}\" on \"{member}\" is at its in-flight cap of {cap}"
+                        "daily budget of {} USD would be exceeded for this key (spent {}, \
+                         reserved in flight {}, this request {})",
+                        llm_proxy_engine::from_micro_usd(budget).normalize(),
+                        llm_proxy_engine::from_micro_usd(spent.unwrap_or(0)).normalize(),
+                        llm_proxy_engine::from_micro_usd(without.max(0)).normalize(),
+                        llm_proxy_engine::from_micro_usd(new).normalize(),
                     ),
-                    retry_after: Some(Duration::from_secs(1)),
+                    retry_after: Some(until_next_day(now)),
                 });
             }
+            self.move_day_reservation(&mut conn, &record, new).await?;
+            record.reserved_usd = new;
         }
 
         // Release the old slots and record the move. The record carries
