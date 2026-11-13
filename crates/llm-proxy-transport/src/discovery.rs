@@ -103,6 +103,10 @@ impl DiscoveryClient {
     /// GET `url` (no credentials attached) and parse the response as JSON,
     /// bounded by `max_bytes`. Operator tooling uses this — the models.dev
     /// pricing sync (plan 05 step 9).
+    ///
+    /// Unlike [`DiscoveryClient::discover`], the request is not stamped with
+    /// the self-loop hop header: a public catalogue URL is not a provider
+    /// upstream.
     pub async fn fetch_json(&self, url: &str, max_bytes: usize) -> Result<Value, ProviderError> {
         let url = Url::parse(url).map_err(|error| {
             ProviderError::InvalidConfig(format!("invalid catalogue URL: {error}"))
@@ -171,6 +175,9 @@ impl DiscoveryClient {
         url: &Url,
     ) -> RequestBuilder {
         let mut request = self.http.get(url.clone());
+        // Self-loop marker (backlog 32): a discovery endpoint that points
+        // back at an llm-proxy must be answered 508 instead of looping.
+        request = request.header(llm_proxy_core::HOP_HEADER, llm_proxy_core::HOP_HEADER_VALUE);
         let api_key: &str = provider.api_key.expose_secret();
         request = match provider.auth_style {
             AuthStyle::Bearer => request.bearer_auth(api_key),
@@ -408,6 +415,17 @@ mod tests {
         }))
     }
 
+    async fn echo_hop(headers: HeaderMap) -> Json<Value> {
+        let hop = headers
+            .get(llm_proxy_core::HOP_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing");
+        Json(json!({
+            "data": [{"id": hop}],
+            "has_more": false
+        }))
+    }
+
     async fn start_test_server(app: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -481,6 +499,23 @@ mod tests {
             .expect("Anthropic discovery should succeed");
 
         assert_eq!(models[0].id, "2024-01-01");
+    }
+
+    #[tokio::test]
+    async fn discovery_requests_carry_the_hop_marker() {
+        let endpoint = start_test_server(Router::new().route("/models", get(echo_hop))).await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect("discovery should succeed");
+
+        assert_eq!(models[0].id, "1");
     }
 
     #[tokio::test]

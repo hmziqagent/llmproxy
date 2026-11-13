@@ -57,11 +57,11 @@ All eleven steps landed, each with regression tests:
    literals and `localhost` exempt); `validate` and startup share the check.
 3. The `/usage` router layers `Cache-Control: no-store` (overriding) and
    `Pragma: no-cache` on every response, the 401 refusal included.
-4. `llm-proxy-core::self_loop` — every upstream request carries
-   `x-llm-proxy-hop: 1`; any request arriving with it is answered
-   `508 Loop Detected`; startup and `validate` resolve every adapter and
-   discovery endpoint (DNS included) and refuse those landing on the proxy's
-   own listeners.
+4. `llm-proxy-core::self_loop` — every provider upstream request (chat,
+   discovery) carries `x-llm-proxy-hop: 1`; any request arriving with it is
+   answered `508 Loop Detected`; startup and `validate` resolve every
+   adapter and discovery endpoint (DNS included) and refuse those landing
+   on the proxy's own listeners.
 5. `LogFormat::effective` + config-before-subscriber init in `cmd_serve`:
    `server.log_format` is honoured, `RUST_LOG_FORMAT` still wins — verified
    against the real binary.
