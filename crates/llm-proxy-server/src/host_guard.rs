@@ -160,7 +160,9 @@ fn request_carries_fetch_metadata(headers: &axum::http::HeaderMap) -> bool {
 }
 
 /// The middleware. Installs nothing under client-keys auth; see the module
-/// docs.
+/// docs. A request whose only foreign marker is an `Origin` header with no
+/// Fetch Metadata is admitted on purpose (captured CLI traffic sends one);
+/// `a_non_browser_request_with_an_origin_header_passes` pins that admission.
 pub(crate) async fn enforce_host_origin(
     State(state): State<AppState>,
     req: Request,

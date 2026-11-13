@@ -36,7 +36,11 @@ at any time.
 
 ## Done when
 
-- A request with a foreign `Host` or `Origin` is refused in `mode = "none"`.
+- A request with a foreign `Host`, or a browser request (one carrying
+  `Sec-Fetch-*`) with a foreign `Origin` or a cross-site `Sec-Fetch-Site`,
+  is refused in `mode = "none"`; a non-browser client's stray `Origin`
+  header is admitted because the Host check already pins it to this
+  listener.
 - `validate` refuses cleartext credentials to a remote host.
 - A reload that changes one provider leaves in-flight requests on other providers
   running.
