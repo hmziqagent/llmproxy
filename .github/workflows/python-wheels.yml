@@ -128,7 +128,11 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # os has to be an original matrix key: an include entry made only of
+      # added keys merges into every combination, and each later entry
+      # overwrites the os the previous one added, leaving macOS-only legs.
       matrix:
+        os: [ubuntu-22.04, windows-latest, macos-15]
         python-version: ["3.9", "3.13"]
         include:
           - os: ubuntu-22.04
