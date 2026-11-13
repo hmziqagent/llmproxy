@@ -72,14 +72,26 @@ fn host_port_of(url: &str) -> Option<(String, u16)> {
     (!host.is_empty()).then_some((host, port))
 }
 
-/// Whether `addr` is one of `listeners`: the same port on loopback (the
-/// default deployment binds loopback, whatever loopback spelling the
-/// endpoint resolved to), or the exact address for a non-loopback bind.
+/// Whether `addr` is one of `listeners`: the same address and port, the same
+/// port on loopback (the default deployment binds loopback, whatever loopback
+/// spelling the endpoint resolved to), or — for a wildcard bind (`0.0.0.0` or
+/// `[::]`) — any loopback (or wildcard) address on that port, since a wildcard
+/// listener accepts every loopback spelling of either family (`[::]` is
+/// dual-stack on the platforms we ship). Residual: an upstream naming one of
+/// the host's own non-loopback interface addresses on a wildcard port is not
+/// caught here and is still only stopped by the runtime `508` hop-header check.
 fn lands_on_listener(addr: SocketAddr, listeners: &[SocketAddr]) -> Option<SocketAddr> {
     listeners
         .iter()
         .copied()
         .find(|listener| addr.port() == listener.port() && addr.ip() == listener.ip())
+        .or_else(|| {
+            listeners.iter().copied().find(|listener| {
+                listener.ip().is_unspecified()
+                    && addr.port() == listener.port()
+                    && (addr.ip().is_loopback() || addr.ip().is_unspecified())
+            })
+        })
         .or_else(|| {
             listeners.iter().copied().find(|listener| {
                 addr.ip().is_loopback()
@@ -232,6 +244,39 @@ mod tests {
             self_loop_problems(&providers, &listeners_of(&[8080])).is_empty(),
             "the check must not report an upstream on another host"
         );
+    }
+
+    #[test]
+    fn a_wildcard_bind_catches_loopback_upstreams_on_its_port() {
+        let wildcard_cases = ["0.0.0.0:8080", "[::]:8080"];
+        for bind in wildcard_cases {
+            let listeners: Vec<SocketAddr> = vec![bind.parse().unwrap()];
+            for (name, endpoint) in [
+                ("v4-loopback", "http://127.0.0.1:8080/v1/chat/completions"),
+                ("by-name", "http://localhost:8080/v1/chat/completions"),
+                ("v6-loopback", "http://[::1]:8080/v1/chat/completions"),
+            ] {
+                let providers = [provider_with_endpoint("loopy", endpoint)];
+                let problems = self_loop_problems(&providers, &listeners);
+                assert_eq!(
+                    problems.len(),
+                    1,
+                    "bind {bind}: endpoint {name} at {endpoint} lands on the wildcard listener: \
+                     {problems:?}"
+                );
+            }
+            for (name, endpoint) in [
+                ("other-port", "http://127.0.0.1:8081/v1/chat/completions"),
+                ("other-host", "http://10.1.2.3:8080/v1/chat/completions"),
+            ] {
+                let providers = [provider_with_endpoint("fine", endpoint)];
+                let problems = self_loop_problems(&providers, &listeners);
+                assert!(
+                    problems.is_empty(),
+                    "bind {bind}: endpoint {name} at {endpoint} must not be reported: {problems:?}"
+                );
+            }
+        }
     }
 
     #[test]
