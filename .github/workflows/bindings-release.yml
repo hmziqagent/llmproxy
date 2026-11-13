@@ -201,10 +201,23 @@ jobs:
           fi
       # napi prepublish validates every platform package (name, files list,
       # the staged llm-proxy.<platform>.node) and syncs the root
-      # optionalDependencies with the pinned @napi-rs/cli.
+      # optionalDependencies with the pinned @napi-rs/cli. Its defaults are
+      # switched off: the lerna tag style rejects a HEAD commit that names no
+      # `<package>@<version>` (--tag-style npm), and --no-gh-release and
+      # --skip-optional-publish keep the CLI from creating a GitHub release
+      # and from running npm publish itself; the next step publishes.
       - name: Run the pinned @napi-rs/cli pre-publish step
         working-directory: bindings/node
-        run: npx napi prepublish
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          prepublish_args=(--tag-style npm --no-gh-release --skip-optional-publish)
+          if [ "$DRY_RUN" = "true" ]; then
+            prepublish_args+=(--dry-run)
+          fi
+          npx napi prepublish "${prepublish_args[@]}"
       - name: Publish the platform packages, then the main package
         working-directory: bindings/node
         shell: bash
