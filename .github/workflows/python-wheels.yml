@@ -1,0 +1,164 @@
+name: Python wheels
+
+# Plan 10 item 10-10: every Python binding wheel and the sdist are built in
+# CI (the local dist/ artifacts are gitignored), then each OS wheel is
+# installed into a fresh venv and the full binding contract suite runs
+# against the installed package with no Rust toolchain in the job. The
+# release workflow (10-13) reuses this file through workflow_call.
+on:
+  pull_request:
+    paths:
+      - "bindings/python/**"
+      - "bindings/shared/**"
+      - "crates/**"
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: wheel (${{ matrix.os }} ${{ matrix.target }} ${{ matrix.manylinux }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 Windows is deliberately absent: the plan marks it
+          # optional and it has not been built or install-tested. Add a
+          # windows-11-arm (or cross-compiled) leg only with that evidence.
+          - os: ubuntu-22.04
+            target: x86_64
+            manylinux: auto
+            artifact: wheels-ubuntu-22.04-x86_64-gnu
+          - os: ubuntu-22.04
+            target: aarch64
+            manylinux: auto # cross-compiled in the rust-cross manylinux container; no QEMU
+            artifact: wheels-ubuntu-22.04-aarch64-gnu
+          - os: ubuntu-22.04
+            target: x86_64
+            manylinux: musllinux_1_2
+            artifact: wheels-ubuntu-22.04-x86_64-musllinux_1_2
+          - os: windows-latest
+            target: x64
+            manylinux: auto # ignored off Linux
+            artifact: wheels-windows-latest-x64
+          - os: macos-15
+            target: universal2-apple-darwin
+            manylinux: auto # ignored off Linux
+            artifact: wheels-macos-15-universal2
+    steps:
+      - uses: actions/checkout@v4
+      # Serves only the wheel-tag check below; Linux builds run inside the
+      # manylinux container and never see this interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          args: --release --locked -o dist
+          manylinux: ${{ matrix.manylinux }}
+          rust-toolchain: "1.96.1"
+      - name: Fail unless every built wheel is an abi3 wheel
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import glob
+          import sys
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if not wheels:
+              sys.exit("no wheel was built into dist/")
+          for wheel in wheels:
+              print(wheel)
+              if "abi3" not in wheel:
+                  sys.exit(f"wheel is not abi3: {wheel}")
+          EOF
+      - name: List the artifact names in the run summary
+        working-directory: bindings/python
+        shell: bash
+        run: |
+          {
+            echo "### wheels (${{ matrix.os }} / ${{ matrix.target }} / ${{ matrix.manylinux }})"
+            for f in dist/*; do
+              echo "- \`$(basename "$f")\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bindings/python/dist
+          if-no-files-found: error
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build the sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+          rust-toolchain: "1.96.1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: bindings/python/dist
+          if-no-files-found: error
+
+  # The install matrix is the plan's acceptance proof: `import llm_proxy`
+  # from the wheel and the whole contract suite on Linux, Windows and macOS
+  # for Python 3.9 and 3.13. Nothing in this job may install Rust; 10-12
+  # adds the enforced no-cargo check for this install path.
+  test-install:
+    name: install (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+        include:
+          - os: ubuntu-22.04
+            artifact: wheels-ubuntu-22.04-x86_64-gnu
+          - os: windows-latest
+            artifact: wheels-windows-latest-x64
+          - os: macos-15
+            artifact: wheels-macos-15-universal2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Install the wheel (no Rust toolchain) and run the contract suite
+        shell: bash
+        run: |
+          python -m venv .venv-install
+          if [ -x .venv-install/bin/python ]; then
+            PY=.venv-install/bin/python
+          else
+            PY=.venv-install/Scripts/python.exe
+          fi
+          # --no-index: llm-proxy can only come from the wheel built above.
+          # pytest is test-only tooling and comes from the package index; a
+          # single --no-index install of both would have nothing to resolve
+          # pytest from.
+          "$PY" -m pip install --no-index --find-links dist llm-proxy
+          "$PY" -m pip install pytest
+          "$PY" -m pytest bindings/python/tests -q

@@ -180,12 +180,12 @@ jobs:
       - name: Publish dry-run
         run: cargo publish --workspace --dry-run --locked
 
-  # The macOS leg of the plan-10 done-when line (`pip install` and `npm
-  # install` work on each platform with no Rust toolchain): builds the
-  # universal2 artifacts on a macOS runner, installs the wheel and the
-  # packed npm tarball (no Rust involved in either install), and runs both
-  # binding contract suites against them. The Linux artifacts are exercised
-  # by the same suites locally; Windows via wine (see the package READMEs).
+  # The macOS leg of the plan-10 done-when line (`npm install` works with no
+  # Rust toolchain) for the Node binding only: builds the darwin-universal
+  # binary, runs the Node contract suite, and installs the packed npm
+  # tarball with no Rust involved in the install. The Python wheels are
+  # built and install-tested on all three OSes by python-wheels.yml (10-10);
+  # 10-11 replaces this Node half with per-platform packages.
   bindings-macos:
     runs-on: macos-15
     timeout-minutes: 60
@@ -198,19 +198,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Build the universal2 wheel and run the Python suite against the install
-        working-directory: bindings/python
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install maturin
-          .venv/bin/maturin build --release --target universal2-apple-darwin -o dist
-          python -m venv .venv-test
-          .venv-test/bin/pip install dist/llm_proxy-*.whl pytest
-          .venv-test/bin/python -m pytest tests -q
 
       - name: Run the Node suite against the darwin-universal binary
         working-directory: bindings/node

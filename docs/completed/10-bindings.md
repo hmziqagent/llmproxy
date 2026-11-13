@@ -74,10 +74,15 @@ the engine and add no logic of their own, so they start once its API has stopped
   --zig --target universal2-apple-darwin`; zig supplies the macOS libc
   stubs, `llvm-lipo` merges the slices): structurally verified as a fat
   `x86_64 + arm64` Mach-O whose undefined `Py_*` symbols resolve from the
-  host interpreter and which links only system libraries. On-macOS
-  verification runs in CI: the `bindings-macos` job builds the universal2
-  wheel on a macOS runner, pip-installs it into a fresh venv (no Rust
-  toolchain) and runs the pytest suite against the install.
+  host interpreter and which links only system libraries. All the wheels
+  plus an sdist are now built in CI by `.github/workflows/python-wheels.yml`
+  (Linux x86_64 manylinux and musllinux_1_2, Linux aarch64 via the
+  rust-cross manylinux container, Windows x64, macOS universal2), each wheel
+  is checked to be `abi3`, and each OS wheel is pip-installed into a fresh
+  venv (no Rust toolchain in the job) on ubuntu-22.04, windows-latest and
+  macos-15 for CPython 3.9 and 3.13, with the pytest suite run against the
+  install; the `bindings-macos` job covers the Node binding only. aarch64
+  Windows is not built: it is optional and unverified.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
