@@ -1,12 +1,10 @@
 //! Shared upstream cooldowns in Redis (plan 09 step 1): one replica's
-//! cooldown is every replica's cooldown.
+//! cooldown is every replica's cooldown, and extending one never shortens
+//! it — writes are one server-side script, the Redis counterpart of the
+//! Postgres store's `GREATEST` upserts.
 //!
-//! Cooldown records are plain string keys (value: unix-ms reset). One
-//! residual race is documented here rather than hidden: extending an
-//! existing cooldown is read-max-write, so two replicas writing
-//! concurrently can leave the shorter of the two extensions in place —
-//! availability is restored slightly early, never withheld. Reads delete
-//! expired records lazily, so storage stays bounded.
+//! Cooldown records are plain string keys (value: unix-ms reset). Reads
+//! delete expired records lazily, so storage stays bounded.
 
 use std::time::Duration;
 
@@ -20,6 +18,18 @@ use crate::RedisStore;
 /// deleted lazily once read, and this bounds storage for members whose
 /// cooldown is never read again.
 const COOLDOWN_GRACE_MS: u64 = 3_600_000;
+
+/// The cooldown write as one atomic server-side script: store `ARGV[1]`
+/// unless an equal or later reset is already stored, with `ARGV[2]`
+/// seconds of TTL. Redis has no atomic set-if-greater command. The same
+/// script also reads legacy values left by older builds (plain integer
+/// ms) without change.
+pub(crate) const SET_IF_GREATER: &str = r#"
+local cur = redis.call('GET', KEYS[1])
+if cur and tonumber(cur) >= tonumber(ARGV[1]) then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"#;
 
 fn unix_ms(at: OffsetDateTime) -> i64 {
     at.unix_timestamp_nanos().div_euclid(1_000_000) as i64
@@ -70,19 +80,20 @@ impl RedisCooldowns {
     }
 
     /// Writes `until` unless a later reset is already stored (extend,
-    /// never shorten — modulo the concurrent-writer race in the module
-    /// docs).
+    /// never shorten): one atomic server-side script, so two replicas
+    /// writing concurrently can never leave the shorter reset in place.
     async fn write_until(&self, key: &str, until: OffsetDateTime) {
-        use redis::AsyncCommands;
         let now = OffsetDateTime::now_utc();
         let mut conn = self.store.conn.clone();
-        let existing: Option<i64> = conn.get(key).await.ok().flatten();
-        if existing.is_some_and(|current| current >= unix_ms(until)) {
-            return;
-        }
         let ttl = ttl_until(until, now);
-        let result: std::result::Result<(), redis::RedisError> =
-            conn.set_ex(key, unix_ms(until), ttl.as_secs().max(1)).await;
+        let result = redis::cmd("EVAL")
+            .arg(SET_IF_GREATER)
+            .arg(1)
+            .arg(key)
+            .arg(unix_ms(until))
+            .arg(ttl.as_secs().max(1))
+            .query_async::<i64>(&mut conn)
+            .await;
         if let Err(error) = result {
             tracing::warn!(%error, "writing cooldown to Redis failed");
         }

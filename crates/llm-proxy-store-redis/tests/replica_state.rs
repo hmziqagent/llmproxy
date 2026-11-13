@@ -106,6 +106,11 @@ fn day_stamp(now: OffsetDateTime) -> String {
     )
 }
 
+/// Unix-ms exactly as the cooldown store serializes a reset.
+fn unix_ms_of(at: OffsetDateTime) -> i64 {
+    i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000_000)).expect("unix ms fits i64")
+}
+
 /// Sum of the named counters in one traced snapshot; a missing key counts 0.
 fn exposure(snapshot: &BTreeMap<String, String>, keys: &[&str]) -> i64 {
     keys.iter()
@@ -419,6 +424,117 @@ async fn cooldowns_written_by_one_replica_are_seen_by_the_other() {
     );
     b.clear_provider("member").await;
     assert!(a.provider_available("member", now).await);
+}
+
+/// Fix 09-3: cooldown writes are monotonic across concurrent replicas.
+/// Sixteen writers over two stores ask for distinct resets in shuffled
+/// order; every traced snapshot of the cooldown key must hold a
+/// non-decreasing reset, and the stored reset must be the longest any
+/// writer asked for — whatever interleaving the connections ran in.
+#[tokio::test]
+async fn concurrent_cooldown_writers_never_shorten_the_stored_reset() {
+    let server = TestRedis::start().expect("bind the in-process test Redis");
+    let store_a = RedisStore::connect(&server.url(), "cdmono")
+        .await
+        .expect("connect");
+    let store_b = RedisStore::connect(&server.url(), "cdmono")
+        .await
+        .expect("connect");
+    let a = Arc::new(RedisCooldowns::new(store_a));
+    let b = Arc::new(RedisCooldowns::new(store_b));
+    let key = "cdmono:cd:p:p".to_owned();
+
+    let now = OffsetDateTime::now_utc();
+    let untils: Vec<OffsetDateTime> = (1..=16_u64)
+        .map(|offset| now + Duration::from_secs(offset))
+        .collect();
+    let longest = unix_ms_of(*untils.iter().max().expect("sixteen resets"));
+
+    // A fixed non-monotonic order — ascending writers would let even the
+    // old read-then-write code look safe.
+    let order = [3, 11, 7, 0, 14, 5, 9, 2, 15, 6, 12, 1, 8, 13, 4, 10];
+    server.start_trace();
+    let mut handles = Vec::new();
+    for (slot, index) in order.iter().enumerate() {
+        let cooldowns = if slot % 2 == 0 {
+            Arc::clone(&a)
+        } else {
+            Arc::clone(&b)
+        };
+        let until = untils[*index];
+        handles.push(tokio::spawn(async move {
+            cooldowns.cooldown_provider("p", until).await;
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("writer task");
+    }
+
+    let trace = server.take_trace();
+    assert!(
+        trace.len() >= 2,
+        "every cooldown write left a traced snapshot"
+    );
+    let mut seen: Option<i64> = None;
+    for (index, snapshot) in trace.iter().enumerate() {
+        let stored = snapshot
+            .get(&key)
+            .unwrap_or_else(|| panic!("snapshot {index} lost the cooldown: {snapshot:?}"))
+            .parse::<i64>()
+            .expect("the stored reset is unix ms");
+        if let Some(previous) = seen {
+            assert!(
+                stored >= previous,
+                "snapshot {index} shortened the reset to {stored} below {previous} \
+                 ({snapshot:?})"
+            );
+        }
+        seen = Some(stored);
+    }
+    assert_eq!(
+        seen,
+        Some(longest),
+        "the stored reset is the longest cooldown any writer asked for"
+    );
+}
+
+/// Fix 09-3's deterministic sibling: writing a shorter cooldown over a
+/// longer stored one keeps the longer reset, and the public read API
+/// agrees — cooling at now+8s, available again at now+11s.
+#[tokio::test]
+async fn a_shorter_cooldown_never_replaces_a_longer_one() {
+    let server = TestRedis::start().expect("bind the in-process test Redis");
+    let store = RedisStore::connect(&server.url(), "cdshort")
+        .await
+        .expect("connect");
+    let cooldowns = RedisCooldowns::new(store);
+    let now = OffsetDateTime::now_utc();
+    cooldowns
+        .cooldown_provider("p", now + Duration::from_secs(10))
+        .await;
+    cooldowns
+        .cooldown_provider("p", now + Duration::from_secs(5))
+        .await;
+
+    assert!(
+        !cooldowns
+            .provider_available("p", now + Duration::from_secs(8))
+            .await,
+        "the provider is still cooling on the 10s reset"
+    );
+    assert_eq!(
+        server
+            .get("cdshort:cd:p:p")
+            .and_then(|value| value.parse::<i64>().ok()),
+        Some(unix_ms_of(now + Duration::from_secs(10))),
+        "the stored reset is exactly the 10s value"
+    );
+    assert!(
+        cooldowns
+            .provider_available("p", now + Duration::from_secs(11))
+            .await,
+        "the reset stayed the 10s one, not the later 5s write"
+    );
 }
 
 #[tokio::test]

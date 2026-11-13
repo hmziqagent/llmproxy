@@ -3,6 +3,13 @@
 //! (single-threaded per command, integer counters, lazy key expiry) over a
 //! real TCP socket on loopback, speaking RESP2.
 //!
+//! Limitation: this server cannot interpret Lua. `EVAL` runs only the
+//! crate's own cooldown set-if-greater script
+//! ([`crate::cooldowns::SET_IF_GREATER`]), executed natively — compare and
+//! `SET EX` under one lock, matching a real server's script atomicity —
+//! and rejects every other script with an error. The real Lua script is
+//! exercised by the ignored live suite (`tests/live_server.rs`).
+//!
 //! This exists so the store's client code runs against the real wire
 //! protocol, not a mock of the client library, in environments that have
 //! no Redis server binary. It is exposed behind the `test-server`
@@ -127,9 +134,9 @@ impl TestRedis {
     }
 
     /// Begin recording a snapshot of the live string keyspace after every
-    /// mutating command (`SET SETEX DEL EXPIRE INCR DECR INCRBY DECRBY`,
-    /// and `EVAL ZADD ZREM` once those commands exist): every state a
-    /// concurrent reader of the store could observe.
+    /// mutating command (`SET SETEX DEL EXPIRE INCR DECR INCRBY DECRBY
+    /// EVAL ZADD ZREM`): every state a concurrent reader of the store
+    /// could observe.
     pub fn start_trace(&self) {
         *self
             .db
@@ -285,6 +292,41 @@ fn handle_set(db: &Arc<Db>, rest: &[String]) -> String {
     simple("OK")
 }
 
+/// `EVAL script numkeys key arg ...` — only the crate's cooldown
+/// set-if-greater script is run, natively (compare and `SET EX` under one
+/// lock, the atomicity a real server gives every script); any other
+/// script is refused, because this server cannot interpret Lua.
+fn handle_eval(db: &Arc<Db>, rest: &[String]) -> String {
+    let (Some(script), Some(numkeys)) = (rest.first(), rest.get(1)) else {
+        return error("EVAL needs a script and the number of keys");
+    };
+    if script != crate::cooldowns::SET_IF_GREATER || numkeys != "1" {
+        return error("this test server only runs the crate's own scripts");
+    }
+    let (Some(key), Some(until), Some(ttl)) = (rest.get(2), rest.get(3), rest.get(4)) else {
+        return error("EVAL needs one key and two arguments");
+    };
+    let (Ok(until), Ok(ttl)) = (until.parse::<i64>(), ttl.parse::<u64>()) else {
+        return error("EVAL arguments are not numbers");
+    };
+    let mut map = db
+        .strings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stored = live(&map, key).and_then(|value| value.parse::<i64>().ok());
+    if stored.is_some_and(|current| current >= until) {
+        return integer(0);
+    }
+    map.insert(
+        key.to_owned(),
+        (
+            until.to_string(),
+            Some(now_ms() + ttl.saturating_mul(1_000)),
+        ),
+    );
+    integer(1)
+}
+
 fn score_bound(raw: &str) -> Option<f64> {
     match raw.to_ascii_lowercase().as_str() {
         "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
@@ -406,6 +448,7 @@ fn handle(args: &[String], db: &Arc<Db>) -> String {
         "HELLO" => error("unknown command 'HELLO'"),
         "GET" => handle_get(db, rest),
         "SET" => handle_set(db, rest),
+        "EVAL" => handle_eval(db, rest),
         "DEL" => {
             let mut removed = 0_i64;
             let mut map = db

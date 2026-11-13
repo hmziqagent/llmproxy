@@ -250,3 +250,63 @@ async fn conn_of() -> redis::aio::ConnectionManager {
     let client = redis::Client::open(url).expect("client");
     client.get_connection_manager().await.expect("conn")
 }
+
+/// Fix 09-3 against the real server: the Lua set-if-greater script keeps
+/// concurrent cooldown writes monotonic — sixteen writers over two
+/// replicas in shuffled order leave the longest reset stored, and the
+/// real server's own script engine (not the in-repo stand-in) is what
+/// made it so.
+#[tokio::test]
+#[ignore = "needs a live Redis; set LLM_PROXY_TEST_REDIS"]
+async fn live_cooldown_script_is_monotonic() {
+    let store_a = store().await;
+    let store_b = store().await;
+    let a = Arc::new(RedisCooldowns::new(store_a));
+    let b = Arc::new(RedisCooldowns::new(store_b));
+
+    let member = fresh_caller("cdmono");
+    let now = OffsetDateTime::now_utc();
+    let untils: Vec<OffsetDateTime> = (1..=16_u64)
+        .map(|offset| now + Duration::from_secs(offset))
+        .collect();
+    let longest = *untils.iter().max().expect("sixteen resets");
+
+    let order = [3, 11, 7, 0, 14, 5, 9, 2, 15, 6, 12, 1, 8, 13, 4, 10];
+    let mut handles = Vec::new();
+    for (slot, index) in order.iter().enumerate() {
+        let cooldowns = if slot % 2 == 0 {
+            Arc::clone(&a)
+        } else {
+            Arc::clone(&b)
+        };
+        let member = member.clone();
+        let until = untils[*index];
+        handles.push(tokio::spawn(async move {
+            cooldowns.cooldown_provider(&member, until).await;
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("writer task");
+    }
+
+    let key = format!("livesrv:cd:p:{member}");
+    let stored: Option<String> = {
+        use redis::AsyncCommands;
+        let mut conn = conn_of().await;
+        conn.get(&key).await.expect("read the cooldown key")
+    };
+    let stored_ms: i64 = stored
+        .expect("the longest cooldown is stored")
+        .parse()
+        .expect("the stored reset is unix ms");
+    assert_eq!(
+        Some(stored_ms),
+        i64::try_from(longest.unix_timestamp_nanos().div_euclid(1_000_000)).ok(),
+        "the real script stored the longest of the sixteen resets"
+    );
+    assert!(
+        !b.provider_available(&member, now + Duration::from_secs(8))
+            .await,
+        "the other replica still sees the provider cooling"
+    );
+}
