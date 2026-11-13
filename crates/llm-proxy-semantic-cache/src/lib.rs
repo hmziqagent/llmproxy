@@ -4,7 +4,12 @@
 //! - **Off by default.** It is wired only when `[server.semantic_cache]`
 //!   is enabled and the crate is compiled in.
 //! - **Caller-scoped keys.** Entries bucket by `(caller, provider,
-//!   model)`; one caller's cached response is never served to another.
+//!   model, shape)`; one caller's cached response is never served to
+//!   another, and only requests of the same shape — route kind, tool
+//!   definitions, tool choice, sampling parameters, provider hints and
+//!   message roles — share a bucket. A request carrying any non-text
+//!   content (an image, document, audio, a tool use or result) is never
+//!   cached and never served.
 //! - **Data policy.** The cache stores prompt embeddings and complete
 //!   responses per caller for the configured TTL, bounded to
 //!   `max_entries` per caller — see `docs/data-class-policy.md`. Nothing
@@ -94,6 +99,47 @@ impl SemanticCache {
         }
         parts.join("\n")
     }
+
+    /// The request shape a bucket is keyed on: route kind, tool
+    /// definitions, tool choice, sampling parameters, provider hints and
+    /// message roles — everything besides the embedded text that changes
+    /// what a response means. `None` when the request can never be
+    /// cached: any non-text system or message content (an image, a
+    /// document, audio, a tool use or result) cannot be embedded as text,
+    /// and keeping the original data in memory would break the data
+    /// policy. This is JSON of tool schemas and sampling numbers, not
+    /// prompt text, so it lives in the bucket key only.
+    fn shape(key: &CacheKey<'_>) -> Option<String> {
+        let all_text = key
+            .request
+            .system
+            .iter()
+            .chain(
+                key.request
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.content.iter()),
+            )
+            .all(|content| matches!(content, CoreContent::Text { .. }));
+        if !all_text {
+            return None;
+        }
+        let roles: Vec<String> = key
+            .request
+            .messages
+            .iter()
+            .map(|message| format!("{:?}", message.role))
+            .collect();
+        serde_json::to_string(&(
+            key.route_kind.config_key(),
+            &key.request.tools,
+            &key.request.tool_choice,
+            &key.request.sampling,
+            &key.request.provider_hints,
+            roles,
+        ))
+        .ok()
+    }
 }
 
 #[async_trait]
@@ -104,6 +150,9 @@ impl Cache for SemanticCache {
         if key.streaming || !self.config.enabled {
             return Ok(None);
         }
+        let Some(shape) = Self::shape(key) else {
+            return Ok(None);
+        };
         let prompt = Self::prompt_text(key.request);
         let embedding = self
             .embedder
@@ -120,9 +169,7 @@ impl Cache for SemanticCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         store.expire(now, self.config.ttl);
         match store.nearest(
-            key.caller,
-            key.provider,
-            key.model,
+            (key.caller, key.provider, key.model, &shape),
             query,
             self.config.threshold,
         ) {
@@ -146,6 +193,10 @@ impl Cache for SemanticCache {
         if key.streaming || !self.config.enabled {
             return;
         }
+        let Some(shape) = Self::shape(key) else {
+            tracing::debug!("semantic cache store skipped: request has non-text content");
+            return;
+        };
         let prompt = Self::prompt_text(key.request);
         let embedding = match self.embedder.embed(&[prompt]).await {
             Ok(embedding) => embedding,
@@ -170,9 +221,7 @@ impl Cache for SemanticCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         store.insert(
-            key.caller,
-            key.provider,
-            key.model,
+            (key.caller, key.provider, key.model, &shape),
             Entry {
                 embedding: vector.clone(),
                 response: entry.response.clone(),

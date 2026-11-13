@@ -19,7 +19,9 @@ use llm_proxy_engine::{
     Cache, CacheEntry, CacheKey, ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest,
     InboundRequest,
 };
-use llm_proxy_protocol::core::{CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole};
+use llm_proxy_protocol::core::{
+    CoreContent, CoreMessage, CoreRequest, CoreResponse, CoreRole, CoreTool,
+};
 use llm_proxy_semantic_cache::{Embedder, Embedding, NgramEmbedder, SemanticCache};
 use llm_proxy_storage::{EventBus, NoopBus};
 use tokio::sync::Mutex;
@@ -99,6 +101,155 @@ async fn store_one(cache: &SemanticCache, caller: &str, prompt: &str) {
             },
         )
         .await;
+}
+
+fn cached_entry() -> CacheEntry {
+    CacheEntry {
+        response: response("the cached answer"),
+        events: Vec::new(),
+    }
+}
+
+/// Requests whose `tools`, `tool_choice`, sampling parameters, provider
+/// hints, route kind, message roles or non-text content differ must never
+/// share a cached entry, no matter how similar their text is.
+#[tokio::test]
+async fn identical_text_with_different_sampling_does_not_share_an_entry() {
+    let cache = SemanticCache::new(
+        config(0.6, Duration::from_secs(600), 16),
+        Box::new(NgramEmbedder::new()),
+    );
+    let prompt = "Summarize this log line as JSON.";
+    let mut stored = core_request(prompt);
+    stored.sampling.temperature = Some(0.0);
+    cache
+        .store(&cache_key("key", &stored), &cached_entry())
+        .await;
+
+    let mut same_sampling = core_request(prompt);
+    same_sampling.sampling.temperature = Some(0.0);
+    let hit = cache
+        .lookup(&cache_key("key", &same_sampling))
+        .await
+        .expect("lookup");
+    assert!(hit.is_some(), "the identical shape hits");
+    assert_eq!(cache.hits(), 1);
+
+    let mut other_sampling = core_request(prompt);
+    other_sampling.sampling.temperature = Some(1.0);
+    let miss = cache
+        .lookup(&cache_key("key", &other_sampling))
+        .await
+        .expect("lookup");
+    assert!(
+        miss.is_none(),
+        "the same text at a different temperature must not be served a 0.0-temperature answer"
+    );
+    assert_eq!(cache.hits(), 1, "only the identical-shape request counted");
+}
+
+#[tokio::test]
+async fn identical_text_with_different_tools_does_not_share_an_entry() {
+    let cache = SemanticCache::new(
+        config(0.6, Duration::from_secs(600), 16),
+        Box::new(NgramEmbedder::new()),
+    );
+    let prompt = "What files are in this directory?";
+    let mut with_tools = core_request(prompt);
+    with_tools.tools = vec![CoreTool {
+        name: "list_files".to_owned(),
+        description: None,
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    cache
+        .store(&cache_key("key", &with_tools), &cached_entry())
+        .await;
+
+    let mut again_with_tools = core_request(prompt);
+    again_with_tools.tools = with_tools.tools.clone();
+    let hit = cache
+        .lookup(&cache_key("key", &again_with_tools))
+        .await
+        .expect("lookup");
+    assert!(hit.is_some(), "the identical tool-bearing shape hits");
+    assert_eq!(cache.hits(), 1);
+
+    let bare = core_request(prompt);
+    let miss = cache
+        .lookup(&cache_key("key", &bare))
+        .await
+        .expect("lookup");
+    assert!(
+        miss.is_none(),
+        "a tool-less request must not be served the tool call the cached answer may contain"
+    );
+    assert_eq!(cache.hits(), 1, "only the identical-shape request counted");
+}
+
+#[tokio::test]
+async fn a_request_with_an_image_is_never_cached_or_served() {
+    let cache = SemanticCache::new(
+        config(0.6, Duration::from_secs(600), 16),
+        Box::new(NgramEmbedder::new()),
+    );
+    let text = "Describe this image.";
+    let mut with_image = core_request(text);
+    with_image.messages[0].content.push(CoreContent::Image {
+        source: serde_json::json!({"type": "base64", "data": "aGVsbG8="}),
+    });
+    cache
+        .store(&cache_key("key", &with_image), &cached_entry())
+        .await;
+
+    let same_image = with_image.clone();
+    let miss = cache
+        .lookup(&cache_key("key", &same_image))
+        .await
+        .expect("lookup");
+    assert!(
+        miss.is_none(),
+        "an image request is never cached, so it can never be served"
+    );
+    assert_eq!(cache.hits(), 0);
+
+    let text_only = core_request(text);
+    let miss = cache
+        .lookup(&cache_key("key", &text_only))
+        .await
+        .expect("lookup");
+    assert!(
+        miss.is_none(),
+        "a text-only request with the same words is a miss too: nothing was stored"
+    );
+    assert_eq!(cache.hits(), 0, "an image-bearing request stored nothing");
+}
+
+#[tokio::test]
+async fn a_streaming_lookup_and_store_do_nothing() {
+    let cache = SemanticCache::new(
+        config(0.6, Duration::from_secs(600), 16),
+        Box::new(NgramEmbedder::new()),
+    );
+    let request = core_request("a prompt that streamed");
+    let streaming_key = CacheKey {
+        streaming: true,
+        ..cache_key("key", &request)
+    };
+    cache.store(&streaming_key, &cached_entry()).await;
+    let miss = cache
+        .lookup(&cache_key("key", &request))
+        .await
+        .expect("lookup");
+    assert!(miss.is_none(), "a streaming store left nothing to serve");
+
+    cache
+        .store(&cache_key("key", &request), &cached_entry())
+        .await;
+    let streaming_miss = cache.lookup(&streaming_key).await.expect("lookup");
+    assert!(
+        streaming_miss.is_none(),
+        "a streaming lookup is never served"
+    );
 }
 
 #[tokio::test]

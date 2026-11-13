@@ -88,14 +88,16 @@ unless real use says otherwise.
   the engine refuses the same-format passthrough shortcut, so the
   redacted core, not the raw client bytes, reaches the upstream.
 - `llm-proxy-semantic-cache` (step 5, conflict 7) implements the
-  engine's `Cache` trait: caller-scoped buckets, prompts embedded
-  through an `Embedder` trait (default: the offline deterministic
-  trigram embedder), threshold-gated cosine matching, TTL and per-caller
-  bounds, complete non-streaming responses only. The engine's `CacheKey`
-  now carries the normalized request so the cache embeds the prompt
-  instead of the body hash. Wired from `[server.semantic_cache]` behind
-  the `semantic-cache` feature, off by default; the data-class policy
-  page covers what it stores.
+  engine's `Cache` trait: caller-scoped buckets keyed additionally on
+  the request shape (route kind, tools, tool choice, sampling, provider
+  hints, message roles), prompts embedded through an `Embedder` trait
+  (default: the offline deterministic trigram embedder), threshold-gated
+  cosine matching, TTL and per-caller bounds, complete non-streaming
+  responses only; requests with non-text content are never cached or
+  served. The engine's `CacheKey` now carries the normalized request so
+  the cache embeds the prompt instead of the body hash. Wired from
+  `[server.semantic_cache]` behind the `semantic-cache` feature, off by
+  default; the data-class policy page covers what it stores.
 - `llm-proxy-mcp` (step 6, conflict 17): MCP clients reach configured
   upstream MCP servers through the proxy on its own listener with its
   own token list and a per-token session table aged out by TTL. Every

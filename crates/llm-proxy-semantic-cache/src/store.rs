@@ -18,12 +18,25 @@ pub(crate) struct Entry {
     pub(crate) stored_at: OffsetDateTime,
 }
 
-/// Bucket key: caller, provider, model — the caller scopes everything.
-type BucketKey = (String, String, String);
+/// Bucket key: caller, provider, model and request shape — the caller
+/// scopes everything, and only requests of the same shape share a bucket.
+type BucketKeyBuf = (String, String, String, String);
+
+/// The borrowed form of a [`BucketKeyBuf`].
+type BucketKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+fn owned(bucket: BucketKey<'_>) -> BucketKeyBuf {
+    (
+        bucket.0.to_owned(),
+        bucket.1.to_owned(),
+        bucket.2.to_owned(),
+        bucket.3.to_owned(),
+    )
+}
 
 #[derive(Default)]
 pub(crate) struct Store {
-    buckets: HashMap<BucketKey, Vec<Entry>>,
+    buckets: HashMap<BucketKeyBuf, Vec<Entry>>,
 }
 
 impl Store {
@@ -38,15 +51,11 @@ impl Store {
     /// The closest entry at or above `threshold`, if any.
     pub(crate) fn nearest(
         &self,
-        caller: &str,
-        provider: &str,
-        model: &str,
+        bucket: BucketKey<'_>,
         query: &[f32],
         threshold: f32,
     ) -> Option<&Entry> {
-        let entries =
-            self.buckets
-                .get(&(caller.to_owned(), provider.to_owned(), model.to_owned()))?;
+        let entries = self.buckets.get(&owned(bucket))?;
         entries
             .iter()
             .map(|entry| (cosine_similarity(query, &entry.embedding), entry))
@@ -58,21 +67,12 @@ impl Store {
     }
 
     /// Inserts an entry, bounding the caller's total across all of its
-    /// `(provider, model)` buckets to `max_entries` by evicting the
+    /// `(provider, model, shape)` buckets to `max_entries` by evicting the
     /// caller's oldest entries wherever they sit.
-    pub(crate) fn insert(
-        &mut self,
-        caller: &str,
-        provider: &str,
-        model: &str,
-        entry: Entry,
-        max_entries: usize,
-    ) {
+    pub(crate) fn insert(&mut self, bucket: BucketKey<'_>, entry: Entry, max_entries: usize) {
+        let (caller, ..) = bucket;
         let cap = max_entries.max(1);
-        self.buckets
-            .entry((caller.to_owned(), provider.to_owned(), model.to_owned()))
-            .or_default()
-            .push(entry);
+        self.buckets.entry(owned(bucket)).or_default().push(entry);
         // The bound is per caller, not per bucket (docs/data-class-policy.md):
         // a caller naming many model strings must not grow the cache
         // without limit. Only this caller's buckets are counted and evicted.
@@ -80,7 +80,7 @@ impl Store {
             let Some(oldest) = self
                 .buckets
                 .iter_mut()
-                .filter(|((bucket_caller, _, _), entries)| {
+                .filter(|((bucket_caller, ..), entries)| {
                     bucket_caller == caller && !entries.is_empty()
                 })
                 // Buckets keep insertion order, so each bucket's oldest
@@ -112,7 +112,7 @@ impl Store {
     fn caller_len(&self, caller: &str) -> usize {
         self.buckets
             .iter()
-            .filter(|((bucket_caller, _, _), _)| bucket_caller == caller)
+            .filter(|((bucket_caller, ..), _)| bucket_caller == caller)
             .map(|(_, entries)| entries.len())
             .sum()
     }

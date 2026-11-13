@@ -82,8 +82,13 @@ feature off, nothing it would store exists anywhere.
 
 - **Stores:** per caller, the embedding of each cached prompt and the
   complete non-streaming response it produced, bucketed by caller,
-  provider and model. Streaming responses are never stored (a streaming
-  lookup misses).
+  provider, model and request shape. The bucket key additionally carries
+  the request's tool definitions, tool choice, sampling parameters,
+  provider hints, route kind and message roles, so only requests of the
+  same shape share a stored response. Requests containing any non-text
+  content (images, documents, audio, tool use or results) are never
+  cached and never served. Streaming responses are never stored (a
+  streaming lookup misses).
 - **Where:** in process memory. Nothing is written to disk; a restart
   empties it.
 - **Retention:** `ttl` (default 10m) from storage; at most `max_entries`
