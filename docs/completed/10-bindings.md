@@ -61,7 +61,7 @@ the engine and add no logic of their own, so they start once its API has stopped
   stream that has run to its end leaves the completed settlement in place.
   Two wheels are
   built here: `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl`
-  (installed into a fresh venv whose `pip install` runs no Rust; 20 pytest
+  (installed into a fresh venv whose `pip install` runs no Rust; 22 pytest
   tests pass against the installed wheel) and
   `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation),
   which is run-verified with the embeddable Windows CPython 3.13.5 under
@@ -86,7 +86,7 @@ the engine and add no logic of their own, so they start once its API has stopped
   `ProxyError`s and an async-iterable `Stream` whose `cancel()` settles as
   `ClientCancelled`, whose iterator `return()` cancels on a `for await`
   early exit (`break` or a throw in the loop body) and which defines
-  `Symbol.asyncDispose` for `await using` on runtimes that have it. 20
+  `Symbol.asyncDispose` for `await using` on runtimes that have it. 22
   `node --test` tests pass; `npm install` of the
   packed tarball (`npm pack` → `freeoxide-llm-proxy-0.1.0.tgz`) loads the
   prebuilt `llm-proxy.linux-x64-gnu.node` with no Rust toolchain. A
@@ -119,8 +119,9 @@ the engine and add no logic of their own, so they start once its API has stopped
   cases: the plan-02 contract fixtures (Claude Code, the Anthropic SDK, the
   OpenAI SDK, Codex — captured and synthesized; provenance in the fixture
   README), the canned upstream responses extracted from the plan-02 contract
-  replay harness, the provider templates, the translation cases and the
-  cancellation scenario. The Rust bridge test
+  replay harness (optional canned `status`/`headers`/`stall_ms`), the
+  provider templates, the translation cases, the upstream error cases
+  (429 with `Retry-After`, 502) and the cancellation scenario. The Rust bridge test
   (`crates/llm-proxy-bridge/tests/contract.rs`) replays every case and pins
   upstream request, upstream headers, client response, stream events and
   errors to snapshots under `bindings/shared/snapshots/` (regenerate with
@@ -128,8 +129,8 @@ the engine and add no logic of their own, so they start once its API has stopped
   stamps with a marker). The Python and Node suites replay the same cases
   against their own fake upstreams and compare to the same snapshots: the
   same fixtures give the same results through Rust, Python and Node
-  (14 tests through Python and Node; the Rust bridge drives the same cases
-  inside 3 aggregate tests). Streaming and cancellation are
+  (16 tests through Python and Node; the Rust bridge drives the same cases
+  inside 4 aggregate tests). Streaming and cancellation are
   exercised in all three: events flow incrementally, `cancel()` stops
   delivery, the `ClientCancelled` usage row lands, and the proxy stays
   usable.

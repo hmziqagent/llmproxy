@@ -254,6 +254,115 @@ async fn forwarded_headers_reach_the_upstream_and_credentials_do_not() {
     assert!(headers.get("origin").is_none());
 }
 
+/// Serves one fixed JSON error status on both chat families, with the given
+/// `retry-after` header, so a bare single-attempt route surfaces the raw
+/// upstream failure with its policy fields.
+async fn spawn_status_upstream(status: u16, retry_after: Option<&str>) -> String {
+    let body = r#"{"error":{"message":"upstream refused the request","type":"api_error"}}"#;
+    let retry_after = retry_after.map(str::to_owned);
+    let app = Router::new().route(
+        "/{*path}",
+        post(move || async move {
+            let code = StatusCode::from_u16(status).expect("a valid status for the fake");
+            let mut response = (
+                code,
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_owned(),
+            )
+                .into_response();
+            if let Some(advised) = retry_after
+                && let Ok(value) = axum::http::HeaderValue::from_str(&advised)
+            {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            response
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "status upstream stopped");
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The retry-policy fields must survive the bridge boundary on the errors
+/// the engine maps from upstream statuses (fix brief 10-8): a 429 keeps its
+/// `Retry-After` as `retry_after` and its policy row's `should_retry: true`,
+/// and a bare 502 keeps its row's `true` with no advised wait. Both
+/// providers here are single-attempt routes, so no ladder wraps the error
+/// into `RetryExhausted` (`false`), which is what a dropped or mis-copied
+/// field would degrade to.
+#[tokio::test]
+async fn retryable_upstream_failures_carry_should_retry_and_retry_after() {
+    let rate_limited = spawn_status_upstream(429, Some("7")).await;
+    let gateway_fault = spawn_status_upstream(502, None).await;
+    let config = json!({
+        "providers": [
+            {
+                "name": "acme",
+                "api_key": "operator-key",
+                "auth_style": "bearer",
+                "adapters": {
+                    "messages": {
+                        "protocol": "anthropic_messages",
+                        "endpoint": format!("{rate_limited}/v1/messages")
+                    }
+                },
+                "routes": { "messages": "messages" }
+            },
+            {
+                "name": "openai-co",
+                "api_key": "operator-key",
+                "auth_style": "bearer",
+                "adapters": {
+                    "chat": {
+                        "protocol": "openai_chat_completions",
+                        "endpoint": format!("{gateway_fault}/v1/chat/completions")
+                    }
+                },
+                "routes": { "chat_completions": "chat" }
+            }
+        ]
+    });
+    let bridge = Bridge::from_json(&config).expect("bridge builds");
+
+    let limited = bridge
+        .execute(
+            "acme",
+            "anthropic_messages",
+            &anthropic_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect_err("a 429 upstream fails the request");
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.kind, "Upstream");
+    assert!(limited.should_retry, "the 429 policy row says retry");
+    assert_eq!(
+        limited.retry_after,
+        Some(Duration::from_secs(7)),
+        "the upstream Retry-After crosses the bridge"
+    );
+
+    let gateway = bridge
+        .execute(
+            "openai-co",
+            "openai_chat_completions",
+            &openai_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect_err("a 502 upstream fails the request");
+    assert_eq!(gateway.status, 502);
+    assert!(gateway.should_retry, "the 502 policy row says retry");
+    assert_eq!(gateway.retry_after, None, "no header, no advised wait");
+}
+
 #[tokio::test]
 async fn failures_carry_kind_status_and_retry_policy() {
     let upstream = spawn_fake_upstream().await;

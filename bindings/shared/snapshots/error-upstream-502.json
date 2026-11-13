@@ -1,0 +1,7 @@
+{
+  "kind": "Upstream",
+  "message": "{\"error\":{\"message\":\"bad gateway from the fake upstream\",\"type\":\"api_error\"}}",
+  "retry_after_secs": null,
+  "should_retry": true,
+  "status": 502
+}

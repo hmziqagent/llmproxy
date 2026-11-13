@@ -1,0 +1,7 @@
+{
+  "kind": "Upstream",
+  "message": "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"rate limit exceeded\",\"param\":null,\"type\":\"requests\"}}",
+  "retry_after_secs": 7.0,
+  "should_retry": true,
+  "status": 429
+}

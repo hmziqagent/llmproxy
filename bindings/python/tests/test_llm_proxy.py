@@ -61,9 +61,17 @@ class CannedUpstream:
                     stall = upstream.canned.get("stall_ms") or 0
                     if stall:
                         time.sleep(stall / 1000.0)
-                    payload = json.dumps(upstream.canned["body"]).encode()
-                    self.send_response(200)
+                    # Canonical form (compact, sorted keys), the same bytes the
+                    # Rust harness's serde_json produces: an error message can
+                    # embed the raw body text, so every language must serve
+                    # byte-identical canned bodies for the snapshots to hold.
+                    payload = json.dumps(
+                        upstream.canned["body"], separators=(",", ":"), sort_keys=True
+                    ).encode()
+                    self.send_response(upstream.canned.get("status") or 200)
                     self.send_header("content-type", "application/json")
+                    for name, value in (upstream.canned.get("headers") or {}).items():
+                        self.send_header(name, value)
                     self.send_header("content-length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
@@ -174,6 +182,28 @@ def test_case_matches_the_shared_snapshot(case, shared=load_shared()):
     }
     expected = json.loads((SHARED / "snapshots" / ("%s.json" % case["name"])).read_text())
     assert normalize(snapshot) == expected
+
+
+@pytest.mark.parametrize("case", load_shared()["errors"], ids=lambda c: c["name"])
+def test_error_case_matches_the_shared_snapshot(case, shared=load_shared()):
+    """Upstream error responses replay with the same retry-policy fields in
+    every language: the normalized ProxyError equals the shared `error-*.json`
+    snapshot the Rust harness wrote (fix brief 10-8)."""
+    canned = shared["upstream_responses"][case["upstream_response"]]
+    upstream = CannedUpstream(canned)
+    provider = provider_for(shared, case["provider"], upstream.base_url)
+    proxy = make_proxy(shared, [provider])
+
+    fixture = (REPO_ROOT / shared["fixture_root"] / case["fixture"]).read_text()
+    body = json.loads(fixture)
+
+    with pytest.raises(ProxyError) as failure:
+        proxy.execute(case["provider"], case["dialect"], body)
+    error = error_info(failure.value)
+    assert failure.value.should_retry is True, "retryable upstream faults stay retryable"
+
+    expected = json.loads((SHARED / "snapshots" / ("%s.json" % case["snapshot"])).read_text())
+    assert normalize(error) == expected
 
 
 @pytest.mark.parametrize("case", load_shared()["translates"], ids=lambda c: c["name"])

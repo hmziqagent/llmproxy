@@ -76,6 +76,31 @@
         "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_0\",\"output_index\":0,\"content_index\":0,\"delta\":\"fixed\"}\n\n",
         "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture_codex\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":120,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":48},\"total_tokens\":129}}}\n\n"
       ]
+    },
+    "rate_limited": {
+      "kind": "json",
+      "status": 429,
+      "headers": {
+        "retry-after": "7"
+      },
+      "body": {
+        "error": {
+          "message": "rate limit exceeded",
+          "type": "requests",
+          "param": null,
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "bad_gateway": {
+      "kind": "json",
+      "status": 502,
+      "body": {
+        "error": {
+          "message": "bad gateway from the fake upstream",
+          "type": "api_error"
+        }
+      }
     }
   },
   "providers": {
@@ -311,6 +336,24 @@
       "from": "anthropic_messages",
       "to": "openai_chat_completions",
       "mode": "response"
+    }
+  ],
+  "errors": [
+    {
+      "name": "upstream-429-retry-after",
+      "provider": "anthropic-upstream",
+      "dialect": "anthropic_messages",
+      "fixture": "claude-code/session-request.json",
+      "upstream_response": "rate_limited",
+      "snapshot": "error-upstream-429"
+    },
+    {
+      "name": "upstream-502",
+      "provider": "openai-upstream",
+      "dialect": "openai_chat_completions",
+      "fixture": "captured/openai-sdk/chat-request.json",
+      "upstream_response": "bad_gateway",
+      "snapshot": "error-upstream-502"
     }
   ],
   "cancellation": {

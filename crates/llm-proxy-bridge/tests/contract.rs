@@ -17,7 +17,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures::StreamExt;
 use llm_proxy_bridge::{Bridge, BridgeError, EventStream, ExecuteOptions};
@@ -48,6 +48,34 @@ fn sse_body(events: Vec<String>, gap: Option<Duration>) -> Body {
     Body::from_stream(stream)
 }
 
+/// The canned JSON response: optional canned `status` (default 200) and
+/// `headers`, with the body serialized canonically (compact, sorted keys —
+/// the same bytes `serde_json` produces, which the Python and Node harnesses
+/// must match because an error message can embed the raw body text).
+fn canned_json_response(response: &Value) -> Response {
+    let status = response
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::OK);
+    let payload =
+        serde_json::to_vec(response.get("body").unwrap_or(&Value::Null)).unwrap_or_default();
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(extra) = response.get("headers").and_then(Value::as_object) {
+        for (name, value) in extra {
+            if let Some(value) = value.as_str() {
+                builder = builder.header(name.as_str(), value);
+            }
+        }
+    }
+    builder
+        .body(Body::from(payload))
+        .unwrap_or_else(|error| panic!("canned json response builds: {error}"))
+}
+
 async fn spawn_canned(response: &Value, gap: Option<Duration>) -> CannedUpstream {
     let capture: Capture = Arc::new(AsyncMutex::new(None));
     let capture_for_handler = Arc::clone(&capture);
@@ -60,13 +88,16 @@ async fn spawn_canned(response: &Value, gap: Option<Duration>) -> CannedUpstream
                 serde_json::from_slice(&body).unwrap_or_else(|_| Value::Object(Default::default()));
             *capture.lock().await = Some((headers, json));
             match response.get("kind").and_then(Value::as_str) {
-                Some("json") => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    serde_json::to_vec(response.get("body").unwrap_or(&Value::Null))
-                        .unwrap_or_default(),
-                )
-                    .into_response(),
+                Some("json") => {
+                    let stall = response
+                        .get("stall_ms")
+                        .and_then(Value::as_u64)
+                        .map(Duration::from_millis);
+                    if let Some(stall) = stall {
+                        tokio::time::sleep(stall).await;
+                    }
+                    canned_json_response(&response)
+                }
                 Some("sse") => {
                     let events: Vec<String> = response
                         .get("events")
@@ -345,6 +376,35 @@ async fn plan02_contract_fixtures_match_the_snapshots_through_the_bridge() {
         let name = case.get("name").and_then(Value::as_str).expect("case name");
         let snapshot = run_case(&shared, case).await;
         compare_or_write_snapshot(name, &snapshot);
+    }
+}
+
+/// Upstream error responses replay through every language binding with the
+/// same retry-policy fields (`kind`, `status`, `message`, `retry_after_secs`,
+/// `should_retry`), pinned to the shared `error-*.json` snapshots (fix brief
+/// 10-8). Both canned providers are bare single-attempt routes, so the raw
+/// upstream error surfaces: the 429 keeps its `Retry-After` as
+/// `retry_after_secs` and its policy row says retry, and the 502 says retry
+/// with no advised wait.
+#[tokio::test]
+async fn error_cases_match_the_shared_snapshots() {
+    let shared = load_shared();
+    for case in shared
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let snapshot_name = case
+            .get("snapshot")
+            .and_then(Value::as_str)
+            .expect("error case names its snapshot");
+        let outcome = run_case(&shared, case).await;
+        let error = outcome
+            .get("error")
+            .filter(|error| !error.is_null())
+            .expect("an upstream error case must fail with a bridge error");
+        compare_or_write_snapshot(snapshot_name, error);
     }
 }
 

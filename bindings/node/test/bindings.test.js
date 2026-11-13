@@ -23,6 +23,21 @@ function fixtureBody(relative) {
   return JSON.parse(fs.readFileSync(path.join(REPO_ROOT, shared.fixture_root, relative), 'utf8'));
 }
 
+// Canonical JSON (compact, sorted keys), the same bytes the Rust harness's
+// serde_json produces: an error message can embed the raw body text, so
+// every language must serve byte-identical canned bodies for the snapshots
+// to hold.
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
 // Serves one canned response (JSON or SSE, with gaps) and captures the last
 // request, like the Rust harness's axum fake upstream.
 class CannedUpstream {
@@ -50,7 +65,7 @@ class CannedUpstream {
       this.capture = { headers, body };
       if (this.canned.kind === 'json') {
         const respond = () => {
-          const payload = JSON.stringify(this.canned.body);
+          const payload = stableStringify(this.canned.body);
           res.writeHead(this.canned.status || 200, {
             'content-type': 'application/json',
             ...this.canned.headers,
@@ -205,6 +220,37 @@ for (const testCase of shared.cases) {
         error,
       };
       assert.deepStrictEqual(normalize(snapshot), snapshotFor(testCase.name));
+    } finally {
+      upstream.stop();
+    }
+  });
+}
+
+// Upstream error responses replay with the same retry-policy fields in every
+// language: the normalized ProxyError equals the shared error-*.json snapshot
+// the Rust harness wrote (fix brief 10-8).
+for (const errorCase of shared.errors) {
+  test(`error case ${errorCase.name} matches the shared snapshot`, async () => {
+    const upstream = await startUpstream(shared.upstream_responses[errorCase.upstream_response]);
+    try {
+      const provider = providerFor(errorCase.provider, upstream.baseUrl);
+      const proxy = new Proxy({ providers: [provider], record_usage: false });
+      const body = fixtureBody(errorCase.fixture);
+
+      let failure = null;
+      try {
+        await proxy.execute(errorCase.provider, errorCase.dialect, body);
+      } catch (error) {
+        if (!(error instanceof ProxyError)) {
+          throw error;
+        }
+        failure = error;
+      }
+      assert.ok(failure, 'an upstream error case must fail with a ProxyError');
+
+      const expected = snapshotFor(errorCase.snapshot);
+      assert.deepStrictEqual(normalize(errorInfo(failure)), expected);
+      assert.equal(failure.shouldRetry, true, `${errorCase.name} is retryable`);
     } finally {
       upstream.stop();
     }
