@@ -256,10 +256,14 @@ path = "{}"
             {
                 return false;
             }
-            if stream
-                .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-                .is_err()
-            {
+            // The host guard under anonymous auth refuses a Host that does
+            // not name this listener, so the readiness probe spells the
+            // bound address (same rule as `post_json` and `cli_serve.rs`).
+            let request = format!(
+                "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n",
+                addr = self.addr
+            );
+            if stream.write_all(request.as_bytes()).is_err() {
                 return false;
             }
             let mut reply = String::new();

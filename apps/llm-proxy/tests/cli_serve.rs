@@ -142,10 +142,14 @@ path = "{storage}"
             {
                 return false;
             }
-            if stream
-                .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-                .is_err()
-            {
+            // The host guard under anonymous auth refuses a Host that does
+            // not name this listener, so the readiness probe spells the
+            // bound address (see the drain test below).
+            let request = format!(
+                "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n",
+                addr = self.addr
+            );
+            if stream.write_all(request.as_bytes()).is_err() {
                 return false;
             }
             let mut reply = String::new();
@@ -212,9 +216,14 @@ path = "{storage}"
         let exited = server.child.try_wait().unwrap();
         assert!(exited.is_none(), "server exited on its own: {exited:?}");
         let mut health = TcpStream::connect(server.addr).unwrap();
-        health
-            .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
-            .unwrap();
+        // The host guard refuses a foreign Host under anonymous auth; spell
+        // the bound address (see `serves_health`).
+        write!(
+            health,
+            "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n",
+            addr = server.addr
+        )
+        .unwrap();
         let mut reply = String::new();
         health.read_to_string(&mut reply).unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "health reply: {reply}");
