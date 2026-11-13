@@ -52,13 +52,16 @@ pub enum GuardMode {
 }
 
 /// What a guard does when its own machinery fails (a broken pattern, an
-/// unreachable checker): serve the request anyway, or refuse it.
+/// unreachable checker) on either pass it runs — inspection and, for
+/// masking guards, the masking rewrite: serve the request anyway, or
+/// refuse it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailPolicy {
     /// Serve the request and log the guard failure: availability over
-    /// safety.
+    /// safety. On a masking pass the affected text passes unmasked.
     Open,
-    /// Refuse the request: safety over availability.
+    /// Refuse the request: safety over availability, on inspection and
+    /// masking alike.
     #[default]
     Closed,
 }
@@ -146,16 +149,43 @@ impl Guardrail {
         self.fail_policy
     }
 
-    /// Applies the fail policy to a rule failure.
-    fn rule_failure(&self, error: &RuleError) -> Result<GuardDecision, EngineError> {
+    /// The fail policy's ruling on one rule failure, shared by the
+    /// inspection and masking passes so the two cannot drift: `Open`
+    /// logs and lets the caller continue; `Closed` produces the
+    /// guard-failed error.
+    fn apply_fail_policy(&self, error: &RuleError) -> Result<(), EngineError> {
         match self.fail_policy {
             FailPolicy::Open => {
                 tracing::warn!(%error, "guard rule failed; failing open");
-                Ok(GuardDecision::Allow)
+                Ok(())
             }
             FailPolicy::Closed => Err(EngineError::Internal(format!(
                 "guard failed closed: {error}"
             ))),
+        }
+    }
+
+    /// Applies the fail policy to a rule failure during inspection.
+    fn rule_failure(&self, error: &RuleError) -> Result<GuardDecision, EngineError> {
+        self.apply_fail_policy(error).map(|()| GuardDecision::Allow)
+    }
+
+    /// A `Reject` verdict that surfaced only on the masking pass — the
+    /// rule flipped since inspection. `Open` keeps the text unchanged
+    /// with a warning; `Closed` refuses rather than pass text a rule
+    /// would have rejected.
+    fn flipped_verdict(&self, message: &str) -> Result<(), EngineError> {
+        match self.fail_policy {
+            FailPolicy::Open => {
+                tracing::warn!(
+                    reason = %message,
+                    "guard verdict changed between inspection and masking; failing open"
+                );
+                Ok(())
+            }
+            FailPolicy::Closed => Err(EngineError::Internal(
+                "guard verdict changed between inspection and masking".to_owned(),
+            )),
         }
     }
 }
@@ -199,19 +229,17 @@ impl Guard for Guardrail {
         mask_request_texts(request, |text| async {
             let text_owned = text;
             match self.rule.check_request_text(&text_owned).await {
-                Ok(GuardVerdict::Mask(redacted)) => Some(redacted),
+                Ok(GuardVerdict::Mask(redacted)) => Ok(Some(redacted)),
+                Ok(GuardVerdict::Allow) => Ok(None),
                 // inspect_request already vetted the request; a rule that
-                // flips between the two passes leaves the text alone (the
-                // inspect pass fails closed on rejections).
-                Ok(_) => None,
-                Err(error) => {
-                    tracing::warn!(%error, "guard mask pass failed; failing open on text");
-                    None
-                }
+                // flips between the two passes is still decided by the
+                // fail policy — never a quiet pass-through of unredacted
+                // text.
+                Ok(GuardVerdict::Reject(message)) => self.flipped_verdict(&message).map(|()| None),
+                Err(error) => self.apply_fail_policy(&error).map(|()| None),
             }
         })
-        .await;
-        Ok(())
+        .await
     }
 
     async fn inspect_response(
@@ -242,15 +270,12 @@ impl Guard for Guardrail {
         mask_response_texts(response, |text| async {
             let text_owned = text;
             match self.rule.check_response_text(&text_owned).await {
-                Ok(GuardVerdict::Mask(redacted)) => Some(redacted),
-                Ok(_) => None,
-                Err(error) => {
-                    tracing::warn!(%error, "guard mask pass failed; failing open on text");
-                    None
-                }
+                Ok(GuardVerdict::Mask(redacted)) => Ok(Some(redacted)),
+                Ok(GuardVerdict::Allow) => Ok(None),
+                Ok(GuardVerdict::Reject(message)) => self.flipped_verdict(&message).map(|()| None),
+                Err(error) => self.apply_fail_policy(&error).map(|()| None),
             }
         })
-        .await;
-        Ok(())
+        .await
     }
 }

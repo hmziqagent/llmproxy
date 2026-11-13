@@ -8,6 +8,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ use llm_proxy_engine::{
 };
 use llm_proxy_guardrails::{
     FailPolicy, GuardMode, GuardRule, GuardVerdict, Guardrail, PatternRule, RuleError,
-    request_texts,
+    request_texts, response_texts,
 };
 use llm_proxy_protocol::core::{CoreContent, CoreRequest, CoreResponse};
 use llm_proxy_storage::{EventBus, NoopBus};
@@ -149,6 +150,60 @@ impl GuardRule for FailingRule {
     }
 }
 
+/// A rule whose checker breaks on its very first call and masks
+/// everything afterwards: the flaky remote checker the fail policy
+/// exists for. The call counter is shared by both directions.
+#[derive(Debug)]
+struct FlakyRule {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl GuardRule for FlakyRule {
+    async fn check_request_text(&self, _text: &str) -> Result<GuardVerdict, RuleError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(RuleError("checker unreachable".to_owned()))
+        } else {
+            Ok(GuardVerdict::Mask("[X]".to_owned()))
+        }
+    }
+
+    async fn check_response_text(&self, _text: &str) -> Result<GuardVerdict, RuleError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(RuleError("checker unreachable".to_owned()))
+        } else {
+            Ok(GuardVerdict::Mask("[X]".to_owned()))
+        }
+    }
+}
+
+/// A rule that masks its first two calls — inspection sees the request's
+/// two text blocks — and rejects everything afterwards: the rule flipped
+/// between inspection and masking.
+#[derive(Debug)]
+struct FlipToRejectRule {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl GuardRule for FlipToRejectRule {
+    async fn check_request_text(&self, _text: &str) -> Result<GuardVerdict, RuleError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+            Ok(GuardVerdict::Mask("[X]".to_owned()))
+        } else {
+            Ok(GuardVerdict::Reject("the rule changed its mind".to_owned()))
+        }
+    }
+
+    async fn check_response_text(&self, _text: &str) -> Result<GuardVerdict, RuleError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+            Ok(GuardVerdict::Mask("[X]".to_owned()))
+        } else {
+            Ok(GuardVerdict::Reject("the rule changed its mind".to_owned()))
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_deny_guard_rejects_matching_requests_and_lets_streams_pass() {
     let rule = PatternRule::deny(r"(?i)\bmalware\b", "this request names forbidden content")
@@ -246,6 +301,164 @@ async fn fail_open_serves_and_fail_closed_refuses_when_the_rule_breaks() {
             .await,
         Err(EngineError::Internal(_))
     ));
+}
+
+/// The fail policy must govern the masking pass too, not just
+/// inspection: a broken rule under `Closed` refuses the transform and
+/// leaves the text exactly as it arrived, never half-redacted.
+#[tokio::test]
+async fn fail_closed_refuses_when_the_rule_breaks_during_masking() {
+    let guard = Guardrail::masking(Arc::new(FailingRule), FailPolicy::Closed);
+
+    let mut request = core_request(false, "the key is sk-abcdefgh1234 ok");
+    let request_before = request_texts(&request).collect::<Vec<_>>();
+    let error = guard
+        .transform_request(&mut request)
+        .await
+        .expect_err("closed masking must refuse when the rule breaks");
+    assert!(
+        matches!(&error, EngineError::Internal(message) if message.contains("failed closed")),
+        "got {error:?}"
+    );
+    assert_eq!(
+        request_texts(&request).collect::<Vec<_>>(),
+        request_before,
+        "the refused transform must leave the request text untouched"
+    );
+
+    let mut response = core_response("echoing sk-abcdefgh1234 back");
+    let response_before = response_texts(&response).collect::<Vec<_>>();
+    guard
+        .transform_response(&mut response)
+        .await
+        .expect_err("closed masking must refuse when the rule breaks");
+    assert_eq!(
+        response_texts(&response).collect::<Vec<_>>(),
+        response_before,
+        "the refused transform must leave the response text untouched"
+    );
+}
+
+/// Under `Open` a masking-pass failure keeps serving: the texts pass
+/// unchanged (the rule answered nothing usable) and the transform still
+/// reports success.
+#[tokio::test]
+async fn fail_open_leaves_the_text_when_masking_breaks() {
+    let guard = Guardrail::masking(Arc::new(FailingRule), FailPolicy::Open);
+
+    let mut request = core_request(false, "the key is sk-abcdefgh1234 ok");
+    let request_before = request_texts(&request).collect::<Vec<_>>();
+    guard
+        .transform_request(&mut request)
+        .await
+        .expect("open masking serves");
+    assert_eq!(
+        request_texts(&request).collect::<Vec<_>>(),
+        request_before,
+        "open masking must not invent a redaction it cannot compute"
+    );
+
+    let mut response = core_response("echoing sk-abcdefgh1234 back");
+    let response_before = response_texts(&response).collect::<Vec<_>>();
+    guard
+        .transform_response(&mut response)
+        .await
+        .expect("open masking serves");
+    assert_eq!(
+        response_texts(&response).collect::<Vec<_>>(),
+        response_before
+    );
+}
+
+/// A rule that fails once under `Closed` must never send unredacted text
+/// anywhere: inspection spends the failure and refuses, and the same
+/// flow through the engine ends with the guard error and zero upstream
+/// requests.
+#[tokio::test]
+async fn a_rule_that_fails_once_under_fail_closed_never_leaks_unmasked_text() {
+    let guard = Guardrail::masking(
+        Arc::new(FlakyRule {
+            calls: AtomicUsize::new(0),
+        }),
+        FailPolicy::Closed,
+    );
+    assert!(
+        matches!(
+            guard
+                .inspect_request(&core_request(false, "rotate sk-clientsecret77 now"))
+                .await,
+            Err(EngineError::Internal(_))
+        ),
+        "the flaky rule's single failure must refuse the request under fail closed"
+    );
+
+    let guard = Arc::new(Guardrail::masking(
+        Arc::new(FlakyRule {
+            calls: AtomicUsize::new(0),
+        }),
+        FailPolicy::Closed,
+    ));
+    let (engine, _endpoint, captured) = engine_with(guard).await;
+    let error = engine
+        .execute(engine_request(core_request(
+            false,
+            "rotate sk-clientsecret77 now",
+        )))
+        .await
+        .expect_err("fail closed must refuse the whole flow");
+    assert!(
+        matches!(&error, EngineError::Internal(message) if message.contains("failed closed")),
+        "got {error:?}"
+    );
+    assert!(
+        captured.lock().await.is_empty(),
+        "the refused request never reached the upstream"
+    );
+}
+
+/// A `Reject` verdict that surfaces only on the masking pass — the rule
+/// flipped since inspection — must not quietly pass the text: `Closed`
+/// refuses, `Open` keeps serving with the text unchanged.
+#[tokio::test]
+async fn a_verdict_flip_to_reject_during_masking_is_decided_by_the_fail_policy() {
+    let closed = Guardrail::masking(
+        Arc::new(FlipToRejectRule {
+            calls: AtomicUsize::new(0),
+        }),
+        FailPolicy::Closed,
+    );
+    let mut request = core_request(false, "anything");
+    closed
+        .inspect_request(&request)
+        .await
+        .expect("inspection masked the texts");
+    let error = closed
+        .transform_request(&mut request)
+        .await
+        .expect_err("a flipped rejection must refuse under fail closed");
+    assert!(
+        matches!(&error, EngineError::Internal(message) if message.contains("verdict changed")),
+        "got {error:?}"
+    );
+
+    let open = Guardrail::masking(
+        Arc::new(FlipToRejectRule {
+            calls: AtomicUsize::new(0),
+        }),
+        FailPolicy::Open,
+    );
+    let mut request = core_request(false, "anything");
+    open.inspect_request(&request)
+        .await
+        .expect("inspection masked the texts");
+    open.transform_request(&mut request)
+        .await
+        .expect("open keeps serving");
+    assert_eq!(
+        request_texts(&request).collect::<Vec<_>>(),
+        request_texts(&core_request(false, "anything")).collect::<Vec<_>>(),
+        "open leaves the text unchanged when the verdict flips"
+    );
 }
 
 #[tokio::test]

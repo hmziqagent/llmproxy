@@ -34,50 +34,60 @@ fn text_of(content: &CoreContent) -> Option<String> {
 
 /// Rewrites every request text in place for which `mask` returns a
 /// replacement. `mask` receives the text by value (rules may need to
-/// rebuild it) and its answer replaces the block verbatim.
-pub async fn mask_request_texts<F, Fut>(request: &mut CoreRequest, mut mask: F)
+/// rebuild it) and its answer replaces the block verbatim; a `None`
+/// answer leaves the block alone. The walk stops at the first rule
+/// failure, surfacing the error so the caller's fail policy decides what
+/// a broken rule means.
+pub async fn mask_request_texts<F, Fut, E>(request: &mut CoreRequest, mut mask: F) -> Result<(), E>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Option<String>>,
+    Fut: Future<Output = Result<Option<String>, E>>,
 {
     for content in request.system.iter_mut() {
         if let CoreContent::Text { text, .. } = content {
-            rewrite(text, &mut mask).await;
+            rewrite(text, &mut mask).await?;
         }
     }
     for message in request.messages.iter_mut() {
         for content in message.content.iter_mut() {
             if let CoreContent::Text { text, .. } = content {
-                rewrite(text, &mut mask).await;
+                rewrite(text, &mut mask).await?;
             }
         }
     }
+    Ok(())
 }
 
 /// Rewrites every response content text in place for which `mask`
-/// returns a replacement.
-pub async fn mask_response_texts<F, Fut>(response: &mut CoreResponse, mut mask: F)
+/// returns a replacement, stopping at the first rule failure (see
+/// [`mask_request_texts`]).
+pub async fn mask_response_texts<F, Fut, E>(
+    response: &mut CoreResponse,
+    mut mask: F,
+) -> Result<(), E>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Option<String>>,
+    Fut: Future<Output = Result<Option<String>, E>>,
 {
     for content in response.content.iter_mut() {
         if let CoreContent::Text { text, .. } = content {
-            rewrite(text, &mut mask).await;
+            rewrite(text, &mut mask).await?;
         }
     }
+    Ok(())
 }
 
-async fn rewrite<F, Fut>(text: &mut String, mask: &mut F)
+async fn rewrite<F, Fut, E>(text: &mut String, mask: &mut F) -> Result<(), E>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Option<String>>,
+    Fut: Future<Output = Result<Option<String>, E>>,
 {
     // The rule receives the text by value (it may rebuild it), but a `None`
     // answer means "leave this block alone" — the original must survive,
     // not be emptied by the hand-off.
     let offered = text.clone();
-    if let Some(redacted) = mask(offered).await {
+    if let Some(redacted) = mask(offered).await? {
         *text = redacted;
     }
+    Ok(())
 }
