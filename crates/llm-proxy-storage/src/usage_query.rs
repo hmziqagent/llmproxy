@@ -148,9 +148,12 @@ pub struct RequestRow {
     pub caller: Option<String>,
     /// Provider name from the URL.
     pub provider: Option<String>,
-    /// Endpoint family (`chat_completions` or `messages`).
+    /// Endpoint family (`chat_completions`, `messages`, `responses`,
+    /// `generate_content`, `embeddings`, `rerank`, `audio_transcriptions`,
+    /// `audio_speech`, `images_generations`, `files`, `batches`).
     pub route_kind: Option<String>,
-    /// Client dialect (`openai_chat` or `anthropic`).
+    /// Client dialect (`openai_chat`, `anthropic`, `openai_responses`,
+    /// `gemini`, `ollama`).
     pub client_protocol: Option<String>,
     /// Whether the request asked for a stream.
     pub streaming: Option<bool>,
