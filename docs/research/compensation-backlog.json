@@ -30,7 +30,7 @@
         "eliasbiondo/antirion"
       ],
       "priority": "high",
-      "crate": "llm-proxy-server + llm-proxy-core + llm-proxy-storage (provider crate only for error classification; audit G)",
+      "crate": "llm-proxy-server + llm-proxy-core + llm-proxy-storage (llm-proxy-adapters only for error classification; audit G)",
       "plan": "04"
     },
     {
@@ -83,7 +83,7 @@
         "router-for-me/CLIProxyAPI"
       ],
       "priority": "high",
-      "crate": "llm-proxy-protocol + llm-proxy-provider (adapters; audit G)",
+      "crate": "llm-proxy-protocol + llm-proxy-adapters (adapters; audit G)",
       "plan": "01"
     },
     {
@@ -107,7 +107,7 @@
         "yolorouter/yolorouter"
       ],
       "priority": "high",
-      "crate": "llm-proxy-server + llm-proxy-provider (context_length capture; audit G)",
+      "crate": "llm-proxy-server + llm-proxy-transport (context_length capture in discovery; audit G)",
       "plan": "05"
     },
     {
@@ -299,7 +299,7 @@
         "musistudio/claude-code-router"
       ],
       "priority": "high",
-      "crate": "llm-proxy-provider",
+      "crate": "llm-proxy-adapters",
       "dropped": "Dropped per the credentials decision in docs/goal.md (audit question Q4): subscription OAuth and client fingerprinting are not built; vendor terms bar routing consumer credentials through third-party software. See docs/README.md 'Not planned'.",
       "plan": null
     },
@@ -960,5 +960,5 @@
     }
   ],
   "corrected": "2026-11-08",
-  "corrections_note": "Corrections applied per the 2026-11-05 research audit ('Backlog review' and evidence section G): rationales restated where they were wrong, candidates #5/#8/#11/#14/#25/#27 rescoped to the real gap, #28 raised to high, #6 resolved to the one admission model built by plan 05, and crate mappings corrected. Every candidate now records 'plan': the completed plan (docs/completed/) that consumed it, or null plus a 'dropped' reason. Plan 03 restructured the workspace crates (llm-proxy-provider split into adapters + transport; llm-proxy-engine added), so 'crate' keeps the audit-corrected, pre-restructure name and 'plan' is the authoritative landing spot. The ten items the audit found missing from the backlog entirely are appended at the end."
+  "corrections_note": "Corrections applied per the 2026-11-05 research audit ('Backlog review' and evidence section G): rationales restated where they were wrong, candidates #5/#8/#11/#14/#25/#27 rescoped to the real gap, #28 raised to high, #6 resolved to the one admission model built by plan 05, and crate mappings corrected. Every candidate now records 'plan': the completed plan (docs/completed/) that consumed it, or null plus a 'dropped' reason. Plan 03 split `llm-proxy-provider` into `llm-proxy-adapters` and `llm-proxy-transport` and added `llm-proxy-engine`; `crate` names the current crates, and `plan` is the authoritative landing spot. The ten items the audit found missing from the backlog entirely are appended at the end."
 }
