@@ -44,11 +44,13 @@ pipeline code.
   bug that broke Codex against one-hub. The route is
   `POST /providers/{provider}/v1/responses` under the `responses` endpoint
   family; the provider resolves it through `routes.responses`. Same-format
-  passthrough forwards the raw Responses body with only the model rewrite,
-  so `store`, `include`, `previous_response_id`, `prompt_cache_key`,
-  `reasoning.summary` and replayed items survive byte-for-byte; a
-  Responses client field with no equivalent on another provider is rejected
-  by name through the cross-format policy.
+  passthrough forwards the raw Responses body unchanged (JSON-value equal —
+  the body is re-serialised, so key order and whitespace may change) apart
+  from the model rewrite and any operator-configured `prompt_cache`
+  hygiene, so `store`, `include`, `previous_response_id`,
+  `prompt_cache_key`, `reasoning.summary` and replayed items arrive intact;
+  a Responses client field with no equivalent on another provider is
+  rejected by name through the cross-format policy.
 - **Gemini native (step 2, backlog 19).**
   `llm-proxy-protocol/src/client/gemini.rs` decodes `contents` /
   `systemInstruction` / `generationConfig` (incl. `thinkingConfig` onto the
@@ -102,7 +104,8 @@ pipeline code.
   one reply drove a real `exec_command` tool turn the CLI executed in its
   read-only sandbox), and both requests of that session
   (`fixtures/contract/captured/codex/`) must reach the fake Responses
-  upstream byte-for-byte apart from the model alias, with none of the
+  upstream JSON-value equal apart from the model alias and any
+  operator-configured `prompt_cache` hygiene, with none of the
   Codex client headers (`originator`, `session-id`, `thread-id`,
   `x-client-request-id`, `x-codex-*`, user agent) forwarded and the SSE
   response returning with exact usage. The capture documents the real
