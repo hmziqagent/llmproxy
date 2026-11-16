@@ -75,8 +75,8 @@ Every feature takes one of these places, in this order:
    `TimeoutLayer` become per-family settings.
 9. **Add cargo features.** The server builds without `rusqlite`, the core without
    `tiktoken-rs`, and `reqwest` uses one TLS stack (BUG-23).
-10. **Make it publishable.** Remove the exact `time` pin from `Cargo.toml` and add
-    versions to the 14 path dependencies.
+10. **Make it publishable.** Remove the exact `time` pin from `Cargo.toml` and make
+    every path dependency carry `version = "0.1.0"`.
 
 ## Done when
 
@@ -114,10 +114,12 @@ Every feature takes one of these places, in this order:
   (`crates/llm-proxy-engine/tests/open_provider_set.rs`).
 - **Config from code (step 5).** `EngineBuilder` and
   `llm_proxy_sdk::ProxyBuilder` assemble the stack without TOML; a loaded
-  TOML `AppConfig` is one `ConfigSource` (`StaticConfigSource`).
-- **Server (step 6).** `llm-proxy-server` keeps routes, middleware and
-  error mapping; `build_router(AppState)` is unchanged. `AppState`
-  materializes the engine on first use.
+  TOML `AppConfig` is one `ConfigSource`: `StaticConfigSource` serves
+  `EngineBuilder::new`, the SDK and the bridge, and the daemon/server uses
+  a `SwappingConfigSource` (`crates/llm-proxy-server/src/state.rs`).
+- **Server (step 6).** `llm-proxy-server` keeps routes, middleware, error
+  mapping, client codecs and bare-model resolution; `build_router(AppState)`
+  is unchanged. `AppState` materializes the engine on first use.
 - **Boundaries (step 7).** Admin usage reads moved out of
   `llm-proxy-api` into `llm-proxy-storage::UsageReader`: the `api` crate
   contains no SQL, but the process still reads the SQLite ledger through
@@ -154,7 +156,8 @@ Every feature takes one of these places, in this order:
   the leaves are actually uploaded — a release action, not a code change.
 
 **Done-when verification:** a Rust program runs the full pipeline against a
-loopback fake upstream with the proxy binding no port
+loopback fake upstream with the proxy binding no port (the fake upstream
+itself is a loopback listener)
 (`crates/llm-proxy-engine/tests/fake_upstream.rs`); an axum app mounts
 `build_router` next to its own routes in a test
 (`crates/llm-proxy-sdk/tests/mount_and_build.rs`); `cargo tree` shows no
@@ -167,6 +170,14 @@ spawned binary against a loopback fake upstream
 (`apps/llm-proxy/tests/cli_contract.rs`:
 `contract_fixture_replays_through_the_spawned_binary` and
 `contract_fixture_replays_streaming_through_the_spawned_binary`).
+
+**Follow-up decisions (plan-03 items 03-8, 03-9):** the publish done-when
+is re-proven by CI — the `publish-dry-run` job in
+`.github/workflows/ci.yml` runs `cargo publish --workspace --dry-run
+--locked` on every push (only the standalone `bindings/*` packages carry
+`publish = false`) — and the contract-replay wording was decided as the
+in-process router for every fixture plus the two spawned-binary replays
+named above.
 
 **Known behavior deltas** (in paths unreachable before the refactor):
 client re-encode failure after a completed non-streaming response
