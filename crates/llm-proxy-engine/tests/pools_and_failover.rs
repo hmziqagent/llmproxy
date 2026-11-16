@@ -608,6 +608,49 @@ async fn a_direct_provider_route_never_fails_over_or_wraps_the_error() {
 }
 
 #[tokio::test]
+async fn a_direct_provider_route_surfaces_a_500_unwrapped_with_one_attempt() {
+    let broken = spawn_upstream(upstream_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"boom"}"#,
+    ))
+    .await;
+    let (engine, bus) = build_engine(vec![member("solo", broken, None)], vec![]);
+
+    let error = engine
+        .execute(engine_request("solo", false))
+        .await
+        .expect_err("the 500 surfaces to the client unwrapped");
+    assert!(
+        matches!(error, EngineError::Upstream { status: 500, .. }),
+        "a direct provider route returns the raw 500, never RetryExhausted, got {error:?}"
+    );
+    assert_eq!(attempts(&bus).len(), 1, "exactly one attempt, no ladder");
+}
+
+#[tokio::test]
+async fn a_direct_provider_route_surfaces_a_connect_error_with_one_attempt() {
+    // Bind a listener, take its port, drop it: a reliably closed port whose
+    // connect is refused immediately (never a hard-coded port).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a throwaway listener");
+    let closed_port = listener.local_addr().expect("listener addr").port();
+    drop(listener);
+    let dead = format!("http://127.0.0.1:{closed_port}/v1/messages");
+    let (engine, bus) = build_engine(vec![member("dead", dead, None)], vec![]);
+
+    let error = engine
+        .execute(engine_request("dead", false))
+        .await
+        .expect_err("the connect error surfaces to the client unwrapped");
+    assert!(
+        matches!(error, EngineError::Upstream { status: 502, .. }),
+        "a refused connect surfaces as the generic 502, never RetryExhausted, got {error:?}"
+    );
+    assert_eq!(attempts(&bus).len(), 1, "exactly one attempt, no ladder");
+}
+
+#[tokio::test]
 async fn an_exhausted_pool_reports_retries_exhausted_with_a_computed_retry_after() {
     let first = spawn_upstream(throttled_upstream_with_retry_after("17")).await;
     let second = spawn_upstream(throttled_upstream_with_retry_after("23")).await;
