@@ -217,6 +217,50 @@ async fn responses_are_never_cacheable() {
     );
 }
 
+/// The 401 refusals and the unknown-path answers must forbid caching too:
+/// the header layers wrap `require_admin` and (via `Router::layer`) the
+/// fallback, so a CDN can never cache an error in place of authenticated
+/// admin data (backlog 37, plan 07 Done 3: "all admin API responses").
+#[tokio::test]
+async fn error_responses_are_never_cacheable() {
+    let (app, _ledger) = surface().await;
+    for (token, path, expected) in [
+        (None, "/keys", StatusCode::UNAUTHORIZED),
+        (Some("wrong"), "/keys", StatusCode::UNAUTHORIZED),
+        (None, "/nope", StatusCode::UNAUTHORIZED),
+        (Some(ADMIN_TOKEN), "/nope", StatusCode::NOT_FOUND),
+    ] {
+        let mut builder = Request::builder().method(axum::http::Method::GET).uri(path);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("request builds"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), expected, "{path} with {token:?}");
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            cache_control, "no-store",
+            "{path} with {token:?} ({expected}) must carry Cache-Control: no-store, got {cache_control:?}"
+        );
+        let pragma = response
+            .headers()
+            .get(header::PRAGMA)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            pragma, "no-cache",
+            "{path} with {token:?} ({expected}) must carry Pragma: no-cache, got {pragma:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_key_lives_a_full_lifecycle_through_http() {
     let (app, _ledger) = surface().await;

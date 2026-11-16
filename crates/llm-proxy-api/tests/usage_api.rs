@@ -493,6 +493,52 @@ mod tests {
         }
     }
 
+    /// The 401 refusals and the unknown-path answers (axum's default 404
+    /// fallback) must forbid caching too: the header layers wrap
+    /// `require_admin` and (via `Router::layer`) the fallback, so a CDN can
+    /// never cache an error in place of authenticated usage data
+    /// (backlog 37, plan 07 Done 3: "all admin API responses").
+    #[tokio::test]
+    async fn error_responses_are_never_cacheable() {
+        let ledger = seed().await;
+        for (token, path, expected) in [
+            (None, "/keys", StatusCode::UNAUTHORIZED),
+            (Some("wrong-token"), "/keys", StatusCode::UNAUTHORIZED),
+            (None, "/nope", StatusCode::UNAUTHORIZED),
+            (Some(ADMIN_TOKEN), "/nope", StatusCode::NOT_FOUND),
+        ] {
+            let app = app_for(&ledger.path);
+            let mut builder = Request::builder().uri(path);
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .oneshot(builder.body(Body::empty()).expect("request builds"))
+                .await
+                .expect("oneshot");
+            let status = response.status();
+            assert_eq!(status, expected, "{path} with {token:?}");
+            let cache_control = response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(
+                cache_control, "no-store",
+                "{path} with {token:?} ({status}) must carry Cache-Control: no-store, got {cache_control:?}"
+            );
+            let pragma = response
+                .headers()
+                .get("pragma")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(
+                pragma, "no-cache",
+                "{path} with {token:?} ({status}) must carry Pragma: no-cache, got {pragma:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn summary_groups_by_provider_with_exact_decimal_costs() {
         let ledger = seed().await;
