@@ -123,7 +123,7 @@ pub async fn load_toml_state_from_config(
     llm_proxy_server::ClientAuth::from_config(&app_config.auth)
         .with_context(|| "building client auth from [auth] config")?;
 
-    let egress_clients = build_egress_clients(&app_config, &registry)?;
+    let egress_clients = build_egress_clients(&app_config, &registry, None)?;
 
     let event_bus = build_event_bus(&app_config)?;
 
@@ -607,31 +607,56 @@ fn providers_with_family_routes(registry: &ProviderRegistry) -> Vec<String> {
 }
 
 /// Per-provider egress-proxy clients from `[provider.egress]` — also the
-/// rebuild path for a hot reload (plan 07 step 11).
+/// rebuild path for a hot reload (plan 07 step 11). `previous` is the
+/// running state a reload reuses from: a provider whose egress proxy and
+/// upstream timeouts are unchanged keeps its existing client — and the
+/// pooled upstream connections inside it — instead of getting a fresh pool.
 pub(crate) fn build_egress_clients(
     app_config: &AppConfig,
     registry: &ProviderRegistry,
+    previous: Option<(
+        &AppConfig,
+        &ProviderRegistry,
+        &std::collections::HashMap<String, std::sync::Arc<ProxyClient>>,
+    )>,
 ) -> Result<std::collections::HashMap<String, std::sync::Arc<ProxyClient>>> {
     let mut egress_clients = std::collections::HashMap::new();
     for provider in registry.iter() {
-        if let Some(egress) = &provider.egress {
-            let client = ProxyClient::try_with_egress_proxy_and_timeouts(
-                &egress.proxy,
-                &app_config.server.upstream_timeouts,
-            )
-            .with_context(|| {
-                format!(
-                    "building egress proxy client for provider \"{}\" from [provider.egress]",
-                    provider.name
-                )
-            })?;
-            info!(
-                provider = %provider.name,
-                scheme = egress.proxy.split("://").next().unwrap_or_default(),
-                "routing upstream traffic through the configured egress proxy"
-            );
-            egress_clients.insert(provider.name.clone(), std::sync::Arc::new(client));
+        let Some(egress) = &provider.egress else {
+            continue;
+        };
+        let reused = previous.and_then(|(previous_config, previous_registry, previous_clients)| {
+            let timeouts_unchanged =
+                previous_config.server.upstream_timeouts == app_config.server.upstream_timeouts;
+            let proxy_unchanged = previous_registry
+                .get(&provider.name)
+                .and_then(|previous_provider| previous_provider.egress.as_ref())
+                == Some(egress);
+            (timeouts_unchanged && proxy_unchanged)
+                .then(|| previous_clients.get(&provider.name))
+                .flatten()
+                .cloned()
+        });
+        if let Some(client) = reused {
+            egress_clients.insert(provider.name.clone(), client);
+            continue;
         }
+        let client = ProxyClient::try_with_egress_proxy_and_timeouts(
+            &egress.proxy,
+            &app_config.server.upstream_timeouts,
+        )
+        .with_context(|| {
+            format!(
+                "building egress proxy client for provider \"{}\" from [provider.egress]",
+                provider.name
+            )
+        })?;
+        info!(
+            provider = %provider.name,
+            scheme = egress.proxy.split("://").next().unwrap_or_default(),
+            "routing upstream traffic through the configured egress proxy"
+        );
+        egress_clients.insert(provider.name.clone(), std::sync::Arc::new(client));
     }
     Ok(egress_clients)
 }

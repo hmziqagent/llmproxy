@@ -238,6 +238,14 @@ impl TransportTable {
         }
         &self.shared
     }
+
+    /// The per-provider egress overrides as an owned `Arc` (plan 07 step
+    /// 11): a hot reload reads the previous engine's map to reuse unchanged
+    /// providers' clients instead of rebuilding their pools.
+    #[must_use]
+    pub fn egress_clients(&self) -> Arc<HashMap<String, Arc<ProxyClient>>> {
+        Arc::clone(&self.egress)
+    }
 }
 
 /// The request engine. Clone is cheap (`Arc`-shared); build one with

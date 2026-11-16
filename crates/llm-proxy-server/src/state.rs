@@ -369,6 +369,18 @@ impl AppState {
         }
     }
 
+    /// The per-provider egress clients the live engine sends with (plan 07
+    /// step 11): an owned `Arc`, because a hot reload swaps the engine and
+    /// with it the answer. The startup-wired map until the first engine is
+    /// built.
+    #[must_use]
+    pub fn egress_clients(&self) -> Arc<HashMap<String, Arc<ProxyClient>>> {
+        match self.engine.get() {
+            Some(Ok(engine)) => engine.transport().egress_clients(),
+            _ => Arc::clone(&self.egress_clients),
+        }
+    }
+
     /// The request engine: the shared lifecycle (admission, routing,
     /// credentials, egress, settlement). Materialized once, on first use,
     /// from this state's config — the daemon's config loader validates

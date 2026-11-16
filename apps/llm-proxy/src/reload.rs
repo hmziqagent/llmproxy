@@ -1,7 +1,8 @@
 //! Hot reload (plan 07 step 11, backlog 23): re-read the provider and pool
-//! files and swap them in, one provider at a time, without dropping
-//! in-flight requests — and refuse, whole and up front, any change that
-//! needs a restart.
+//! files and swap the provider and pool set atomically (a new engine over a
+//! new registry) — and refuse, whole and up front, any change that needs a
+//! restart. In-flight requests finish on the engine they hold; unchanged
+//! providers keep their pooled upstream connections.
 //!
 //! What reload may change: the provider and pool files under `providers/`.
 //! What it must refuse: anything under `[server]`, `[auth]` (including the
@@ -133,10 +134,18 @@ pub async fn reload_registry(
     .map_err(|error| anyhow::anyhow!("the reload's config gates task failed: {error}"))??;
 
     let current = state.providers();
+    let current_egress = state.egress_clients();
     let report = diff_registries(&current, &registry);
 
-    // Egress clients are per-provider; rebuild them from the new registry.
-    let egress = crate::state::build_egress_clients(&next, &registry)?;
+    // Egress clients are per-provider; rebuild them from the new registry,
+    // reusing the previous client — and the pooled upstream connections in
+    // it — for providers whose egress proxy and upstream timeouts are
+    // unchanged. Changed and added providers get fresh pools.
+    let egress = crate::state::build_egress_clients(
+        &next,
+        &registry,
+        Some((state.app_config(), &current, &current_egress)),
+    )?;
 
     // Build and validate the replacement engine from the proposed config
     // before touching anything live — including the config snapshot the
@@ -306,6 +315,37 @@ auth_style = "x-api-key"
 [provider.adapters.messages]
 protocol = "anthropic_messages"
 endpoint = "{endpoint}"
+[provider.routes]
+messages = "messages"
+
+[provider.model_aliases]
+"m" = "{marker_port}"
+"#
+            ),
+        )
+        .expect("provider file");
+    }
+
+    fn write_provider_with_egress(
+        dir: &Path,
+        name: &str,
+        endpoint: &str,
+        marker_port: u16,
+        proxy: &str,
+    ) {
+        std::fs::create_dir_all(dir.join("providers")).expect("providers dir");
+        std::fs::write(
+            dir.join(format!("providers/{name}.toml")),
+            format!(
+                r#"[provider]
+name = "{name}"
+api_key = "key-{name}"
+auth_style = "x-api-key"
+[provider.adapters.messages]
+protocol = "anthropic_messages"
+endpoint = "{endpoint}"
+[provider.egress]
+proxy = "{proxy}"
 [provider.routes]
 messages = "messages"
 
@@ -980,6 +1020,54 @@ path = "{dir_path}/usage.db"
         assert!(
             Arc::ptr_eq(&engine_before, &engine_after),
             "the engine was not swapped by a refused reload"
+        );
+    }
+
+    /// The reload's pool promise (plan 07 step 11): a provider whose
+    /// `[provider.egress]` proxy is untouched keeps its egress client — and
+    /// the pooled upstream connections inside it — across reloads, instead
+    /// of being handed a fresh pool every time.
+    #[tokio::test]
+    async fn an_unchanged_egress_provider_keeps_its_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO, 3).await;
+        write_provider_with_egress(
+            dir.path(),
+            "proxied",
+            &endpoint,
+            1,
+            "socks5h://127.0.0.1:1080",
+        );
+        write_provider(dir.path(), "plain", &endpoint, 2);
+        let path = write_config(dir.path(), "");
+        let state = state_for(dir.path()).await;
+        state.engine().expect("engine builds");
+
+        let before = std::sync::Arc::clone(
+            state
+                .egress_clients()
+                .get("proxied")
+                .expect("the egress provider has a client wired"),
+        );
+
+        // Two reloads, each touching only the non-egress provider — the
+        // egress provider's file is never edited.
+        write_provider(dir.path(), "plain", &endpoint, 3);
+        reload_registry(&state, &path, None)
+            .await
+            .expect("the first reload applies");
+        write_provider(dir.path(), "plain", &endpoint, 4);
+        reload_registry(&state, &path, None)
+            .await
+            .expect("the second reload applies");
+
+        let after_map = state.egress_clients();
+        let after = after_map
+            .get("proxied")
+            .expect("the egress provider is still wired");
+        assert!(
+            Arc::ptr_eq(&before, after),
+            "the untouched egress provider keeps its client across reloads"
         );
     }
 }

@@ -31,8 +31,10 @@ at any time.
    probes, each failure naming its fix.
 10. **Config snapshots (conflict 11).** Load config through `ConfigSource` from plan 03
     into an immutable snapshot that can be swapped, with one stated precedence.
-11. **Hot reload (backlog 23).** Swap one provider at a time without touching other
-    connections, and refuse changes that need a restart rather than half-applying them.
+11. **Hot reload (backlog 23).** Swap the provider and pool set atomically (a new
+    engine over a new registry); in-flight requests finish on the engine they hold;
+    unchanged providers keep their pooled upstream connections, and changes that
+    need a restart are refused rather than half-applied.
 
 ## Done when
 
