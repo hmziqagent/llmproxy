@@ -1376,6 +1376,61 @@ mod tests {
     }
 
     #[test]
+    fn top_k_from_core_maps_to_generation_config() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.top_k = Some(5);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["generation_config"]["topK"], 5,
+            "core top_k must reach the wire as generationConfig.topK: {body}"
+        );
+    }
+
+    #[test]
+    fn top_k_from_chat_body_extra_maps_to_generation_config() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": "gemini-2.5-pro",
+                "messages": [],
+                "top_k": 7,
+            }),
+        );
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client)
+            .expect("a Chat top_k extra must not be rejected on a Gemini target");
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["generation_config"]["topK"], 7,
+            "the Chat body top_k extra must map onto generationConfig.topK: {body}"
+        );
+        assert!(
+            body.get("top_k").is_none(),
+            "the client field must not ride the wire verbatim: {body}"
+        );
+    }
+
+    #[test]
     fn encode_generation_config() {
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,

@@ -2411,6 +2411,28 @@ mod tests {
     }
 
     #[test]
+    fn top_k_from_core_reaches_anthropic_body() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.top_k = Some(5);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["top_k"], 5,
+            "core top_k must reach the Anthropic request body: {body}"
+        );
+    }
+
+    #[test]
     fn same_format_passthrough_translates_a_foreign_reasoning_effort() {
         // An Anthropic-dialect body carrying the OpenAI `reasoning_effort`
         // field: passthrough still strips it and translates it into a native
