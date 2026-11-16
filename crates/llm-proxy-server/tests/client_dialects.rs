@@ -60,6 +60,9 @@ mod tests {
     struct FakeUpstream {
         base_url: String,
         capture: Capture,
+        /// `path_and_query` of the most recent upstream request, so URL
+        /// selection (e.g. `:streamGenerateContent?alt=sse`) is observable.
+        uri: Arc<tokio::sync::Mutex<Option<String>>>,
     }
 
     fn anthropic_non_stream_body(tool_call: bool) -> Vec<u8> {
@@ -267,44 +270,50 @@ mod tests {
     async fn spawn_fake_upstream(behavior: Behavior) -> FakeUpstream {
         let capture: Capture = Arc::new(tokio::sync::Mutex::new(None));
         let capture_for_handler = Arc::clone(&capture);
+        let uri: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+        let uri_for_handler = Arc::clone(&uri);
         let behavior_for_handler = behavior;
 
-        let handler = Arc::new(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
-            let capture = Arc::clone(&capture_for_handler);
-            let behavior = behavior_for_handler;
-            async move {
-                *capture.lock().await = Some((headers, body));
-                respond(behavior)
-            }
-        });
+        let handler = Arc::new(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                let capture = Arc::clone(&capture_for_handler);
+                let uri_slot = Arc::clone(&uri_for_handler);
+                let behavior = behavior_for_handler;
+                async move {
+                    *uri_slot.lock().await = uri.path_and_query().map(|p| p.as_str().to_owned());
+                    *capture.lock().await = Some((headers, body));
+                    respond(behavior)
+                }
+            },
+        );
 
         let app = Router::new()
             .route(
                 "/v1/messages",
                 post({
                     let handler = Arc::clone(&handler);
-                    move |headers, body| handler(headers, body)
+                    move |uri, headers, body| handler(uri, headers, body)
                 }),
             )
             .route(
                 "/v1/responses",
                 post({
                     let handler = Arc::clone(&handler);
-                    move |headers, body| handler(headers, body)
+                    move |uri, headers, body| handler(uri, headers, body)
                 }),
             )
             .route(
                 "/v1beta/models/{model_method}",
                 post({
                     let handler = Arc::clone(&handler);
-                    move |headers, body| handler(headers, body)
+                    move |uri, headers, body| handler(uri, headers, body)
                 }),
             )
             .route(
                 "/v1/chat/completions",
                 post({
                     let handler = Arc::clone(&handler);
-                    move |headers, body| handler(headers, body)
+                    move |uri, headers, body| handler(uri, headers, body)
                 }),
             )
             .route("/health", get(|| async { StatusCode::OK }));
@@ -331,6 +340,7 @@ mod tests {
         FakeUpstream {
             base_url: format!("http://{addr}"),
             capture,
+            uri,
         }
     }
 
@@ -487,6 +497,16 @@ mod tests {
         let guard = upstream.capture.lock().await;
         let (_, body) = guard.as_ref().expect("upstream received a request");
         serde_json::from_slice(body).expect("upstream body is JSON")
+    }
+
+    /// The `path_and_query` the proxy last requested from `upstream`.
+    async fn captured_uri(upstream: &FakeUpstream) -> String {
+        upstream
+            .uri
+            .lock()
+            .await
+            .clone()
+            .expect("upstream received a request")
     }
 
     fn post_json(uri: &str, body: &Value) -> Request<Body> {
@@ -1588,6 +1608,36 @@ mod tests {
             .filter_map(|part| part["text"].as_str().map(str::to_owned))
             .collect();
         assert_eq!(content, "it is 72F");
+        assert_eq!(
+            captured_uri(&upstream).await,
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+            "streaming must select :streamGenerateContent?alt=sse on the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_same_format_non_stream_keeps_generate_content_url() {
+        let upstream = spawn_fake_upstream(Behavior::GeminiNonStream).await;
+        let state = state_with_provider(
+            &upstream,
+            "gemini_generate_content",
+            ProviderRouteKind::GenerateContent,
+            false,
+        );
+        let app = build_router(state);
+        let response = app
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1beta/models/gemini-2.5-flash:generateContent",
+                &gemini_request(),
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            captured_uri(&upstream).await,
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            "non-streaming must keep :generateContent with no alt query"
+        );
     }
 
     // A Responses knob with no Anthropic equivalent is rejected by name,
