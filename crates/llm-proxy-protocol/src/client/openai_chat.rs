@@ -1286,13 +1286,33 @@ mod tests {
         let mut req = make_openai_request();
         req.messages[0].cache_control = Some(OpenAICacheControl {
             r#type: "ephemeral".into(),
-            ttl: None,
+            ttl: Some("1h".into()),
         });
         let core = decode_request(req).unwrap();
         match &core.messages[0].content[0] {
             CoreContent::Text { cache, .. } => {
                 assert!(cache.is_some());
                 assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
+                assert_eq!(cache.as_ref().unwrap().ttl.as_deref(), Some("1h"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn system_cache_control_ttl_carries_to_core_system() {
+        let mut req = make_openai_request();
+        req.messages[0].role = "system".into();
+        req.messages[0].cache_control = Some(OpenAICacheControl {
+            r#type: "ephemeral".into(),
+            ttl: Some("1h".into()),
+        });
+        let core = decode_request(req).unwrap();
+        match &core.system[0] {
+            CoreContent::Text { cache, .. } => {
+                assert!(cache.is_some());
+                assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
+                assert_eq!(cache.as_ref().unwrap().ttl.as_deref(), Some("1h"));
             }
             _ => panic!("expected Text"),
         }
