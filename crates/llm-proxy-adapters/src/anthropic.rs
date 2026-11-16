@@ -2447,6 +2447,68 @@ mod tests {
     }
 
     #[test]
+    fn same_format_passthrough_keeps_output_config() {
+        // An Anthropic-dialect body with the native `output_config` object:
+        // same-format passthrough forwards it unchanged, subkeys included
+        // (02-9 pins this in CI; only a manual probe named it before).
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let output_config =
+            serde_json::json!({"effort": "low", "format": {"type": "json_schema", "schema": {}}});
+        let client = ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": output_config,
+            }),
+        );
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target, &client).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["output_config"], output_config);
+    }
+
+    #[test]
+    fn cross_format_output_config_is_carried_to_anthropic() {
+        // A Chat-dialect client's `output_config` reaches the Anthropic
+        // upstream verbatim instead of being rejected by name: Anthropic
+        // accepts the field natively with the identical shape (02-9).
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let output_config =
+            serde_json::json!({"effort": "low", "format": {"type": "json_schema", "schema": {}}});
+        let client = ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 4096,
+                "messages": [],
+                "output_config": output_config,
+            }),
+        );
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target, &client).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["output_config"], output_config);
+    }
+
+    #[test]
     fn encode_tool_choice_tool_sanitized() {
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,

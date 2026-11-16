@@ -262,7 +262,7 @@ pub fn field_disposition(
         ) if field == "seed" => FieldDisposition::Rejected,
         (_, protocols::ANTHROPIC_MESSAGES) => match field {
             // Anthropic accepts these OpenAI Chat fields with the same shape.
-            "service_tier" | "top_k" => FieldDisposition::Carried,
+            "service_tier" | "top_k" | "output_config" => FieldDisposition::Carried,
             // Mapped by the Anthropic adapter from the raw client body.
             "parallel_tool_calls" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
