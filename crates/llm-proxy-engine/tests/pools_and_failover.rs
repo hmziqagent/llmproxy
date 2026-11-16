@@ -32,6 +32,7 @@ use llm_proxy_protocol::core::{
 };
 use llm_proxy_storage::{
     AttemptCompleted, AttemptOutcome, EventBus, ProxyEvent, RecordingBus, RequestReceived,
+    ResponseCompleted, ResponseFailed,
 };
 use secrecy::SecretString;
 
@@ -2714,5 +2715,191 @@ async fn a_guard_rejected_stream_still_writes_a_failed_attempt_row() {
     assert!(
         cooldowns.provider_available("primary", now).await,
         "a guard refusal is proxy policy: the member that answered is not cooled"
+    );
+}
+
+/// [`upstream_ok_stream`] with a pause before every SSE event: a stream the
+/// client can drop mid-flight. The un-throttled twin fits whole into the
+/// engine's event-channel buffer, so a dropped tail could lose the race
+/// against the engine's own clean end.
+fn upstream_ok_stream_throttled() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let events = vec![
+                Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}"#),
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
+                Event::default()
+                    .event("message_delta")
+                    .data(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}"#),
+                Event::default()
+                    .event("message_stop")
+                    .data(r#"{"type":"message_stop"}"#),
+            ];
+            let stream = futures::stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            )
+            .then(|event| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                event
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(stream).into_response(),
+            )
+        }),
+    )
+}
+
+/// Terminal ledger rows of one request: its `ResponseCompleted` and
+/// `ResponseFailed` events, in arrival order.
+fn terminal_rows(bus: &RecordingBus) -> Vec<TerminalRow> {
+    bus.snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            ProxyEvent::ResponseCompleted(completed) => Some(TerminalRow::Completed(completed)),
+            ProxyEvent::ResponseFailed(failed) => Some(TerminalRow::Failed(failed)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+enum TerminalRow {
+    Completed(ResponseCompleted),
+    Failed(ResponseFailed),
+}
+
+/// Plan 04 step 7, ledger side: a clean stream guarantees exactly one
+/// terminal row — `ResponseCompleted` with the usage the stream reported —
+/// and its committed attempt row is `Streaming`, the terminal outcome
+/// living on the request's row. Client-visible events are not the
+/// guarantee: the in-band error path emits a `CoreEvent::Error` but no
+/// `UsageDelta` to the client, so the ledger row is what pins the usage.
+#[tokio::test]
+async fn a_clean_stream_writes_exactly_one_completed_row_with_the_streamed_usage() {
+    let solo = spawn_upstream(upstream_ok_stream()).await;
+    let (engine, bus) = build_engine(
+        vec![member("solo", solo, None)],
+        vec![pool(
+            "clean",
+            vec!["solo"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let stream = engine
+        .execute_stream(engine_request("clean", true))
+        .await
+        .expect("the clean stream commits");
+    let mut all = stream.head.clone();
+    let mut tail = stream.tail;
+    while let Some(event) = tail.next().await {
+        all.push(event);
+    }
+    assert!(
+        all.iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the clean stream reaches its terminal event, got {all:?}"
+    );
+
+    // Draining the tail to `None` only happens after the stream task has
+    // finished, and it records the terminal row before closing the channel:
+    // the rows are settled without waiting on the task.
+    let terminals = terminal_rows(&bus);
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal row per clean stream, never zero or two"
+    );
+    let TerminalRow::Completed(completed) = &terminals[0] else {
+        panic!("a clean stream ends in ResponseCompleted, got {terminals:?}");
+    };
+    assert_eq!(
+        completed.usage.input_tokens, 7,
+        "the row carries message_start's input usage"
+    );
+    assert_eq!(
+        completed.usage.output_tokens, 1,
+        "the row carries message_delta's output usage"
+    );
+    assert!(
+        bus.snapshot()
+            .iter()
+            .all(|event| !matches!(event, ProxyEvent::ResponseFailed(_))),
+        "a clean stream writes no failure row"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 1, "one attempt served the whole stream");
+    assert_eq!(rows[0].provider, "solo");
+    assert_eq!(
+        rows[0].outcome,
+        AttemptOutcome::Streaming,
+        "a committed stream's attempt row is Streaming; its terminal outcome \
+         lives on the request row"
+    );
+}
+
+/// The drop twin: a client that hangs up mid-stream leaves exactly one
+/// terminal row and it is the cancellation — never zero (the stream
+/// vanished from the ledger) or two (the cancellation and the completion
+/// the client never received).
+#[tokio::test]
+async fn a_stream_dropped_by_the_client_writes_one_terminal_row() {
+    let solo = spawn_upstream(upstream_ok_stream_throttled()).await;
+    let (engine, bus) = build_engine(
+        vec![member("solo", solo, None)],
+        vec![pool(
+            "dropped",
+            vec!["solo"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let stream = engine
+        .execute_stream(engine_request("dropped", true))
+        .await
+        .expect("the first chunk commits the stream");
+    let mut tail = stream.tail;
+    let first = tokio::time::timeout(Duration::from_secs(5), tail.next())
+        .await
+        .expect("the first tail event arrives within the throttle gap");
+    assert!(first.is_some(), "the committed stream still has events");
+    drop(tail);
+
+    // The dropped tail cancels the stream task; wait (bounded) for it to
+    // write the row instead of racing it with a fixed sleep.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let terminals = loop {
+        let terminals = terminal_rows(&bus);
+        if !terminals.is_empty() || std::time::Instant::now() >= deadline {
+            break terminals;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal row, never zero or two, got {terminals:?}"
+    );
+    let TerminalRow::Failed(failed) = &terminals[0] else {
+        panic!("a dropped stream ends in the cancellation row, got {terminals:?}");
+    };
+    assert_eq!(
+        failed.error_kind, "ClientCancelled",
+        "the terminal row records why the stream ended"
+    );
+    assert!(
+        bus.snapshot()
+            .iter()
+            .all(|event| !matches!(event, ProxyEvent::ResponseCompleted(_))),
+        "the engine never records the completion the client did not receive"
     );
 }
