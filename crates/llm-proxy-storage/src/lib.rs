@@ -54,9 +54,13 @@ pub struct RequestReceived {
     pub caller: String,
     /// Provider name from the URL path.
     pub provider: String,
-    /// Route kind (`"chat_completions"` or `"messages"`).
+    /// Route kind (`"chat_completions"`, `"messages"`, `"responses"`,
+    /// `"generate_content"`, `"embeddings"`, `"rerank"`,
+    /// `"audio_transcriptions"`, `"audio_speech"`, `"images_generations"`,
+    /// `"files"`, `"batches"`).
     pub route_kind: String,
-    /// Client protocol (`"openai_chat"` or `"anthropic"`).
+    /// Client protocol (`"openai_chat"`, `"anthropic"`, `"openai_responses"`,
+    /// `"gemini"`, `"ollama"`).
     pub client_protocol: String,
     /// Requested and upstream model.
     pub model: ModelRef,
