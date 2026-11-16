@@ -546,13 +546,52 @@ fn uncarried_block_label(content: &CoreContent) -> Option<String> {
     }
 }
 
+/// The neutral type name of a content block, for naming a block a rejection
+/// drops. Used for the inner blocks of a `tool_result`: every cross-format
+/// encoder reduces a tool result to its text regardless of inner
+/// mappability, so any non-`Text` inner block is uncarried even when the
+/// top-level variant of the same kind would map.
+fn core_content_type_name(content: &CoreContent) -> &'static str {
+    match content {
+        CoreContent::Text { .. } => "text",
+        CoreContent::Image { .. } => "image",
+        CoreContent::Document { .. } => "document",
+        CoreContent::Audio { .. } => "audio",
+        CoreContent::Video { .. } => "video",
+        CoreContent::ToolUse { .. } => "tool_use",
+        CoreContent::ToolResult { .. } => "tool_result",
+        CoreContent::Thinking { .. } => "thinking",
+        CoreContent::RedactedThinking { .. } => "redacted_thinking",
+        CoreContent::Refusal { .. } => "refusal",
+        CoreContent::Opaque { .. } => "opaque",
+        _ => "unknown",
+    }
+}
+
+/// Names the non-`Text` inner blocks of one `tool_result` at their nested
+/// paths (`messages[m].content[b].content[k] type=...`).
+fn uncarried_tool_result_inner_labels(m: usize, b: usize, inner: &[CoreContent]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for (k, block) in inner.iter().enumerate() {
+        if matches!(block, CoreContent::Text { .. }) {
+            continue;
+        }
+        let label = uncarried_block_label(block)
+            .unwrap_or_else(|| format!("type={}", core_content_type_name(block)));
+        labels.push(format!("messages[{m}].content[{b}].content[{k}] {label}"));
+    }
+    labels
+}
+
 /// Message blocks the cross-format encoders cannot carry: opaque blocks (a
 /// client block the core does not model, e.g. a replayed Anthropic
-/// `server_tool_use`), documents (no built-in provider encodes them) and
+/// `server_tool_use`), documents (no built-in provider encodes them),
 /// images without a readable `base64`/`url` source (e.g. a Files API `file`
-/// source). Same-format passthrough forwards the raw client body instead;
-/// every cross-format encode calls this so these blocks are rejected by name
-/// rather than dropped by the encoder (dropped with a warning under `lossy`).
+/// source), and non-`Text` blocks nested inside a `tool_result` (every
+/// cross-format encoder reduces a tool result to its text). Same-format
+/// passthrough forwards the raw client body instead; every cross-format
+/// encode calls this so these blocks are rejected by name rather than
+/// dropped by the encoder (dropped with a warning under `lossy`).
 pub fn check_cross_format_content(
     core: &CoreRequest,
     provider: &ProtocolName,
@@ -563,6 +602,9 @@ pub fn check_cross_format_content(
         for (b, content) in message.content.iter().enumerate() {
             if let Some(label) = uncarried_block_label(content) {
                 uncarried.push(format!("messages[{m}].content[{b}] {label}"));
+            }
+            if let CoreContent::ToolResult { content: inner, .. } = content {
+                uncarried.extend(uncarried_tool_result_inner_labels(m, b, inner));
             }
         }
     }
@@ -1286,6 +1328,86 @@ mod tests {
             true,
         )
         .expect("lossy drops uncarried blocks instead of rejecting");
+    }
+
+    fn tool_result_core_request(inner: Vec<CoreContent>) -> CoreRequest {
+        use llm_proxy_protocol::core::{CoreMessage, CoreRole, ModelRef, SamplingOptions};
+        CoreRequest {
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            system: vec![],
+            messages: vec![CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: inner,
+                    is_error: false,
+                    cache: None,
+                }],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            sampling: SamplingOptions::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: Default::default(),
+        }
+    }
+
+    // Every cross-format encoder reduces a tool result to its text
+    // (`collect_text`/the Responses and Gemini loops), so a non-Text inner
+    // block would vanish silently; the walk must reject it by name instead,
+    // locating it inside the nested `tool_result` content.
+    #[test]
+    fn image_inside_tool_result_is_rejected_by_name() {
+        let core = tool_result_core_request(vec![
+            CoreContent::Text {
+                text: "screenshot attached".into(),
+                cache: None,
+            },
+            CoreContent::Image {
+                source: json!({"type": "base64", "media_type": "image/png", "data": "iVBOR"}),
+            },
+        ]);
+        for provider in [
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::OPENAI_RESPONSES,
+            protocols::GEMINI_GENERATE_CONTENT,
+            protocols::ANTHROPIC_MESSAGES,
+        ] {
+            let err = check_cross_format_content(&core, &ProtocolName::new(provider), false)
+                .expect_err("a non-Text tool_result inner block cannot cross formats");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("messages[0].content[0].content[1] type=image"),
+                "error must locate the inner image block for {provider}: {msg}"
+            );
+            assert!(
+                msg.contains("content["),
+                "error must use the nested content[ path for {provider}: {msg}"
+            );
+            check_cross_format_content(&core, &ProtocolName::new(provider), true)
+                .expect("lossy drops the inner block instead of rejecting");
+        }
+    }
+
+    #[test]
+    fn text_only_tool_result_passes() {
+        let core = tool_result_core_request(vec![CoreContent::Text {
+            text: "42".into(),
+            cache: None,
+        }]);
+        for provider in [
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::OPENAI_RESPONSES,
+            protocols::GEMINI_GENERATE_CONTENT,
+            protocols::ANTHROPIC_MESSAGES,
+        ] {
+            check_cross_format_content(&core, &ProtocolName::new(provider), false)
+                .expect("a text-only tool_result crosses formats");
+        }
     }
 
     #[test]

@@ -238,7 +238,9 @@ fn encode_content_part(
     match c {
         CoreContent::Text { text, cache } => {
             if cache.is_some() {
-                tracing::warn!("Gemini: cache_control is not supported, dropping cache marker");
+                // A cache hint with no effect on the model output; exempt
+                // rather than a rejected field.
+                tracing::debug!("Gemini: cache_control is not supported, dropping cache marker");
             }
             if !text.is_empty() {
                 parts.push(GeminiPart::text(text.clone()));
@@ -706,7 +708,9 @@ impl GeminiAdapter {
             encode_tool_choice(core.tool_choice.as_ref(), !tools.is_empty(), target.lossy)?;
 
         if core.metadata.user_id.is_some() {
-            tracing::warn!(
+            // Attribution only, no semantic effect; exempt rather than a
+            // rejected field.
+            tracing::debug!(
                 "Gemini: user_id specified but not forwarded; \
                  Gemini does not support this parameter"
             );

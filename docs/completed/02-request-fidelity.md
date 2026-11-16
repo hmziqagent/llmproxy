@@ -110,7 +110,13 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   keeps rejecting the field by name. Cross-format, `seed` maps onto Gemini
   `generationConfig.seed` from Chat-dialect clients only (a non-integer seed
   is rejected naming the field, dropped under lossy); other client dialects
-  and non-Gemini targets keep rejecting it by name.
+  and non-Gemini targets keep rejecting it by name. Cross-format
+  `stop_sequences` have no Responses equivalent: strict routes reject naming
+  the field, `lossy` routes drop with a warning. Non-text blocks inside a
+  `tool_result` are rejected by name the same way (dropped under lossy).
+  `metadata.user_id` carries onto the Responses `user` field; where a drop is
+  only attribution or a cache hint (Gemini `user_id`, non-Anthropic
+  cache-control markers) it is an exempt debug-level log.
 - **Reasoning translation (step 5, BUG-20, backlog 13).**
   `adapter/reasoning.rs` converts between `reasoning_effort`,
   `thinking.budget_tokens` and Gemini's `thinkingConfig.thinkingBudget` with a

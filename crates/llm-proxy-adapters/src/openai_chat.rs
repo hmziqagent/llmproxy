@@ -563,7 +563,9 @@ fn encode_normalized_request(
         match sys_content {
             CoreContent::Text { text, cache } => {
                 if cache.is_some() {
-                    tracing::warn!(
+                    // A cache hint with no effect on the model output;
+                    // exempt rather than a rejected field.
+                    tracing::debug!(
                         "OpenAI Chat: cache_control is not supported, dropping cache marker on system message"
                     );
                 }
@@ -928,7 +930,9 @@ fn collect_text(content: &[CoreContent]) -> String {
         match c {
             CoreContent::Text { text: t, cache } => {
                 if cache.is_some() {
-                    tracing::warn!(
+                    // A cache hint with no effect on the model output;
+                    // exempt rather than a rejected field.
+                    tracing::debug!(
                         "OpenAI Chat: cache_control is not supported, dropping cache marker"
                     );
                 }
@@ -1046,6 +1050,60 @@ mod tests {
         assert_eq!(
             body.messages[0].content,
             serde_json::Value::String("You are helpful".into())
+        );
+    }
+
+    // The Chat encoder reduces a tool result to its text, so an image inside
+    // `tool_result.content` would vanish silently; the cross-format walk must
+    // reject the request by name (surfaced as a 400) through `encode_request`,
+    // and the lossy twin keeps the old drop behaviour.
+    #[test]
+    fn image_inside_tool_result_is_rejected_by_encode_request() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: vec![
+                    CoreContent::Text {
+                        text: "see attachment".into(),
+                        cache: None,
+                    },
+                    CoreContent::Image {
+                        source: serde_json::json!({
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBOR"
+                        }),
+                    },
+                ],
+                is_error: false,
+                cache: None,
+            }],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let err = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .expect_err(
+                "the 400 for an uncarriable tool_result image must surface through encode_request",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("messages[0].content[0].content[1] type=image"),
+            "error must locate the inner image block: {msg}"
+        );
+
+        let mut lossy_target = make_target();
+        lossy_target.lossy = true;
+        let proxy_req = adapter
+            .encode_request(&core, &lossy_target, &client_wire(&core))
+            .expect("a lossy route keeps the old drop behaviour");
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "tool");
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::Value::String("see attachment".into()),
+            "a lossy route keeps the tool-result text and drops the image"
         );
     }
 

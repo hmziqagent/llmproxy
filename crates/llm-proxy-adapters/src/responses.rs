@@ -367,7 +367,9 @@ fn encode_content_item<'a>(
     match c {
         CoreContent::Text { text, cache } => {
             if cache.is_some() {
-                tracing::warn!("Responses: cache_control is not supported, dropping cache marker");
+                // A cache hint with no effect on the model output; exempt
+                // rather than a rejected field.
+                tracing::debug!("Responses: cache_control is not supported, dropping cache marker");
             }
             if !text.is_empty() {
                 text_parts.push(text.as_str());
@@ -646,18 +648,27 @@ impl ResponsesAdapter {
             max_output_tokens: core.sampling.max_tokens,
             extra: carried,
         };
-
-        if core.sampling.stop.as_ref().is_some_and(|s| !s.is_empty()) {
-            tracing::warn!(
-                "Responses: stop sequences specified but not forwarded; \
-                 the Responses API does not support this parameter"
+        // `metadata.user_id` carries to the Responses API's accepted
+        // top-level `user` field (attribution only, no semantic effect).
+        if let Some(user_id) = core.metadata.user_id.as_ref() {
+            req.extra.insert(
+                "user".to_owned(),
+                serde_json::Value::String(user_id.clone()),
             );
         }
-        if core.metadata.user_id.is_some() {
-            tracing::warn!(
-                "Responses: user_id specified but not forwarded; \
-                 the Responses API does not support this parameter"
-            );
+
+        if core.sampling.stop.as_ref().is_some_and(|s| !s.is_empty()) {
+            if target.lossy {
+                tracing::warn!(
+                    "lossy route: dropping stop sequences with no openai_responses equivalent"
+                );
+            } else {
+                return Err(ProviderError::InvalidRequest(
+                    "stop sequences have no openai_responses equivalent; \
+                     remove them or enable the route's lossy mode"
+                        .to_owned(),
+                ));
+            }
         }
 
         if let Some(ref tc) = core.tool_choice {
@@ -997,6 +1008,73 @@ mod tests {
             ResponsesInput::Message { role, .. } => assert_eq!(role, "user"),
             other => panic!("expected Message input item, got {other:?}"),
         }
+    }
+
+    // The Responses API has no stop-sequence parameter; a strict cross-format
+    // route must fail naming it instead of silently changing where generation
+    // stops, and the lossy twin restores the old warn-and-drop behaviour.
+    #[test]
+    fn stop_sequences_are_rejected_by_name() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.stop = Some(vec!["END".to_owned()]);
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let err = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .expect_err("stop sequences have no Responses equivalent on a strict route");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stop sequences"),
+            "error must name stop sequences: {msg}"
+        );
+        assert!(
+            msg.contains("lossy"),
+            "error must name the lossy opt-in: {msg}"
+        );
+
+        let mut lossy_target = make_target();
+        lossy_target.lossy = true;
+        let proxy_req = adapter
+            .encode_request(&core, &lossy_target, &client_wire(&core))
+            .expect("a lossy route drops stop sequences instead of failing");
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(
+            body.extra.get("stop").is_none(),
+            "a lossy route must not forward stop sequences: {:?}",
+            body.extra
+        );
+    }
+
+    // `metadata.user_id` carries to the Responses API's accepted top-level
+    // `user` field instead of being dropped.
+    #[test]
+    fn user_id_is_carried_as_user() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.metadata.user_id = Some("user_9f2".to_owned());
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .expect("user_id is carried to the Responses `user` field");
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body.extra.get("user"),
+            Some(&serde_json::json!("user_9f2")),
+            "the Responses body must carry the user id: {:?}",
+            body.extra
+        );
     }
 
     #[test]
