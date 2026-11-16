@@ -609,15 +609,19 @@ fn is_traced_mutation(command: &str) -> bool {
 }
 
 /// Records one snapshot of the live string keyspace, when tracing is on.
+///
+/// The trace lock is held across capture and push: a snapshot built while
+/// a newer snapshot was already pushed would record an older keyspace
+/// after a newer one, and the trace would show a monotonic value going
+/// backwards that the store never actually stored.
 fn trace_snapshot(db: &Arc<Db>) {
-    let tracing_on = db
+    let mut trace = db
         .trace
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_some();
-    if !tracing_on {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(trace) = trace.as_mut() else {
         return;
-    }
+    };
     let snapshot: KeySnapshot = {
         let strings = db
             .strings
@@ -629,12 +633,5 @@ fn trace_snapshot(db: &Arc<Db>) {
             .map(|(key, (value, _))| (key.clone(), value.clone()))
             .collect()
     };
-    if let Some(trace) = db
-        .trace
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_mut()
-    {
-        trace.push(snapshot);
-    }
+    trace.push(snapshot);
 }
