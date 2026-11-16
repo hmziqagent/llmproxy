@@ -1656,6 +1656,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_encode_failure_returns_500_and_keeps_the_completed_row() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        // OpenAI Chat upstream whose assistant message refuses and carries no
+        // content: the decode yields a `CoreContent::Refusal` block, which the
+        // Anthropic client encoder rejects (`encode_response` -> Encode
+        // error), after the engine has already settled the completed row.
+        let upstream = serde_json::to_vec(&json!({
+            "id": "chatcmpl-refusal",
+            "object": "chat.completion",
+            "created": 12345,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "I cannot answer that."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .unwrap();
+        let mock_url = spawn_mock_server(upstream, "application/json").await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_openai_chat_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("gpt-4o", false);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resp_body["type"], "error");
+        assert_eq!(resp_body["error"]["type"], "api_error");
+        assert_eq!(resp_body["error"]["message"], "internal server error");
+
+        let request_id = bus
+            .snapshot()
+            .iter()
+            .find_map(|e| match e {
+                ProxyEvent::RequestReceived(r) => Some(r.request_id.clone()),
+                _ => None,
+            })
+            .expect("the engine must record the received request");
+        let events = bus.snapshot();
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProxyEvent::ResponseCompleted(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "the settled upstream response must keep exactly one completed row: {events:?}"
+        );
+        assert_eq!(
+            completed[0].request_id, request_id,
+            "the completed row must belong to this request: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseFailed(f) if f.request_id == request_id)),
+            "a client re-encode failure must not write a failed row: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn openai_responses_provider_returns_anthropic_response() {
         let mock_url = spawn_mock_openai_responses_non_stream().await;
         let state = state_with_openai_responses_provider(&mock_url);
