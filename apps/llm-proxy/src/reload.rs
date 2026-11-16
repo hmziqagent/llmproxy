@@ -150,7 +150,11 @@ pub async fn reload_registry(
     // Build and validate the replacement engine from the proposed config
     // before touching anything live — including the config snapshot the
     // serving engine reads, so a refused build really applies nothing. The
-    // snapshot and engine slot then advance together.
+    // snapshot swap and the engine swap are two statements. This is safe
+    // because the restart-required gate above guarantees the snapshots are
+    // equal in everything the engine reads per stage (`[server]`, `[auth]`,
+    // `[storage]`, `[replica]`, `[mcp]`); a request observing the pair
+    // mid-swap sees an indistinguishable config.
     let next_config = std::sync::Arc::new(next);
     let engine = state
         .build_engine_from_parts_with_config(&std::sync::Arc::new(registry), egress, &next_config)
