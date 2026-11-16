@@ -58,6 +58,25 @@ fn upstream_always_ok() -> Router {
     )
 }
 
+/// The always-ok upstream, counting the requests that actually arrive, so a
+/// test can assert a refusal happened before any egress.
+fn upstream_always_ok_counting(arrivals: Arc<AtomicUsize>) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move || {
+            let arrivals = Arc::clone(&arrivals);
+            async move {
+                arrivals.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}"#,
+                )
+            }
+        }),
+    )
+}
+
 fn upstream_always_500() -> Router {
     Router::new().route(
         "/{*path}",
@@ -886,6 +905,51 @@ async fn per_key_allowlists_are_enforced_through_the_engine() {
         .execute(engine_request("someone-else", "gpt-4o"))
         .await
         .expect("keys without a policy are unrestricted");
+}
+
+/// Fix 05-11: a models-restricted key sending a request with no identifiable
+/// model — empty `requested` and, with no alias configured, an empty resolved
+/// upstream model — fails closed with 403 before any upstream call, the
+/// engine-level twin of
+/// [`allowlists_fail_closed_without_an_identifiable_model`]
+/// (`src/admission.rs`).
+#[tokio::test]
+async fn a_restricted_key_with_no_identifiable_model_is_refused_403_without_an_upstream_call() {
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_upstream(upstream_always_ok_counting(Arc::clone(&arrivals))).await;
+    let registry =
+        ProviderRegistry::from_providers(vec![provider(upstream, None)]).expect("registry");
+    let mut keys = HashMap::new();
+    keys.insert(
+        "scoped".to_owned(),
+        KeyPolicy {
+            allow_models: vec!["claude-*".to_owned()],
+            allow_providers: vec!["fake".to_owned()],
+            ..KeyPolicy::default()
+        },
+    );
+    let admission = Arc::new(PolicyAdmission::new(keys, HashMap::new(), HashMap::new()));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+
+    let error = engine
+        .execute(engine_request("scoped", ""))
+        .await
+        .expect_err("a restricted key with no identifiable model fails closed");
+    assert!(
+        matches!(error, EngineError::Forbidden(ref message) if message.contains("names none")),
+        "got {error:?}"
+    );
+    assert_eq!(error.status_code(), 403);
+    assert_eq!(
+        arrivals.load(Ordering::SeqCst),
+        0,
+        "the refusal must happen before any upstream call"
+    );
 }
 
 /// An admission that counts reservations, for the cache-hit rule.
