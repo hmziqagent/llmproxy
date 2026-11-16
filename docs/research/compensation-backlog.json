@@ -349,7 +349,7 @@
     },
     {
       "candidate": "Prompt-cache hygiene: normalize cache-busting volatile bytes (client correlation tokens, per-turn reminder blocks) before egress, keep any request mutation byte-stable past the last cache breakpoint, and optionally auto-inject cache markers",
-      "rationale": "llm-proxy performs no request-body normalization, no cache_control/prompt_cache_key injection, and has no mutation-safety boundary. ostk-cache measured cache_read going 0 -> 963K tokens/turn just by stripping one volatile token; sub2api engineered fingerprint convergence for the same effect; plano injects markers per provider family.",
+      "rationale": "llm-proxy performs no request-body normalization, no cache_control/prompt_cache_key injection, and has no mutation-safety boundary. ostk-cache measured cache_read going 0 -> 963K tokens/turn just by stripping one volatile token; sub2api engineered fingerprint convergence for the same effect; plano injects markers per provider family. Partly dropped: matching a vendor client's fingerprint (sub2api's fingerprint convergence) is not built (docs/goal.md Credentials; docs/README.md 'Not planned'); plan 06 delivers only operator-configured removal of volatile bytes and marker injection.",
       "area": "caching",
       "evidence": [
         "research-repos/os-tack__ostk-cache/src/billing_strip.rs",
