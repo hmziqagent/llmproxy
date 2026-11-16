@@ -18,7 +18,7 @@ log_level = "info"
 hot_reload = false
 # Requests per minute, keyed by the caller's client key id when
 # authenticated and by client IP otherwise. 0 disables rate limiting.
-# Direct loopback connections are exempt unless trust_forwarded_headers = true.
+# Unauthenticated direct loopback connections are exempt unless trust_forwarded_headers = true; callers with a client key are always limited.
 rate_limit_rpm = 100
 # Use X-Forwarded-For / X-Real-IP for client identity. Enable only behind a
 # trusted reverse proxy that overwrites these headers.
