@@ -21,15 +21,17 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    fn config_with_chat_limit(chat_max_body: usize) -> AppConfig {
-        let mut families = HashMap::new();
-        families.insert(
-            "chat_completions".to_owned(),
-            EndpointFamilyConfig {
-                max_body_bytes: chat_max_body,
-                request_timeout: Duration::from_secs(60),
-            },
-        );
+    fn config_with_limits(families: &[(&str, usize)]) -> AppConfig {
+        let mut family_configs = HashMap::new();
+        for (family, max_body_bytes) in families {
+            family_configs.insert(
+                (*family).to_owned(),
+                EndpointFamilyConfig {
+                    max_body_bytes: *max_body_bytes,
+                    request_timeout: Duration::from_secs(60),
+                },
+            );
+        }
         AppConfig {
             server: ServerConfig {
                 bind: "127.0.0.1:0".parse().expect("bind"),
@@ -47,7 +49,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
-                endpoint_families: families,
+                endpoint_families: family_configs,
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
@@ -82,7 +84,7 @@ mod tests {
         // The chat family is capped at 1 KiB; the messages family keeps the
         // 32 MiB default. The same oversized body must be rejected on one
         // family and accepted (past the limit layer) on the other.
-        let app = build_router(state(config_with_chat_limit(1024)));
+        let app = build_router(state(config_with_limits(&[("chat_completions", 1024)])));
 
         let big_body = vec![b'x'; 8 * 1024];
 
@@ -114,9 +116,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_dialect_families_have_their_own_body_limit() {
+        // Plan 08's new route families are wired to their own admission
+        // stack, so a per-family cap on each of them must reject the same
+        // oversized body, while the messages family (uncapped here) keeps
+        // the 32 MiB default.
+        let app = build_router(state(config_with_limits(&[
+            ("responses", 1024),
+            ("generate_content", 1024),
+            ("ollama", 1024),
+        ])));
+
+        let big_body = vec![b'x'; 8 * 1024];
+
+        for uri in [
+            "/providers/mock/v1/responses",
+            "/providers/mock/v1beta/models/m:generateContent",
+            "/providers/mock/api/chat",
+            "/providers/mock/api/generate",
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(big_body.clone()))
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("served");
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the 1 KiB limit on {uri}'s family must reject an 8 KiB body"
+            );
+        }
+
+        let messages = Request::builder()
+            .method("POST")
+            .uri("/providers/mock/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(big_body))
+            .expect("request");
+        let messages_response = app.oneshot(messages).await.expect("messages served");
+        assert_ne!(
+            messages_response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the messages family keeps the 32 MiB default and must not 413"
+        );
+    }
+
+    #[tokio::test]
+    async fn limits_on_one_new_family_do_not_leak_to_another() {
+        // Only the responses family is capped; the ollama family must keep
+        // the 32 MiB default and let the same oversized body past admission.
+        let app = build_router(state(config_with_limits(&[("responses", 1024)])));
+
+        let chat = Request::builder()
+            .method("POST")
+            .uri("/providers/mock/api/chat")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; 8 * 1024]))
+            .expect("request");
+        let chat_response = app.oneshot(chat).await.expect("chat served");
+        assert_ne!(
+            chat_response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the ollama family must not inherit the responses family's 1 KiB limit"
+        );
+    }
+
+    #[tokio::test]
     async fn families_default_to_the_server_wide_settings() {
         // No family overrides: both families share the 32 MiB default.
-        let app = build_router(state(config_with_chat_limit(usize::MAX)));
+        let app = build_router(state(config_with_limits(&[(
+            "chat_completions",
+            usize::MAX,
+        )])));
 
         let uri = Request::builder()
             .method("POST")
