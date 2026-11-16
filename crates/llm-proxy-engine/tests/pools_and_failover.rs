@@ -6,6 +6,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -1956,7 +1957,8 @@ async fn the_health_probe_clears_a_members_cooldown_when_it_recovers() {
     // input_tokens=2. The first request fails over to the spare and cools
     // "probed" for the advertised 300s; the probe (every 50ms) must clear
     // that cooldown so the next request reaches "probed" again.
-    let probed_endpoint = spawn_upstream(probed_upstream()).await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let probed_endpoint = spawn_upstream(probed_upstream(Arc::clone(&calls))).await;
     let spare_endpoint = spawn_upstream(upstream_json(StatusCode::OK, SPARE_OK_BODY)).await;
     let mut probed_member = member("probed", probed_endpoint, None);
     // The probe needs a model the member serves.
@@ -2014,14 +2016,87 @@ async fn the_health_probe_clears_a_members_cooldown_when_it_recovers() {
     );
 }
 
+/// The negative control for the probe test above: the same upstream (429
+/// with a 300s reset, then 200) recovers on its side, but with the probe
+/// off (`probe_interval = None`, the pool default) the engine never learns
+/// that — the advertised cooldown stands and no synthetic probe request
+/// ever reaches the upstream.
+#[tokio::test]
+async fn without_a_probe_a_cooled_member_stays_cooled_after_the_upstream_recovers() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let probed_endpoint = spawn_upstream(probed_upstream(Arc::clone(&calls))).await;
+    let spare_endpoint = spawn_upstream(upstream_json(StatusCode::OK, SPARE_OK_BODY)).await;
+    let mut probed_member = member("probed", probed_endpoint, None);
+    probed_member.model_aliases.insert(
+        "claude-sonnet-4-6".to_owned(),
+        "claude-sonnet-4-6".to_owned(),
+    );
+    let mut spare_member = member("spare", spare_endpoint, None);
+    spare_member.model_aliases.insert(
+        "claude-sonnet-4-6".to_owned(),
+        "claude-sonnet-4-6".to_owned(),
+    );
+    let cooldowns = Arc::new(CooldownStore::new());
+    let engine = build_engine_with_cooldowns(
+        vec![probed_member, spare_member],
+        vec![PoolConfig {
+            name: "probing".to_owned(),
+            members: vec!["probed".to_owned(), "spare".to_owned()],
+            retry: RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            affinity: Default::default(),
+            // The default: no probe interval, the probe is off.
+            health: llm_proxy_core::provider_config::PoolHealthConfig::default(),
+        }],
+        &cooldowns,
+    );
+
+    // First request: probed 429s (300s advertised reset) and the pool
+    // fails over to the spare.
+    let first = engine
+        .execute(engine_request("probing", false))
+        .await
+        .expect("the pool fails over to the spare");
+    assert_eq!(first.core.usage.input_tokens, 2, "the spare served it");
+    assert!(
+        !cooldowns
+            .provider_available("probed", time::OffsetDateTime::now_utc())
+            .await,
+        "the 429 with its 300s reset cools the member"
+    );
+
+    // Wait far longer than the positive test's 50ms probe interval (the
+    // same 20 × 50ms budget): the upstream would answer 200 by now, but
+    // nothing probes it, so the cooldown must stand.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !cooldowns
+                .provider_available("probed", time::OffsetDateTime::now_utc())
+                .await,
+            "without the probe the cooled member stays cooled past its wait"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the initial 429 reached the upstream: no probe ran and no later request did"
+    );
+}
+
 /// Serves one 429 with `Retry-After: 300`, then a distinguishable 200.
-fn probed_upstream() -> Router {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: AtomicU32 = AtomicU32::new(0);
+/// `calls` counts every request that reached the upstream; each test owns
+/// its counter, so tests sharing this fake stay independent.
+fn probed_upstream(calls: Arc<AtomicU32>) -> Router {
     Router::new().route(
         "/{*path}",
-        post(|| async {
-            let n = CALLS.fetch_add(1, Ordering::SeqCst);
+        post(move || async move {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
