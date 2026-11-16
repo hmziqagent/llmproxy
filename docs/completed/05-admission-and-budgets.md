@@ -32,9 +32,9 @@ proposes three different admission models, and this plan replaces them with one.
    Cache hits charge nothing and are recorded as hits.
 7. **Concurrency caps (backlog 30).** Limit in-flight requests per provider and model.
    When saturated, return 503 with a short `Retry-After`, not 429.
-8. **Preflight (backlog 4, conflict 15).** Warn by default. Reject only with a safety
-   margin or a provider token count, because non-OpenAI estimates use chars/4 and
-   counting ignores tools, tool results and images.
+8. **Preflight (backlog 4, conflict 15).** Warn by default. Reject only past a
+   configured safety margin: non-OpenAI estimates use chars/4 and ignore tools,
+   tool results and images. A provider token count is not used.
 9. **Pricing (backlog 22, BUG-24).** Add an opt-in sync from models.dev and an explicit
    unpriced state. Unpriced rows never show as $0 in summaries.
 

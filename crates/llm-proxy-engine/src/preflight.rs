@@ -9,7 +9,7 @@
 //! warn: an over-window estimate is logged and the request goes upstream,
 //! which answers with the authoritative count. `enforce` rejects only when
 //! the estimate clears the window by the configured margin, and only when
-//! the catalog knows the window at all.
+//! the catalog knows the window at all. A provider token count is not used.
 
 use llm_proxy_core::{Counter, MessageContent, PreflightConfig, PreflightMode};
 use llm_proxy_protocol::core::{CoreContent, CoreRequest, CoreRole};
