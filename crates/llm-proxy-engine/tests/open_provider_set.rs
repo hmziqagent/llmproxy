@@ -16,13 +16,14 @@ use llm_proxy_adapters::{
     ProtocolName, ProviderAdapter, ProviderAdapterTarget, ProviderStreamDecoder,
 };
 use llm_proxy_core::{
-    AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
-    ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+    AffinityConfig, AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
+    ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig,
 };
 use llm_proxy_engine::error::EngineError;
 use llm_proxy_engine::traits::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, Cache, CacheEntry, CacheKey,
-    CredentialSource, Guard, GuardDecision, UsageSink,
+    CredentialSource, Guard, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery, Router,
+    UsageSink,
 };
 use llm_proxy_engine::{
     ClientDialect, EngineBuilder, EngineRequest, EngineResponse, InboundRequest,
@@ -263,7 +264,7 @@ async fn spawn(app: axum::Router) -> String {
     format!("http://{addr}/echo")
 }
 
-fn echo_provider(endpoint: String) -> ProviderConfig {
+fn echo_provider(name: &str, endpoint: String) -> ProviderConfig {
     let mut adapters = HashMap::new();
     adapters.insert(
         "main".to_owned(),
@@ -281,7 +282,7 @@ fn echo_provider(endpoint: String) -> ProviderConfig {
         ..Default::default()
     };
     ProviderConfig {
-        name: "echo".to_owned(),
+        name: name.to_owned(),
         api_key: SecretString::from("configured-key"),
         auth_style: AuthStyle::Bearer,
         passthrough_auth: false,
@@ -332,8 +333,12 @@ fn config() -> AppConfig {
 }
 
 fn request(text: &str) -> EngineRequest {
+    request_for("echo", text)
+}
+
+fn request_for(provider: &str, text: &str) -> EngineRequest {
     EngineRequest::new(
-        "echo",
+        provider,
         ProviderRouteKind::Messages,
         ClientDialect::Anthropic,
         llm_proxy_protocol::core::CoreRequest {
@@ -391,7 +396,7 @@ async fn a_registered_custom_protocol_serves_through_the_pipeline() {
     let endpoint = spawn(upstream_app(Arc::clone(&seen))).await;
 
     let registry =
-        ProviderRegistry::from_providers(vec![echo_provider(endpoint)]).expect("registry");
+        ProviderRegistry::from_providers(vec![echo_provider("echo", endpoint)]).expect("registry");
     let engine = EngineBuilder::new(config())
         .register_adapter(Arc::new(EchoAdapter))
         .expect("custom adapter registers")
@@ -432,7 +437,7 @@ async fn the_engine_drives_admission_reserve_then_settle() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let endpoint = spawn(upstream_app(Arc::clone(&seen))).await;
     let registry =
-        ProviderRegistry::from_providers(vec![echo_provider(endpoint)]).expect("registry");
+        ProviderRegistry::from_providers(vec![echo_provider("echo", endpoint)]).expect("registry");
     let admission = Arc::new(RecordingAdmission::default());
 
     let engine = EngineBuilder::new(config())
@@ -458,6 +463,7 @@ async fn the_engine_drives_admission_reserve_then_settle() {
         .expect("adapter registers")
         .providers(Arc::new(
             ProviderRegistry::from_providers(vec![echo_provider(
+                "echo",
                 "http://127.0.0.1:9/echo".to_owned(),
             )])
             .expect("registry"),
@@ -486,6 +492,7 @@ async fn the_engine_drives_admission_reserve_then_settle() {
         .expect("adapter registers")
         .providers(Arc::new(
             ProviderRegistry::from_providers(vec![echo_provider(
+                "echo",
                 "http://127.0.0.1:9/echo".to_owned(),
             )])
             .expect("registry"),
@@ -549,6 +556,7 @@ async fn a_stream_task_that_panics_still_settles_its_reservation() {
         .expect("adapter registers")
         .providers(Arc::new(
             ProviderRegistry::from_providers(vec![echo_provider(
+                "echo",
                 "http://127.0.0.1:9/echo".to_owned(),
             )])
             .expect("registry"),
@@ -589,7 +597,7 @@ async fn a_custom_credential_source_rotates_keys() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let endpoint = spawn(upstream_app(Arc::clone(&seen))).await;
     let registry =
-        ProviderRegistry::from_providers(vec![echo_provider(endpoint)]).expect("registry");
+        ProviderRegistry::from_providers(vec![echo_provider("echo", endpoint)]).expect("registry");
 
     let engine = EngineBuilder::new(config())
         .register_adapter(Arc::new(EchoAdapter))
@@ -616,7 +624,7 @@ async fn a_custom_cache_serves_the_second_request_without_egress() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let endpoint = spawn(upstream_app(Arc::clone(&seen))).await;
     let registry =
-        ProviderRegistry::from_providers(vec![echo_provider(endpoint)]).expect("registry");
+        ProviderRegistry::from_providers(vec![echo_provider("echo", endpoint)]).expect("registry");
     let cache = Arc::new(HashMapCache::default());
 
     let engine = EngineBuilder::new(config())
@@ -678,8 +686,8 @@ fn event_request_id(event: &ProxyEvent) -> String {
 async fn a_custom_usage_sink_receives_the_ledger_events() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let endpoint = spawn(upstream_app(Arc::clone(&seen))).await;
-    let registry =
-        ProviderRegistry::from_providers(vec![echo_provider(endpoint.clone())]).expect("registry");
+    let registry = ProviderRegistry::from_providers(vec![echo_provider("echo", endpoint.clone())])
+        .expect("registry");
     let sink = Arc::new(CollectingSink::default());
 
     let engine = EngineBuilder::new(config())
@@ -717,7 +725,7 @@ async fn a_custom_usage_sink_receives_the_ledger_events() {
     let later_sink = Arc::new(CollectingSink::default());
     let bus = Arc::new(RecordingBus::new());
     let registry =
-        ProviderRegistry::from_providers(vec![echo_provider(endpoint)]).expect("registry");
+        ProviderRegistry::from_providers(vec![echo_provider("echo", endpoint)]).expect("registry");
     let engine = EngineBuilder::new(config())
         .register_adapter(Arc::new(EchoAdapter))
         .expect("adapter registers")
@@ -742,5 +750,111 @@ async fn a_custom_usage_sink_receives_the_ledger_events() {
             "response_completed"
         ],
         "the later-set sink receives the ledger rows"
+    );
+}
+
+/// A custom [`Router`] that ignores the provider the client addressed and
+/// pins every request to provider `b`, installed through
+/// [`EngineBuilder::router`] exactly as an SDK user would.
+#[derive(Debug)]
+struct PinnedRouter {
+    registry: Arc<ProviderRegistry>,
+}
+
+#[async_trait]
+impl Router for PinnedRouter {
+    async fn resolve(&self, query: &RouteQuery<'_>) -> Result<RoutePlan, EngineError> {
+        // Deliberately ignore `query.provider`: resolve the pinned member's
+        // adapter target through the same registry the default router uses.
+        let target = self
+            .registry
+            .resolve_provider_route("b", query.route_kind, query.requested_model)
+            .map_err(EngineError::from_route_error)?;
+        Ok(RoutePlan {
+            route: query.provider.to_owned(),
+            candidates: vec![ResolvedTarget { target }],
+            retry: RetryConfig {
+                max_attempts: 1,
+                backoff: std::time::Duration::ZERO,
+                cooldown: std::time::Duration::from_secs(30),
+                total_timeout: std::time::Duration::ZERO,
+                hold: std::time::Duration::ZERO,
+            },
+            affinity: AffinityConfig::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_custom_router_chooses_the_target() {
+    let seen_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint_a = spawn(upstream_app(Arc::clone(&seen_a))).await;
+    let endpoint_b = spawn(upstream_app(Arc::clone(&seen_b))).await;
+
+    // Provider b aliases the requested model, so its upstream echo carries
+    // "b-upstream-model" — the only way to tell whose upstream answered.
+    let mut provider_b = echo_provider("b", endpoint_b);
+    provider_b
+        .model_aliases
+        .insert("echo-model".to_owned(), "b-upstream-model".to_owned());
+    let registry = Arc::new(
+        ProviderRegistry::from_providers(vec![echo_provider("a", endpoint_a), provider_b])
+            .expect("registry"),
+    );
+    let bus = Arc::new(RecordingBus::new());
+
+    let engine = EngineBuilder::new(config())
+        .register_adapter(Arc::new(EchoAdapter))
+        .expect("adapter registers")
+        .providers(Arc::clone(&registry))
+        .router(Arc::new(PinnedRouter {
+            registry: Arc::clone(&registry),
+        }) as Arc<dyn Router>)
+        .event_bus(Arc::clone(&bus) as Arc<dyn EventBus>)
+        .build()
+        .expect("engine builds");
+
+    let response = engine
+        .execute(request_for("a", "hello"))
+        .await
+        .expect("execute");
+    let text = match response.core.content.first() {
+        Some(llm_proxy_protocol::core::CoreContent::Text { text, .. }) => text.clone(),
+        _ => String::new(),
+    };
+    assert!(
+        text.contains("b-upstream-model"),
+        "the response must come from provider b's upstream: {text}"
+    );
+    assert!(
+        seen_a.lock().expect("upstream lock").is_empty(),
+        "provider a's upstream must see zero calls: {:?}",
+        seen_a.lock().expect("upstream lock")
+    );
+    assert_eq!(
+        seen_b.lock().expect("upstream lock").len(),
+        1,
+        "provider b's upstream serves the attempt"
+    );
+
+    let attempts: Vec<llm_proxy_storage::AttemptCompleted> = bus
+        .snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            ProxyEvent::AttemptCompleted(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts.len(), 1, "exactly one attempt row");
+    assert_eq!(
+        attempts.first().map(|row| row.provider.as_str()),
+        Some("b"),
+        "the attempt row names provider b"
+    );
+    assert_eq!(
+        attempts.first().map(|row| row.route.as_str()),
+        Some("a"),
+        "the row keeps the client's route"
     );
 }
