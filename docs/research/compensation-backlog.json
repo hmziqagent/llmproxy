@@ -158,7 +158,7 @@
         "Wei-Shaw/sub2api"
       ],
       "priority": "high",
-      "crate": "llm-proxy-engine + llm-proxy-store (server + storage per audit G; the old 'core' mapping was wrong)",
+      "crate": "llm-proxy-engine + llm-proxy-server + llm-proxy-storage (admission model; audit G — the old 'core' mapping was wrong)",
       "plan": "05"
     },
     {
