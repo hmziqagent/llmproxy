@@ -20,9 +20,9 @@ mod tests {
     };
     use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
-        AppConfig, AuthStyle, PoolConfig, PoolFile, ProviderAdapterConfig, ProviderCatalogConfig,
-        ProviderCatalogMode, ProviderConfig, ProviderRegistry, ProviderRouteKind,
-        ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
+        AppConfig, AuthStyle, PoolConfig, PoolFile, PromptCacheConfig, ProviderAdapterConfig,
+        ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig, ProviderRegistry,
+        ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
     };
     use llm_proxy_server::{AppState, BuildInfo, build_router};
     use llm_proxy_storage::{
@@ -1537,6 +1537,49 @@ mod tests {
             upstream_body["previous_response_id"], "resp_prev_01",
             "conversation continuity must survive passthrough"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_applies_configured_prompt_hygiene() {
+        // Passthrough is JSON-value equal, not byte-for-byte: an operator's
+        // `[provider.prompt_cache].strip_volatile` pointers are also removed
+        // from the raw body on its way upstream (plan 06 phase 3 runs at the
+        // provider edge for same-format hops too).
+        let upstream = spawn_fake_upstream(Behavior::ResponsesNonStream).await;
+        let mut provider = provider_config(
+            "dialect-provider",
+            &upstream,
+            "openai_responses",
+            ProviderRouteKind::Responses,
+            false,
+            None,
+        );
+        provider.prompt_cache = Some(PromptCacheConfig {
+            strip_volatile: vec!["/instructions".to_owned()],
+            inject_markers: false,
+        });
+        let app = build_router(state_from(vec![provider], Vec::new()));
+        let body = responses_request(false);
+        let response = app
+            .oneshot(post_json("/providers/dialect-provider/v1/responses", &body))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let upstream_body = captured(&upstream).await;
+        assert!(
+            upstream_body.get("instructions").is_none(),
+            "the configured strip_volatile pointer must be stripped from the \
+             passthrough body, got {upstream_body}"
+        );
+        // Only the configured pointer is removed: every other field is
+        // intact and the model rewrite still applies (identity here, as no
+        // alias is configured).
+        assert_eq!(upstream_body["input"], body["input"]);
+        assert_eq!(upstream_body["tools"], body["tools"]);
+        assert_eq!(upstream_body["store"], body["store"]);
+        assert_eq!(upstream_body["stream"], body["stream"]);
+        assert_eq!(upstream_body["model"], body["model"]);
     }
 
     #[tokio::test]
