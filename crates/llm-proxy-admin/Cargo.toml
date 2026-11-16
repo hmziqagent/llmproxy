@@ -31,7 +31,9 @@ time = { workspace = true }
 tower-http = { version = "0.6", features = ["set-header", "trace", "catch-panic"] }
 
 [dev-dependencies]
+llm-proxy-protocol = { workspace = true }
 llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }
 llm-proxy-server = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

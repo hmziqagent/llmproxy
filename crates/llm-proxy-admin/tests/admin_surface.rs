@@ -6,22 +6,134 @@
 #![cfg(test)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use llm_proxy_admin::{AdminSurface, KeyPolicyInput, ManagedKeys};
+use llm_proxy_protocol::core::{ModelRef, StopReason, Usage, UsageProvenance};
+use llm_proxy_storage::{
+    EventBus, ProxyEvent, RequestReceived, ResponseCompleted, RetentionPolicy, SqliteEventBus,
+    UsageReader,
+};
+use time::OffsetDateTime;
 use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "admin-secret";
 
-fn surface() -> Router {
-    let keys = Arc::new(ManagedKeys::in_memory().expect("key store"));
-    let usage = llm_proxy_storage::UsageReader::new(":memory:");
-    AdminSurface::new(ADMIN_TOKEN)
-        .keys(keys)
-        .usage(usage)
-        .router()
+/// Unbounded retention (the `sqlite.rs` test-helper shape): nothing prunes
+/// the seeded rows out from under the reader.
+fn unbounded_retention() -> RetentionPolicy {
+    RetentionPolicy {
+        max_age: None,
+        max_rows: None,
+        prune_every: Duration::from_secs(3600),
+    }
+}
+
+/// One request/complete pair written into the ledger: a completed
+/// `chat_completions` request with reported usage and no computed cost.
+fn emit_pair(
+    bus: &SqliteEventBus,
+    id: &str,
+    caller: &str,
+    provider: &str,
+    received_at: OffsetDateTime,
+) {
+    bus.emit(&ProxyEvent::RequestReceived(RequestReceived {
+        request_id: id.to_owned(),
+        timestamp: received_at,
+        caller: caller.to_owned(),
+        provider: provider.to_owned(),
+        route_kind: "chat_completions".to_owned(),
+        client_protocol: "openai_chat".to_owned(),
+        model: ModelRef {
+            requested: "claude-3".to_owned(),
+            upstream: None,
+        },
+        streaming: false,
+        body_hash: "sha256-digest-only".to_owned(),
+        session_id: None,
+    }));
+    bus.emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
+        request_id: id.to_owned(),
+        timestamp: received_at + Duration::from_secs(1),
+        provider: provider.to_owned(),
+        upstream_message_id: None,
+        model: ModelRef {
+            requested: "claude-3".to_owned(),
+            upstream: None,
+        },
+        usage: Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            provenance: UsageProvenance::ProviderReported,
+            ..Usage::default()
+        },
+        cost: None,
+        stop_reason: StopReason::EndTurn,
+        latency_ms: 12,
+        credential_id: None,
+        cache_hit: false,
+    }));
+}
+
+/// Flush and stop the ledger's background writer. `SqliteEventBus` writes
+/// on a separate task, so the reader must only open after this.
+async fn drain_ledger(bus: SqliteEventBus) {
+    tokio::task::spawn_blocking(move || EventBus::close(&bus))
+        .await
+        .expect("the ledger writer drains");
+}
+
+/// The admin surface over a real (empty) SQLite ledger, so an
+/// authenticated usage route answers 200 with empty data instead of the
+/// 500 envelope a broken reader produces. The caller keeps the `TempDir`
+/// alive for as long as the router lives: the reader opens the ledger
+/// file by path per query, so dropping the directory silently breaks
+/// every view.
+async fn surface() -> (Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = dir.path().join("usage.db");
+    let bus = SqliteEventBus::open(&ledger, unbounded_retention()).expect("ledger opens");
+    drain_ledger(bus).await;
+    let app = AdminSurface::new(ADMIN_TOKEN)
+        .keys(Arc::new(ManagedKeys::in_memory().expect("key store")))
+        .usage(UsageReader::new(&ledger))
+        .router();
+    (app, dir)
+}
+
+/// The usage surface over a seeded ledger: two completed requests for
+/// caller `key-a` on provider `p1` and one for `key-b` on `p2`, with
+/// staggered timestamps so `(received_at, request_id)` ordering is
+/// deterministic (`req-b1` is the newest row).
+async fn surface_with_usage() -> (Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = dir.path().join("usage.db");
+    let bus = SqliteEventBus::open(&ledger, unbounded_retention()).expect("ledger opens");
+    let base = OffsetDateTime::now_utc();
+    emit_pair(
+        &bus,
+        "req-a1",
+        "key-a",
+        "p1",
+        base - Duration::from_secs(20),
+    );
+    emit_pair(
+        &bus,
+        "req-a2",
+        "key-a",
+        "p1",
+        base - Duration::from_secs(10),
+    );
+    emit_pair(&bus, "req-b1", "key-b", "p2", base);
+    drain_ledger(bus).await;
+    let app = AdminSurface::new(ADMIN_TOKEN)
+        .usage(UsageReader::new(&ledger))
+        .router();
+    (app, dir)
 }
 
 fn get(path: &str) -> Request<Body> {
@@ -56,7 +168,7 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn every_route_requires_the_admin_token() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     for path in ["/keys", "/config", "/usage/summary", "/"] {
         let unauthenticated = app
             .clone()
@@ -92,7 +204,7 @@ async fn every_route_requires_the_admin_token() {
 
 #[tokio::test]
 async fn responses_are_never_cacheable() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     let response = app.oneshot(get("/keys")).await.expect("response");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -107,7 +219,7 @@ async fn responses_are_never_cacheable() {
 
 #[tokio::test]
 async fn a_key_lives_a_full_lifecycle_through_http() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     // Create.
     let created = app
         .clone()
@@ -200,7 +312,7 @@ async fn an_issued_token_authenticates_through_client_auth() {
 /// and store nothing.
 #[tokio::test]
 async fn a_malformed_usd_per_day_answers_400_and_stores_nothing() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     let refused = app
         .clone()
         .oneshot(post("/keys", Some(r#"{"usd_per_day": "five"}"#.to_owned())))
@@ -224,7 +336,7 @@ async fn a_malformed_usd_per_day_answers_400_and_stores_nothing() {
 
 #[tokio::test]
 async fn the_web_ui_serves_and_names_the_surface() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     let response = app.oneshot(get("/")).await.expect("response");
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
@@ -247,7 +359,7 @@ async fn the_web_ui_serves_and_names_the_surface() {
 /// header validation with `-32020`, unknown methods 404 with `-32601`.
 #[tokio::test]
 async fn mcp_tools_list_and_call_behind_the_same_token() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
 
     let listed = app
         .clone()
@@ -299,7 +411,7 @@ async fn mcp_tools_list_and_call_behind_the_same_token() {
 
 #[tokio::test]
 async fn mcp_protocol_rules_are_enforced() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
 
     // Missing protocol-version header.
     let missing = app
@@ -406,7 +518,7 @@ async fn mcp_protocol_rules_are_enforced() {
 
 #[tokio::test]
 async fn mcp_create_key_tool_issues_a_working_token() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     let called = app
         .oneshot(mcp_post(
             r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"create_key","arguments":{"rpm":10}}}"#.to_owned(),
@@ -429,7 +541,7 @@ async fn mcp_create_key_tool_issues_a_working_token() {
 /// surface) answers -32603 internal error.
 #[tokio::test]
 async fn mcp_tool_failures_map_client_and_server_blame() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     let invalid = app
         .oneshot(mcp_post(
             r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"create_key","arguments":{"usd_per_day":"five"}}}"#.to_owned(),
@@ -555,11 +667,204 @@ async fn metrics_route_serves_prometheus_text_behind_the_admin_token() {
 /// store.
 #[tokio::test]
 async fn without_metrics_attached_the_route_does_not_exist() {
-    let app = surface();
+    let (app, _ledger) = surface().await;
     let response = app.oneshot(get("/metrics")).await.expect("response");
     assert_eq!(
         response.status(),
         StatusCode::NOT_FOUND,
         "/metrics must not exist unless the metrics registry is attached"
+    );
+}
+
+/// The read-only usage views over a seeded ledger, asserted at the HTTP
+/// body level (plan 09-10): the grouped summary, the validation refusals,
+/// request-row paging, and the per-caller list.
+#[tokio::test]
+async fn usage_summary_returns_grouped_counts() {
+    let (app, _ledger) = surface_with_usage().await;
+    let body = json_body(
+        app.oneshot(get("/usage/summary?window=24h&group_by=provider"))
+            .await
+            .expect("response"),
+    )
+    .await;
+    assert_eq!(body["group_by"].as_str(), Some("provider"), "got {body}");
+    let groups = body["groups"].as_array().expect("groups array");
+    assert_eq!(groups.len(), 2, "one group per provider, got {body}");
+    assert_eq!(groups[0]["key"].as_str(), Some("p1"), "got {body}");
+    assert_eq!(
+        groups[0]["requests"].as_i64(),
+        Some(2),
+        "p1 served both key-a requests, got {body}"
+    );
+    assert_eq!(groups[1]["key"].as_str(), Some("p2"), "got {body}");
+    assert_eq!(
+        groups[1]["requests"].as_i64(),
+        Some(1),
+        "p2 served key-b's single request, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn usage_summary_rejects_a_bad_window_and_group() {
+    let (app, _ledger) = surface_with_usage().await;
+    for (query, blame) in [
+        ("window=nope", "window"),
+        ("window=0s", "positive"),
+        ("group_by=team", "group_by"),
+    ] {
+        let refused = app
+            .clone()
+            .oneshot(get(&format!("/usage/summary?{query}")))
+            .await
+            .expect("response");
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "{query} is a client mistake and must answer 400"
+        );
+        let body = json_body(refused).await;
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "{query} must use the invalid-request envelope, got {body}"
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(blame),
+            "the refusal names its blame ({blame}): {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_requests_pages_and_filters() {
+    let (app, _ledger) = surface_with_usage().await;
+    let page = json_body(
+        app.clone()
+            .oneshot(get("/usage/requests?limit=1"))
+            .await
+            .expect("response"),
+    )
+    .await;
+    let rows = page["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "the limit caps the page: {page}");
+    assert_eq!(
+        rows[0]["request_id"].as_str(),
+        Some("req-b1"),
+        "rows order newest-first: {page}"
+    );
+    assert!(
+        page["next_cursor"].as_str().is_some(),
+        "a fuller ledger hands back a cursor: {page}"
+    );
+
+    let filtered = json_body(
+        app.clone()
+            .oneshot(get("/usage/requests?provider=p2"))
+            .await
+            .expect("response"),
+    )
+    .await;
+    let rows = filtered["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "the provider filter narrows to one row");
+    assert_eq!(rows[0]["provider"].as_str(), Some("p2"));
+    assert!(
+        filtered["next_cursor"].is_null(),
+        "a single matching row is the whole page: {filtered}"
+    );
+
+    for bad in ["limit=0", "limit=1001"] {
+        let refused = app
+            .clone()
+            .oneshot(get(&format!("/usage/requests?{bad}")))
+            .await
+            .expect("response");
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad} is a client mistake, not a server failure"
+        );
+        let body = json_body(refused).await;
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "{bad} must use the invalid-request envelope, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_keys_lists_the_callers() {
+    let (app, _ledger) = surface_with_usage().await;
+    let body = json_body(app.oneshot(get("/usage/keys")).await.expect("response")).await;
+    let callers: Vec<&str> = body["callers"]
+        .as_array()
+        .expect("callers array")
+        .iter()
+        .map(|entry| entry["caller"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(callers.len(), 2, "one entry per caller, got {body}");
+    assert!(
+        callers.contains(&"key-a") && callers.contains(&"key-b"),
+        "both seeded callers are listed, got {callers:?}"
+    );
+}
+
+/// The MCP `usage_summary` tool and the REST route share
+/// `usage_summary_json` verbatim, so their payloads must agree. The
+/// `since_ms`/`until_ms` bounds are sampled per request, so only their
+/// presence is compared.
+#[tokio::test]
+async fn the_mcp_usage_summary_tool_matches_the_rest_route() {
+    let (app, _ledger) = surface_with_usage().await;
+    let rest = json_body(
+        app.clone()
+            .oneshot(get("/usage/summary?window=24h&group_by=provider"))
+            .await
+            .expect("response"),
+    )
+    .await;
+    let called = app
+        .oneshot(mcp_post(
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"usage_summary","arguments":{"window":"24h","group_by":"provider"}}}"#.to_owned(),
+            Some("tools/call"),
+            Some("usage_summary"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(called.status(), StatusCode::OK);
+    let body = json_body(called).await;
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content block");
+    let tool_payload: serde_json::Value = serde_json::from_str(text).expect("tool payload is JSON");
+    assert_eq!(
+        tool_payload["group_by"], rest["group_by"],
+        "same arguments, same grouping"
+    );
+    assert_eq!(
+        tool_payload["groups"], rest["groups"],
+        "the MCP tool and the REST route must return the same groups"
+    );
+    assert!(
+        tool_payload["since_ms"].is_i64() && tool_payload["until_ms"].is_i64(),
+        "the window bounds are present: {tool_payload}"
+    );
+}
+
+/// A surface built without `.usage(...)` answers the handler's own
+/// internal-error envelope — not a panic, not a route loss.
+#[tokio::test]
+async fn a_surface_without_usage_reports_an_error_not_a_panic() {
+    let bare = AdminSurface::new(ADMIN_TOKEN).router();
+    let response = bare.oneshot(get("/usage/summary")).await.expect("response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"].as_str(), Some("internal_error"));
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no usage views were attached"),
+        "the envelope explains the missing attachment: {message}"
     );
 }

@@ -303,9 +303,9 @@ async fn usage_requests(
         .and_then(|raw| raw.parse::<i64>().ok())
         .unwrap_or(100);
     if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
-        return admin_error(format!(
+        return action_error(AdminActionError::invalid(format!(
             "limit must be between 1 and {MAX_PAGE_LIMIT}, got {limit}"
-        ));
+        )));
     }
     let page = reader
         .requests(RequestFilter {

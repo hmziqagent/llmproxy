@@ -117,6 +117,8 @@ vergen-gix = "1"
 
 # Misc
 uuid = { version = "1", features = ["v4"] }
+# Test-only scratch directories (temp ledgers, config files)
+tempfile = "3"
 
 [workspace.lints.rust]
 # Lint groups need strictly lower priority (more negative) than
