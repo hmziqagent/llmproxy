@@ -696,16 +696,13 @@ impl StreamEncoder {
                 }));
             }
 
-            CoreEvent::ContentStart { index, kind } => {
-                match kind {
-                    ContentKind::ToolUse => {}
-                    ContentKind::Text | ContentKind::Thinking => {}
-                    _ => {
-                        tracing::warn!(kind = ?kind, "unsupported ContentKind in OpenAI stream");
-                    }
+            CoreEvent::ContentStart { kind, .. } => match kind {
+                ContentKind::ToolUse => {}
+                ContentKind::Text | ContentKind::Thinking => {}
+                _ => {
+                    tracing::warn!(kind = ?kind, "unsupported ContentKind in OpenAI stream");
                 }
-                let _ = index;
-            }
+            },
 
             CoreEvent::TextDelta { text, .. } => {
                 chunks.push(self.make_chunk(Choice {

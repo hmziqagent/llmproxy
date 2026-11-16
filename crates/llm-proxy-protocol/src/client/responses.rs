@@ -980,13 +980,11 @@ impl StreamEncoder {
                 );
                 events.push(self.event("response.created", payload));
             }
-            CoreEvent::ContentStart { index, kind } => {
+            CoreEvent::ContentStart { kind, .. } => {
                 // A new content block closes the open text/reasoning item;
                 // tool items open on their own ToolCallStart event.
                 match kind {
-                    ContentKind::ToolUse => {
-                        let _ = index;
-                    }
+                    ContentKind::ToolUse => {}
                     ContentKind::Text => {
                         self.close_open_items(&mut events);
                         let open = OpenText {
