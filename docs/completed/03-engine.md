@@ -113,8 +113,11 @@ Every feature takes one of these places, in this order:
 - **Server (step 6).** `llm-proxy-server` keeps routes, middleware and
   error mapping; `build_router(AppState)` is unchanged. `AppState`
   materializes the engine on first use.
-- **Boundaries (step 7).** Admin reads go through
-  `llm-proxy-storage::UsageReader` (the api crate no longer opens SQLite);
+- **Boundaries (step 7).** Admin usage reads moved out of
+  `llm-proxy-api` into `llm-proxy-storage::UsageReader`: the `api` crate
+  contains no SQL, but the process still reads the SQLite ledger through
+  storage's `sqlite` feature (the admin surface's managed-key store keeps
+  its own SQLite table). A backend-neutral reader trait is not built.
   `PidManager` moved to the app (`apps/llm-proxy/src/pid/`).
 - **Endpoint families (step 8).** `[server.endpoint_families.<name>]`
   sets `max_body_bytes` and `request_timeout` per family; the router layers
