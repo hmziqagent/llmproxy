@@ -478,8 +478,14 @@ async fn modes_declare_what_a_guard_sees() {
 }
 
 /// A tracing subscriber that collects warn-level event messages, so the
-/// fail-open path's warning is observable in-process without racing other
-/// tests (thread-local dispatcher, no global state).
+/// fail-open path's warning is observable in-process. It installs as the
+/// process-global default on purpose: warn events are gated by a
+/// process-global per-callsite interest cache, and a subscriber that is
+/// only thread-local loses to sibling tests firing the same callsite
+/// without one (their first registration can cache `Interest::never`,
+/// which silences the event for every later observer). Stray sibling
+/// events may land in the capture; assertions read the events emitted
+/// after the test installed the subscriber.
 #[derive(Debug, Default, Clone)]
 struct WarnCapture {
     messages: Arc<std::sync::Mutex<Vec<String>>>,
@@ -569,7 +575,8 @@ async fn a_mask_rule_in_a_deny_only_guard_is_allowed_with_a_warning_under_fail_o
     let guard = Guardrail::deny_only(Arc::new(rule), FailPolicy::Open);
     let capture = WarnCapture::default();
     let reader = capture.clone();
-    let _subscriber = tracing::subscriber::set_default(capture);
+    tracing::subscriber::set_global_default(capture).expect("global warn capture");
+    let observed = reader.messages.lock().expect("capture lock").len();
 
     let decision = guard
         .inspect_request(&core_request(false, "rotate sk-clientsecret77 now"))
@@ -578,7 +585,7 @@ async fn a_mask_rule_in_a_deny_only_guard_is_allowed_with_a_warning_under_fail_o
         matches!(decision, Ok(GuardDecision::Allow)),
         "fail open must serve the request, got {decision:?}"
     );
-    let messages = reader.messages.lock().expect("capture lock").clone();
+    let messages = reader.messages.lock().expect("capture lock").clone()[observed..].to_vec();
     assert!(
         messages
             .iter()
