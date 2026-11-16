@@ -31,34 +31,8 @@ pub async fn apply_replica(
     };
     let url = replica.url.expose_secret();
     match replica.backend {
-        ReplicaBackend::Redis => {
-            #[cfg(feature = "store-redis")]
-            {
-                redis_replica(url, &replica.prefix, registry, state, pair).await
-            }
-            #[cfg(not(feature = "store-redis"))]
-            {
-                let _ = (url, registry, state, pair);
-                anyhow::bail!(
-                    "[replica] backend \"redis\" is configured but this build lacks the \
-                     store-redis feature; rebuild with --features store-redis"
-                );
-            }
-        }
-        ReplicaBackend::Postgres => {
-            #[cfg(feature = "store-postgres")]
-            {
-                postgres_replica(url, registry, state, pair).await
-            }
-            #[cfg(not(feature = "store-postgres"))]
-            {
-                let _ = (url, registry, state, pair);
-                anyhow::bail!(
-                    "[replica] backend \"postgres\" is configured but this build lacks the \
-                     store-postgres feature; rebuild with --features store-postgres"
-                );
-            }
-        }
+        ReplicaBackend::Redis => redis_replica(url, &replica.prefix, registry, state, pair).await,
+        ReplicaBackend::Postgres => postgres_replica(url, registry, state, pair).await,
     }
 }
 
@@ -105,6 +79,23 @@ async fn redis_replica(
     Ok((state, Some(installer)))
 }
 
+/// The Redis arm in a build without the `store-redis` feature: a startup
+/// refusal naming the feature and the rebuild fix, never a silent
+/// single-node fallback.
+#[cfg(not(feature = "store-redis"))]
+async fn redis_replica(
+    _url: &str,
+    _prefix: &str,
+    _registry: &ProviderRegistry,
+    _state: AppState,
+    _pair: Option<Arc<llm_proxy_server::SwappingAuthPair>>,
+) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
+    anyhow::bail!(
+        "[replica] backend \"redis\" is configured but this build lacks the \
+         store-redis feature; rebuild with --features store-redis"
+    );
+}
+
 /// The Postgres arm of [`apply_replica`]: the same wiring over the
 /// Postgres store, plus the stale-row purge timer.
 #[cfg(feature = "store-postgres")]
@@ -139,6 +130,21 @@ async fn postgres_replica(
         llm_proxy_store_postgres::replica_admission_over_config(auth, providers, store.clone())
     });
     Ok((state, Some(installer)))
+}
+
+/// The Postgres arm in a build without the `store-postgres` feature: the
+/// same startup refusal posture as the Redis arm.
+#[cfg(not(feature = "store-postgres"))]
+async fn postgres_replica(
+    _url: &str,
+    _registry: &ProviderRegistry,
+    _state: AppState,
+    _pair: Option<Arc<llm_proxy_server::SwappingAuthPair>>,
+) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
+    anyhow::bail!(
+        "[replica] backend \"postgres\" is configured but this build lacks the \
+         store-postgres feature; rebuild with --features store-postgres"
+    );
 }
 
 /// Installs the replica-shared admission step: into the daemon's swap
@@ -199,4 +205,108 @@ fn spawn_purge_timer(store: llm_proxy_store_postgres::PostgresStore) {
             }
         }
     });
+}
+
+#[cfg(not(all(feature = "store-redis", feature = "store-postgres")))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
+    use llm_proxy_transport::ProxyClient;
+
+    /// A `[replica]` config shaped like the one
+    /// `tests/redis_replica_managed_keys.rs` boots against, pointed at a
+    /// URL with no store behind it: the feature-off refusal must fire
+    /// before any connection is attempted.
+    fn replica_config(backend: ReplicaBackend, url: &str) -> AppConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backend = match backend {
+            ReplicaBackend::Redis => "redis",
+            ReplicaBackend::Postgres => "postgres",
+        };
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3463"
+request_timeout = "300s"
+log_level = "info"
+server_name = "replica-refusal"
+
+[replica]
+backend = "{backend}"
+url = "{url}"
+prefix = "llm-proxy"
+"#
+            ),
+        )
+        .unwrap();
+        llm_proxy_core::load_app_config(&path).unwrap()
+    }
+
+    /// The state exactly as `load_toml_state_from_config` builds it before
+    /// it calls [`apply_replica`]: the config's phase-shaped client, an
+    /// empty registry, the builtin adapters.
+    fn replica_state(config: &AppConfig, registry: &ProviderRegistry) -> AppState {
+        let proxy_client =
+            ProxyClient::try_with_timeouts(&config.server.upstream_timeouts).unwrap();
+        AppState::new_with_catalog_dir(
+            config.clone(),
+            registry.clone(),
+            ProviderAdapterRegistry::builtin(),
+            proxy_client,
+            crate::state::build_info(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A `[replica]` naming Redis in a build without store-redis is a
+    /// startup refusal that names the feature and the rebuild fix — never
+    /// a silent single-node fallback.
+    #[cfg(not(feature = "store-redis"))]
+    #[tokio::test]
+    async fn a_redis_replica_without_the_feature_refuses_to_start() {
+        let config = replica_config(ReplicaBackend::Redis, "redis://127.0.0.1:1");
+        let registry = ProviderRegistry::from_providers([]).unwrap();
+        let state = replica_state(&config, &registry);
+
+        let result = apply_replica(&config, &registry, state, None).await;
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("store-redis")
+                        && message.contains("rebuild with --features store-redis"),
+                    "the refusal names the feature and the rebuild fix, got: {message}"
+                );
+            }
+            Ok(_) => panic!("a redis [replica] must never start single-node silently"),
+        }
+    }
+
+    /// The same posture for Postgres: without store-postgres the daemon
+    /// refuses to start rather than serving single-node.
+    #[cfg(not(feature = "store-postgres"))]
+    #[tokio::test]
+    async fn a_postgres_replica_without_the_feature_refuses_to_start() {
+        let config = replica_config(ReplicaBackend::Postgres, "postgres://127.0.0.1:1/llmproxy");
+        let registry = ProviderRegistry::from_providers([]).unwrap();
+        let state = replica_state(&config, &registry);
+
+        let result = apply_replica(&config, &registry, state, None).await;
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("store-postgres")
+                        && message.contains("rebuild with --features store-postgres"),
+                    "the refusal names the feature and the rebuild fix, got: {message}"
+                );
+            }
+            Ok(_) => panic!("a postgres [replica] must never start single-node silently"),
+        }
+    }
 }
