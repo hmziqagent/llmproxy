@@ -50,10 +50,24 @@ async fn load_serve_state(
 
 /// The `--background` path: the parent only logs spawn failures; the
 /// daemon child runs this same command with `--daemonize` and initializes
-/// tracing itself from the resolved config.
-fn spawn_in_background(config_path: Option<&Path>, port_override: Option<u16>) -> Result<()> {
-    init_tracing(&LogFormat::from_env());
-    spawn_daemon(config_path, port_override)
+/// tracing itself. The parent resolves `server.log_format` from the same
+/// resolved config path the child will load (BUG-25, with `RUST_LOG_FORMAT`
+/// still winning) so both processes log in the same shape.
+fn spawn_in_background(path: &Path, port_override: Option<u16>) -> Result<()> {
+    init_tracing(&resolve_parent_log_format(path));
+    spawn_daemon(Some(path), port_override)
+}
+
+/// The log format the `--background` parent should initialize tracing with:
+/// `server.log_format` from the config the daemon child will load, with
+/// `RUST_LOG_FORMAT` still winning. A config that cannot be loaded here
+/// falls back to [`LogFormat::from_env`] instead of failing the parent — the
+/// child reports the real load error, so this must not turn it into a
+/// different parent-side failure.
+pub fn resolve_parent_log_format(path: &Path) -> LogFormat {
+    llm_proxy_core::load_app_config(path)
+        .map(|config| crate::state::startup_log_format(&config))
+        .unwrap_or_else(|_| LogFormat::from_env())
 }
 
 /// Applies the `--port` CLI override to the loaded config (step 10's stated
@@ -83,7 +97,7 @@ pub async fn cmd_serve(
     validate_toml_extension(&path)?;
 
     if background && !daemonize {
-        return spawn_in_background(config_path.as_deref(), port_override);
+        return spawn_in_background(&path, port_override);
     }
 
     let state = load_serve_state(&path, port_override).await?;

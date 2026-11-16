@@ -263,7 +263,167 @@ mod log_format_startup {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    use llm_proxy_app::commands::resolve_parent_log_format;
+    use llm_proxy_core::LogFormat;
+
+    static RUST_LOG_FORMAT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard over `RUST_LOG_FORMAT`, mirroring `cli_init.rs`'s
+    /// `HomeGuard`.
+    struct RustLogFormatGuard {
+        prior: Option<String>,
+    }
+
+    impl RustLogFormatGuard {
+        fn set(value: &str) -> Self {
+            let prior =
+                std::env::var_os("RUST_LOG_FORMAT").map(|v| v.to_string_lossy().into_owned());
+            #[expect(
+                unsafe_code,
+                reason = "std::env::set_var is unsafe since edition 2024; RUST_LOG_FORMAT_LOCK is held by the caller, see the SAFETY note below"
+            )]
+            // SAFETY: `set_var` is sound only when no other thread reads or
+            // writes the environment concurrently. Every constructor call
+            // site holds `RUST_LOG_FORMAT_LOCK` for the whole lifetime of the
+            // returned guard, so this thread has exclusive access to the
+            // environment here.
+            unsafe {
+                std::env::set_var("RUST_LOG_FORMAT", value)
+            };
+            Self { prior }
+        }
+
+        fn remove() -> Self {
+            let prior =
+                std::env::var_os("RUST_LOG_FORMAT").map(|v| v.to_string_lossy().into_owned());
+            #[expect(
+                unsafe_code,
+                reason = "std::env::remove_var is unsafe since edition 2024; RUST_LOG_FORMAT_LOCK is held by the caller, see the SAFETY note below"
+            )]
+            // SAFETY: same invariant as `set` — the caller holds
+            // `RUST_LOG_FORMAT_LOCK`, so no other thread touches the
+            // environment during the call.
+            unsafe {
+                std::env::remove_var("RUST_LOG_FORMAT")
+            };
+            Self { prior }
+        }
+    }
+
+    impl Drop for RustLogFormatGuard {
+        #[expect(
+            unsafe_code,
+            reason = "restores RUST_LOG_FORMAT via unsafe set_var/remove_var while RUST_LOG_FORMAT_LOCK is still held, see the SAFETY note below"
+        )]
+        fn drop(&mut self) {
+            match self.prior.as_ref() {
+                // SAFETY: the guard is dropped before the `RUST_LOG_FORMAT_LOCK`
+                // guard it shares a scope with (reverse drop order), so the
+                // lock is still held and no other thread can touch the
+                // environment while the value is restored.
+                Some(v) => unsafe { std::env::set_var("RUST_LOG_FORMAT", v) },
+                // SAFETY: same invariant as the `Some` arm — the lock is
+                // still held, giving this thread exclusive access.
+                None => unsafe { std::env::remove_var("RUST_LOG_FORMAT") },
+            }
+        }
+    }
+
+    /// The `--background` parent logs spawn failures itself, so it must
+    /// resolve `server.log_format` the way the daemon child does (BUG-25,
+    /// fix-brief 07-15): the configured format is honoured and
+    /// `RUST_LOG_FORMAT` still wins.
+    ///
+    /// Pinned through `resolve_parent_log_format` because the parent has no
+    /// tracing-visible spawn failure that fires deterministically: the
+    /// earliest failure (opening the daemon log) never reaches the
+    /// subscriber, and the later branches need a read-only config dir,
+    /// which a root CI ignores.
+    #[test]
+    fn resolve_parent_log_format_honours_the_configured_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log_format_config(dir.path(), "json");
+        {
+            let _lock = RUST_LOG_FORMAT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _guard = RustLogFormatGuard::remove();
+            assert_eq!(
+                resolve_parent_log_format(&path),
+                LogFormat::Json,
+                "the parent must honour server.log_format like the daemon child"
+            );
+        }
+        {
+            let _lock = RUST_LOG_FORMAT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _guard = RustLogFormatGuard::set("plain");
+            assert_eq!(
+                resolve_parent_log_format(&path),
+                LogFormat::Plain,
+                "RUST_LOG_FORMAT must still win over server.log_format"
+            );
+        }
+    }
+
+    /// A config the parent cannot load must not silently change the parent's
+    /// format: `resolve_parent_log_format` falls back to
+    /// `LogFormat::from_env()`, and the daemon child reports the real load
+    /// error.
+    #[test]
+    fn unreadable_config_falls_back_to_the_environment_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        {
+            let _lock = RUST_LOG_FORMAT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _guard = RustLogFormatGuard::set("json");
+            assert_eq!(
+                resolve_parent_log_format(&missing),
+                LogFormat::Json,
+                "an unloadable config must fall back to RUST_LOG_FORMAT"
+            );
+        }
+        {
+            let _lock = RUST_LOG_FORMAT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _guard = RustLogFormatGuard::remove();
+            assert_eq!(
+                resolve_parent_log_format(&missing),
+                LogFormat::Plain,
+                "an unloadable config with RUST_LOG_FORMAT unset stays plain"
+            );
+        }
+    }
+
+    fn write_log_format_config(
+        dir: &std::path::Path,
+        log_format_setting: &str,
+    ) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[server]
+bind = "127.0.0.1:0"
+request_timeout = "60s"
+shutdown_timeout = "1s"
+log_level = "info"
+log_format = "{log_format_setting}"
+hot_reload = false
+server_name = "log-format-test"
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
 
     /// BUG-25 regression, at the binary: `server.log_format = "json"` in the
     /// config must shape the daemon's own startup logs, and `RUST_LOG_FORMAT`
