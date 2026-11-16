@@ -48,8 +48,9 @@ proposes three different admission models, and this plan replaces them with one.
 ## Done
 
 - `llm_proxy_engine::STATUS_POLICY` is the one status table; the server renders
-  its `x-should-retry` row on every error plus any `Retry-After` advice, and
-  tests on both sides enforce that every engine and server status is a row.
+  its `x-should-retry` row on every error from the proxy router plus any
+  `Retry-After` advice, and tests on both sides enforce that every engine and
+  server status is a row.
 - Client tokens are `<key-id>.<secret>`: one argon2 verification per bad
   prefixed token, zero for an unknown id, at any key count. A bare secret
   without a dot is refused unless `[auth] legacy_bare_tokens = true`; the
@@ -66,8 +67,14 @@ proposes three different admission models, and this plan replaces them with one.
   answer stored for it earlier. Under failover the ladder re-keys the
   reservation to the member about to serve — the in-flight slot moves and
   the budget reservation is re-priced at that member's rates, refused with
-  402 when the pricier estimate would not fit. Settlement charges exactly
-  what the provider billed and refunds a failure before any usage.
+  402 when the pricier estimate would not fit. With `[storage]`, the day
+  budget and the rpd window are seeded from `requests` rows at startup;
+  rpm/tpm windows start empty, and without `[storage]` everything resets on
+  restart. Settlement charges exactly what the provider billed and refunds a
+  failure before any usage: a stream that fails before commit still charges
+  the cost its buffered prefix already reported, and an earlier failed
+  attempt's billed prefix is superseded — only the latest failed or the
+  serving attempt is charged.
 - Preflight estimates input tokens once (shared with admission) and warns by
   default; enforce mode rejects only past the configured margin.
 - `llm-proxy pricing-sync` writes per-token pricing from models.dev into
