@@ -56,7 +56,9 @@ pipeline code.
   `systemInstruction` / `generationConfig` (incl. `thinkingConfig` onto the
   core thinking hint) / `tools.functionDeclarations` / `toolConfig`, takes
   the model from the URL and streaming from the method, and encodes
-  candidates/parts/finishReason/usageMetadata (with `thoughtsTokenCount`).
+  candidates/parts/finishReason/usageMetadata (with `thoughtsTokenCount`;
+  `promptTokenCount` includes cache reads and carries
+  `cachedContentTokenCount`).
   Function calls and results correlate by name (the shared
   name-correlation pass), and `thoughtSignature` round-trips on
   `functionCall` parts. Routes:
@@ -76,8 +78,10 @@ pipeline code.
   `think` levels map onto `reasoning_effort`. Streaming is NDJSON (one JSON
   object per line, no SSE), tool calls emit as complete `tool_calls`
   function objects, and the terminal object carries `done_reason` plus
-  `prompt_eval_count`/`eval_count`. `/api/tags` lists the provider's (or
-  pool's) catalog in the Ollama shape. Both generation routes resolve
+  `prompt_eval_count`/`eval_count` (`prompt_eval_count` counts evaluated
+  tokens only; cache reads are excluded). `/api/tags` lists the provider's (or
+  pool's) catalog in the Ollama shape and is admitted under the `models`
+  endpoint family. Both generation routes resolve
   through `routes.chat_completions` — they are chat endpoints reached in a
   different dialect — under the `ollama` endpoint family, reusing the same
   admission middleware chain.
@@ -95,7 +99,7 @@ pipeline code.
   text, tool calls, exact usage, upstream errors (HTTP and in-band
   mid-stream, per dialect), same-format passthrough —
   run for every dialect against a loopback fake upstream in
-  `crates/llm-proxy-server/tests/client_dialects.rs` (32 tests), including
+  `crates/llm-proxy-server/tests/client_dialects.rs` (41 tests), including
   the Codex tool-call ordering assertion and the wire-exact usage fields.
   Captured Codex traffic replays through the Responses route in the
   plan-02 contract harness (`tests/contract_replay.rs`): the real Codex
@@ -103,7 +107,8 @@ pipeline code.
   against a loopback capture upstream (fake credential, canned replies —
   one reply drove a real `exec_command` tool turn the CLI executed in its
   read-only sandbox), and both requests of that session
-  (`fixtures/contract/captured/codex/`) must reach the fake Responses
+  (`crates/llm-proxy-server/tests/fixtures/contract/captured/codex/`) must
+  reach the fake Responses
   upstream JSON-value equal apart from the model alias and any
   operator-configured `prompt_cache` hygiene, with none of the
   Codex client headers (`originator`, `session-id`, `thread-id`,
