@@ -35,20 +35,24 @@
 
 #![deny(missing_docs)]
 
-pub mod admission;
-pub mod admission_backend;
-pub mod cache;
-pub mod catalog;
-pub mod classification;
-pub mod error;
-pub mod error_policy;
-pub mod headers;
-pub mod health;
+// The crate's one public surface is the root: each module below is private
+// and re-exports its complete public API here, so every public item is
+// reachable through exactly one path. `lifecycle`, `preflight` and `probe`
+// stay public modules with no re-export.
+mod admission;
+mod admission_backend;
+mod cache;
+mod catalog;
+mod classification;
+mod error;
+mod error_policy;
+mod headers;
+mod health;
 pub mod lifecycle;
 pub mod preflight;
 pub mod probe;
-pub mod traits;
-pub mod types;
+mod traits;
+mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,11 +71,15 @@ pub use cache::{
     IdempotencyClaim, IdempotencyStore, MemoryCache, SingleFlight, StoredOutcome, StreamShares,
 };
 pub use catalog::{ModelCatalogService, write_catalog_atomic};
-pub use classification::{ErrorClass, classify, parse_duration_suffix, parse_retry_after};
-pub use error::{
-    AuthOwner, EngineError, map_provider_error, map_upstream_status, sanitize_upstream_error_body,
+pub use classification::{
+    ErrorClass, MAX_ADVERTISED_RETRY_AFTER_SECS, classify, next_wait, parse_duration_suffix,
+    parse_retry_after, rate_limit_reset, rate_limit_reset_at,
 };
-pub use error_policy::{STATUS_POLICY, StatusCodePolicy, policy_for};
+pub use error::{
+    AuthOwner, EngineError, fully_sanitize_upstream_error, map_provider_error, map_upstream_status,
+    retry_after_from_headers, sanitize_upstream_error_body,
+};
+pub use error_policy::{STATUS_POLICY, StatusCodePolicy, policy_for, should_retry};
 pub use headers::select_forwarded_headers;
 pub use health::{AffinityTable, CooldownStore, Cooldowns};
 pub use traits::{

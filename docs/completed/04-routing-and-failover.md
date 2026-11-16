@@ -56,7 +56,7 @@ Add pools, retries and failover on top of the routing decision in the
 
 ## Done
 
-- `llm_proxy_engine::classification` is the one transient/terminal sort,
+- `llm_proxy_engine::classify` is the one transient/terminal sort,
   with `Retry-After` parsing for both header spellings, Go-style durations
   and RFC 3339 reset timestamps — scoped by header name (`retry-after`, or
   names containing both `ratelimit` and `reset`), longest advertised reset
@@ -127,5 +127,5 @@ Add pools, retries and failover on top of the routing decision in the
   to a provider or pool and runs the same failover
   (`bare_v1_resolves_a_model_to_a_provider_when_enabled`, `…_to_a_pool…`).
 - Retry exhaustion answers with the status policy's `x-should-retry: false`
-  plus a computed `Retry-After` (`llm_proxy_engine::error_policy`, asserted
+  plus a computed `Retry-After` (`llm_proxy_engine::STATUS_POLICY`, asserted
   on the HTTP surface in `routing_pools.rs`).

@@ -19,14 +19,10 @@ use llm_proxy_core::{
     AffinityConfig, AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
     ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig,
 };
-use llm_proxy_engine::error::EngineError;
-use llm_proxy_engine::traits::{
-    Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, Cache, CacheEntry, CacheKey,
-    CredentialSource, Guard, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery, Router,
-    UsageSink,
-};
 use llm_proxy_engine::{
-    ClientDialect, EngineBuilder, EngineRequest, EngineResponse, InboundRequest,
+    Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, Cache, CacheEntry, CacheKey,
+    ClientDialect, CredentialSource, EngineBuilder, EngineError, EngineRequest, EngineResponse,
+    Guard, GuardDecision, InboundRequest, ResolvedTarget, RoutePlan, RouteQuery, Router, UsageSink,
 };
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest, CoreResponse};
 use llm_proxy_storage::{EventBus, NoopBus, ProxyEvent, RecordingBus};

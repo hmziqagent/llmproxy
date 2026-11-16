@@ -47,7 +47,7 @@ proposes three different admission models, and this plan replaces them with one.
 
 ## Done
 
-- `llm_proxy_engine::error_policy` holds the one status table; the server renders
+- `llm_proxy_engine::STATUS_POLICY` is the one status table; the server renders
   its `x-should-retry` row on every error plus any `Retry-After` advice, and
   tests on both sides enforce that every engine and server status is a row.
 - Client tokens are `<key-id>.<secret>`: one argon2 verification per bad

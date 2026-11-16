@@ -366,10 +366,9 @@ async fn forward(
         extra_headers.insert(header::CONTENT_TYPE.to_string(), content_type);
     }
     let inbound = inbound_headers_for_engine(outbound.headers);
-    for (name, value) in llm_proxy_engine::headers::select_forwarded_headers(
-        &inbound,
-        &target.forward_inbound_headers,
-    ) {
+    for (name, value) in
+        llm_proxy_engine::select_forwarded_headers(&inbound, &target.forward_inbound_headers)
+    {
         extra_headers.insert(name, value);
     }
     let request = ProxyRequest {
