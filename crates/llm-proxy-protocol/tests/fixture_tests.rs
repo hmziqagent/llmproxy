@@ -586,7 +586,7 @@ mod tests {
         panic!(
             "client streaming decode path is unimplemented: parse input.sse through \
          a client StreamDecoder and compare CoreEvents against core-events.json \
-         (mirror llm-proxy-provider run_stream_decode_fixture), plus a \
+         (mirror the adapters crate's stream-decode fixture runner), plus a \
          malformed/truncation case"
         );
     }
