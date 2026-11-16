@@ -1112,6 +1112,12 @@ mod tests {
         assert_eq!(terminal["usageMetadata"]["cachedContentTokenCount"], 8);
     }
 
+    /// `prompt_eval_count` deliberately excludes cache reads: Ollama's wire
+    /// has no cached-token field and it counts tokens actually evaluated
+    /// (KV-cache hits reduce it). The Anthropic fixture carries 8 cache-read
+    /// tokens on top of the 21 evaluated, so 21 — not 29 — is the pinned
+    /// expectation; changing this to a cache-inclusive total must be a
+    /// deliberate decision.
     #[tokio::test]
     async fn ollama_non_streaming_usage_fields() {
         let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;

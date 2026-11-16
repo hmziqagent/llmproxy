@@ -478,6 +478,9 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// Ollama counts evaluated prompt tokens; cache-read tokens are not
+/// evaluated and are deliberately excluded (contrast Responses/Gemini,
+/// whose wire totals include them).
 fn usage_counts(usage: &Usage) -> Value {
     serde_json::json!({
         "prompt_eval_count": usage.input_tokens,
