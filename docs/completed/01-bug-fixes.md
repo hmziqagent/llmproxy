@@ -43,15 +43,18 @@ Make what already exists correct and truthful before anything is built on it.
   framing valid, and the ledger records `ResponseFailed` instead of success.
 - **Cache markers (rows 10, 11, BUG-5):** message-level text markers (with
   `ttl`) and `tool_result` markers — the `CoreContent::ToolResult` block grew
-  a `cache` field — survive Anthropic encode; the OpenAI `cache_control` shape
-  carries `ttl` too.
+  a `cache` field — survive Anthropic encode; the OpenAI client
+  `cache_control` shape carries `ttl` into the core (Anthropic upstreams
+  only; the chat adapter does not forward markers).
 - **Usage mapping (row 13, BUG-11, BUG-12, backlog 3):** DeepSeek miss tokens
   count as plain input, never cache creation; `prompt_tokens_details.
-  cached_tokens` (chat and Responses), `completion_tokens_details.
-  reasoning_tokens` and Anthropic's 5m/1h `cache_creation` split map into the
-  core fields; absent usage is labelled missing (`SyntheticZero`), not
-  provider-reported zeros. OpenAI clients receive `prompt_tokens` including
-  cached tokens.
+  cached_tokens` (chat), `input_tokens_details.cached_tokens` (Responses),
+  `completion_tokens_details.reasoning_tokens` /
+  `output_tokens_details.reasoning_tokens` and Anthropic's 5m/1h
+  `cache_creation` split (summed into one `cache_creation_input_tokens`)
+  map into the core fields; absent usage is labelled missing
+  (`SyntheticZero`), not provider-reported zeros. OpenAI clients receive
+  `prompt_tokens` including cached tokens.
 - **Ledger accuracy (BUG-10, BUG-21, BUG-26, backlog 5):** streaming rows keep
   `model_upstream` under aliases; a client disconnect before the first event
   settles its row; events lost to a failed ledger batch or a full channel are
@@ -66,6 +69,7 @@ Make what already exists correct and truthful before anything is built on it.
 
 ## Done when
 
-- [`run.sh`](../research/audit-2026-11-05/evidence/probes/run.sh) shows correct
-  results for rows 4 to 7, 10, 11 and 13.
+- Each of rows 4 to 7, 10, 11 and 13 is covered by a named CI test (see the
+  Done list); [`run.sh`](../research/audit-2026-11-05/evidence/probes/run.sh)
+  remains a manual probe for a human to read.
 - Each fix has a regression test that fails without it.
