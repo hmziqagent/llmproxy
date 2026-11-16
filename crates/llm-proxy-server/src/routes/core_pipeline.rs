@@ -179,16 +179,15 @@ pub(crate) fn emit_response_failed(
     }
     let (status, _client_error_type, message) = extract_error_fields(error);
     let error_kind = route_error_variant_name(error);
-    event_bus.emit(&ProxyEvent::ResponseFailed(ResponseFailed {
-        request_id: request_id.to_owned(),
-        timestamp: time::OffsetDateTime::now_utc(),
-        provider: provider.map(str::to_owned),
-        model: model.cloned(),
-        error_kind: error_kind.to_owned(),
+    event_bus.emit(&ProxyEvent::ResponseFailed(ResponseFailed::new(
+        request_id,
+        provider,
+        model,
+        error_kind,
         message,
-        http_status: status.as_u16(),
-        latency_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-    }));
+        status.as_u16(),
+        Some(start),
+    )));
 }
 
 /// Bearer/x-api-key token from the client, if any (passthrough auth).

@@ -7,6 +7,7 @@
 
 use llm_proxy_protocol::core::{Cost, ModelRef, StopReason, Usage};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use time::OffsetDateTime;
 
 #[cfg(feature = "sqlite")]
@@ -127,6 +128,39 @@ pub struct ResponseFailed {
     pub http_status: u16,
     /// Request latency in milliseconds.
     pub latency_ms: u64,
+}
+
+impl ResponseFailed {
+    /// Builds the failure row: the timestamp is stamped now and
+    /// `latency_ms` is computed from `start` (saturating at `u64::MAX`).
+    /// `None` start records latency 0 — the failure landed before any
+    /// request start was captured.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one failure row has seven facts; a params struct would repeat the row's own field list"
+    )]
+    pub fn new(
+        request_id: impl Into<String>,
+        provider: Option<&str>,
+        model: Option<&ModelRef>,
+        error_kind: impl Into<String>,
+        message: impl Into<String>,
+        http_status: u16,
+        start: Option<Instant>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            timestamp: OffsetDateTime::now_utc(),
+            provider: provider.map(str::to_owned),
+            model: model.cloned(),
+            error_kind: error_kind.into(),
+            message: message.into(),
+            http_status,
+            latency_ms: start.map_or(0, |start| {
+                start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+            }),
+        }
+    }
 }
 
 /// Event payload for one upstream attempt (plan 04 step 1, conflict 8):

@@ -188,16 +188,15 @@ pub(crate) fn emit_response_failed(
     }
     inner
         .usage
-        .record(&ProxyEvent::ResponseFailed(ResponseFailed {
-            request_id: request_id.to_owned(),
-            timestamp: time::OffsetDateTime::now_utc(),
-            provider: provider.map(str::to_owned),
-            model: model.cloned(),
-            error_kind: error.kind_name().to_owned(),
-            message: error.client_message(),
-            http_status: error.status_code(),
-            latency_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        }));
+        .record(&ProxyEvent::ResponseFailed(ResponseFailed::new(
+            request_id,
+            provider,
+            model,
+            error.kind_name(),
+            error.client_message(),
+            error.status_code(),
+            Some(start),
+        )));
 }
 
 /// Emits one [`ProxyEvent::AttemptCompleted`] row (plan 04 step 1): the
@@ -2256,37 +2255,30 @@ fn record_stream_success(inner: &EngineInner, ctx: &StreamContext) {
 fn record_client_cancelled(inner: &EngineInner, ctx: &StreamContext) {
     inner
         .usage
-        .record(&ProxyEvent::ResponseFailed(ResponseFailed {
-            request_id: ctx.request_id.clone(),
-            timestamp: time::OffsetDateTime::now_utc(),
-            provider: Some(ctx.provider_name.clone()),
-            model: Some(ctx.ledger_model()),
-            error_kind: "ClientCancelled".to_owned(),
-            message: "client disconnected before the stream completed".to_owned(),
-            http_status: 200,
-            latency_ms: ctx
-                .start
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        }));
+        .record(&ProxyEvent::ResponseFailed(ResponseFailed::new(
+            &ctx.request_id,
+            Some(&ctx.provider_name),
+            Some(&ctx.ledger_model()),
+            "ClientCancelled",
+            "client disconnected before the stream completed",
+            200,
+            Some(ctx.start),
+        )));
 }
 
 fn record_client_cancelled_no_ctx(inner: &EngineInner, request_id: &str) {
     inner.metrics.record_client_cancel();
     inner
         .usage
-        .record(&ProxyEvent::ResponseFailed(ResponseFailed {
-            request_id: request_id.to_owned(),
-            timestamp: time::OffsetDateTime::now_utc(),
-            provider: None,
-            model: None,
-            error_kind: "ClientCancelled".to_owned(),
-            message: "client disconnected before the stream completed".to_owned(),
-            http_status: 200,
-            latency_ms: 0,
-        }));
+        .record(&ProxyEvent::ResponseFailed(ResponseFailed::new(
+            request_id,
+            None,
+            None,
+            "ClientCancelled",
+            "client disconnected before the stream completed",
+            200,
+            None,
+        )));
 }
 
 /// The sanitized message of a `CoreEvent::Error`, for ledger rows.
@@ -3545,21 +3537,15 @@ impl StreamReplay {
         self.inner.metrics.record_failure();
         self.inner
             .usage
-            .record(&ProxyEvent::ResponseFailed(ResponseFailed {
-                request_id: self.request_id.clone(),
-                timestamp: time::OffsetDateTime::now_utc(),
-                provider: Some(self.provider.clone()),
-                model: Some(self.model.clone()),
-                error_kind: kind.to_owned(),
-                message: message.to_owned(),
-                http_status: 200,
-                latency_ms: self
-                    .start
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            }));
+            .record(&ProxyEvent::ResponseFailed(ResponseFailed::new(
+                &self.request_id,
+                Some(&self.provider),
+                Some(&self.model),
+                kind,
+                message,
+                200,
+                Some(self.start),
+            )));
     }
 
     fn record_cancelled(&mut self) {
@@ -3570,21 +3556,15 @@ impl StreamReplay {
         self.inner.metrics.record_client_cancel();
         self.inner
             .usage
-            .record(&ProxyEvent::ResponseFailed(ResponseFailed {
-                request_id: self.request_id.clone(),
-                timestamp: time::OffsetDateTime::now_utc(),
-                provider: Some(self.provider.clone()),
-                model: Some(self.model.clone()),
-                error_kind: "ClientCancelled".to_owned(),
-                message: "client disconnected before the stream completed".to_owned(),
-                http_status: 200,
-                latency_ms: self
-                    .start
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            }));
+            .record(&ProxyEvent::ResponseFailed(ResponseFailed::new(
+                &self.request_id,
+                Some(&self.provider),
+                Some(&self.model),
+                "ClientCancelled",
+                "client disconnected before the stream completed",
+                200,
+                Some(self.start),
+            )));
     }
 }
 
