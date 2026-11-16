@@ -4,7 +4,8 @@
 //! compile time, so counting requires no network access and works offline.
 //! [`Counter`](super::Counter) remains the public front door: it dispatches
 //! to a [`TiktokenTokenizer`] for known OpenAI model ids and falls back to a
-//! [`HeuristicTokenizer`] (~4 chars/token) for everything else, so the
+//! [`HeuristicTokenizer`](super::tokenizer::HeuristicTokenizer)
+//! (~4 chars/token) for everything else, so the
 //! `/v1/messages/count_tokens` route never hard-fails on an unfamiliar model.
 
 use std::sync::Arc;
@@ -108,7 +109,7 @@ impl Encoding {
 ///
 /// Non-OpenAI providers (Anthropic, Gemini, Fireworks, ...) do not publish
 /// tiktoken-compatible tokenizers; they fall through to `None` here. For those,
-/// provider-reported [`Usage`](llm_proxy_protocol::core::Usage) remains the
+/// provider-reported `Usage` remains the
 /// authoritative count for billing; the local counter is only an estimate for
 /// the `/v1/messages/count_tokens` route and pre-flight guardrails.
 pub fn encoding_for_model(model: &str) -> Option<Encoding> {

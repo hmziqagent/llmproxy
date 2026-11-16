@@ -1163,7 +1163,8 @@ pub struct ProviderConfig {
     /// Supports `${ENV_VAR}` interpolation (applied to the raw TOML *before*
     /// this field is constructed, so the resolved value is what gets wrapped).
     ///
-    /// Wrapped in [`SecretString`]: redacted in [`Debug`] and [`Display`] output
+    /// Wrapped in [`SecretString`]: redacted in [`Debug`] and
+    /// [`Display`](std::fmt::Display) output
     /// and zeroized on drop. Not serialized (`skip_serializing`): credentials
     /// never leak through serialization paths, so round-tripping a
     /// `ProviderFile` through serialize/deserialize FAILS because `api_key`
@@ -3186,8 +3187,9 @@ fn client_spec_matches(current: &ClientKeySpec, next: &ClientKeySpec) -> bool {
 
 /// Validates one pool definition in isolation: non-empty name and members,
 /// no duplicate members, a valid retry ladder. Membership and name collisions
-/// with providers are checked by [`validate_registry_pools`], which sees both
-/// sets.
+/// with providers are checked by
+/// [`ProviderRegistry::validate_pools`](crate::provider_registry::ProviderRegistry::validate_pools),
+/// which sees both sets.
 ///
 /// # Errors
 ///

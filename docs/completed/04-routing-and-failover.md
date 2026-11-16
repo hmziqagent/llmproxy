@@ -60,13 +60,16 @@ Add pools, retries and failover on top of the routing decision in the
   with `Retry-After` parsing for both header spellings, Go-style durations
   and RFC 3339 reset timestamps — scoped by header name (`retry-after`, or
   names containing both `ratelimit` and `reset`), longest advertised reset
-  wins; the ladder consumes it through `next_wait` for backoff and
-  cooldown decisions.
-- Pools live in `[pool.*]` config and serve `/providers/{pool}/v1/...`:
-  config validation rejects a duplicate member, an empty member list and a
-  pool name colliding with a provider (`validate_pool_config_against`,
-  `provider_registry.rs`), and every attempt of a pool's ladder writes its
-  own `AttemptCompleted` row — `pool_survives_a_429…`,
+  wins; the ladder consumes it through `next_wait` for backoff
+  decisions; cooldowns use the advised reset directly (`apply_cooldowns`).
+- Pools are `[pool]` tables in per-file TOML under the providers directory
+  (one `[pool]` per file, with `[pool.retry]`, `[pool.affinity]` and
+  `[pool.health]` sub-tables, `PoolFile` in `provider_config.rs`) and serve
+  `/providers/{pool}/v1/...`: config validation rejects a duplicate member,
+  an empty member list (`validate_pool_config_against`) and a pool name
+  colliding with a provider (`ProviderRegistry::validate_pools`), and every
+  attempt of a pool's ladder writes its own `AttemptCompleted` row —
+  `pool_survives_a_429…`,
   `pool_survives_a_5xx_from_its_first_member…`,
   `pool_survives_a_connect_error_from_its_first_member…` and
   `a_direct_provider_route_never_fails_over…`

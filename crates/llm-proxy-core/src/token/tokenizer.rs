@@ -16,7 +16,7 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug {
     /// This is a synchronous, CPU-bound operation: the BPE backend runs a
     /// fancy-regex pass over the input. It must NOT be called on an async
     /// runtime worker thread; callers should run it under
-    /// [`tokio::task::spawn_blocking`].
+    /// `tokio::task::spawn_blocking`.
     fn count_tokens(&self, text: &str) -> usize;
 }
 
