@@ -26,6 +26,10 @@ llm-proxy              facade crate with cargo features
 apps/llm-proxy         daemon and CLI
 ```
 
+As built: `store-sqlite` is the `sqlite` feature of `llm-proxy-storage`;
+`llm-proxy-core`, `-storage`, `-api`, `-bridge`, `-guardrails` and
+`-semantic-cache` exist beyond this table; the facade is `llm-proxy-sdk`.
+
 The facade name is taken by the binary's package today. Rename that package and
 keep the binary named `llm-proxy`. Confirm each new name is free on crates.io.
 
@@ -88,7 +92,8 @@ Every feature takes one of these places, in this order:
 
 - **Crate split (steps 1, 10).** `llm-proxy-provider` is gone:
   `llm-proxy-adapters` (provider codecs, pure encoding) and
-  `llm-proxy-transport` (HTTP egress, credentials, discovery) replace it;
+  `llm-proxy-transport` (HTTP egress and model discovery;
+  credential selection lives in the engine's `CredentialSource`) replace it;
   `llm-proxy-engine` holds the extracted lifecycle; `llm-proxy-sdk` is the
   facade (published as `llm-proxy-sdk`, not `llm-proxy`, because crates.io
   `llm-proxy` is an unrelated third-party placeholder from 2023 —
