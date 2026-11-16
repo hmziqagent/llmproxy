@@ -15,7 +15,8 @@
 //!
 //! The default test run uses in-repo fake MCP servers; this file is the
 //! same properties checked against a real third-party implementation,
-//! so protocol divergences surface here.
+//! so protocol divergences surface here. CI runs this suite nightly
+//! against the pinned server version (`.github/workflows/live-external.yml`).
 
 #![cfg(test)]
 

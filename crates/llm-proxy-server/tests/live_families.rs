@@ -12,8 +12,13 @@
 //! - files and batches: Llama Stack (`inline::localfs` files,
 //!   `inline::reference` batches answered by a llama.cpp chat model).
 //!
-//! Every test is `#[ignore]`d and does nothing unless its family's
-//! variable names a live server, so run any subset. The reference setup
+//! Every test is `#[ignore]`d and needs exactly one family's variable
+//! naming a live server: an `--ignored` run without it fails naming the
+//! variable, never passes silently. The pinned reference versions and
+//! containers that CI can run (llama.cpp `server-b7205`, speaches
+//! `0.7.0-cpu`, `@modelcontextprotocol/server-everything` 2.2.1,
+//! inspector 2.14.0) live in `.github/workflows/live-external.yml`,
+//! which runs these suites on a schedule. The reference setup
 //! (CPU only; GGUF models from Hugging Face in `$MODELS`):
 //!
 //! ```text
@@ -78,15 +83,17 @@ fn env_or(name: &str, default: &str) -> String {
     env(name).unwrap_or_else(|| default.to_owned())
 }
 
-/// The live server for one test, or `None` (with a note) when unset:
-/// `--ignored` runs every test, and only the configured ones have a
-/// server to talk to.
-fn live_base(var: &str) -> Option<String> {
-    let base = env(var);
-    if base.is_none() {
-        eprintln!("skipped: {var} is not set");
-    }
-    base.map(|base| base.trim_end_matches('/').to_owned())
+/// An explicitly requested live run must fail when its server variable
+/// is missing: `--ignored` selects these tests, and a silent skip would
+/// let "ran the live suite" be claimed with nothing behind it.
+fn require(var: &str) -> String {
+    env(var).unwrap_or_else(|| panic!("{var} must be set when running the ignored live tests"))
+}
+
+/// The live server for one test. Each test needs exactly one family's
+/// variable, so a run without it fails naming that variable.
+fn live_base(var: &str) -> String {
+    require(var).trim_end_matches('/').to_owned()
 }
 
 /// One provider whose every family route points under `base` (an
@@ -349,9 +356,7 @@ fn family_rows(bus: &RecordingBus) -> Vec<(String, String)> {
 #[tokio::test]
 #[ignore = "needs a live embeddings server; set LLM_PROXY_TEST_EMBEDDINGS_URL"]
 async fn embeddings_reach_a_real_server_through_the_alias() {
-    let Some(base) = live_base("LLM_PROXY_TEST_EMBEDDINGS_URL") else {
-        return;
-    };
+    let base = live_base("LLM_PROXY_TEST_EMBEDDINGS_URL");
     let model = env_or("LLM_PROXY_TEST_EMBEDDINGS_MODEL", "bge-small-en-v1.5");
     let (app, bus) = proxy(&base, &[("live-embed", &model)]);
 
@@ -405,9 +410,7 @@ async fn embeddings_reach_a_real_server_through_the_alias() {
 #[tokio::test]
 #[ignore = "needs a live rerank server; set LLM_PROXY_TEST_RERANK_URL"]
 async fn rerank_reaches_a_real_reranker_through_the_alias() {
-    let Some(base) = live_base("LLM_PROXY_TEST_RERANK_URL") else {
-        return;
-    };
+    let base = live_base("LLM_PROXY_TEST_RERANK_URL");
     let model = env_or("LLM_PROXY_TEST_RERANK_MODEL", "bge-reranker-v2-m3");
     let (app, bus) = proxy(&base, &[("live-rerank", &model)]);
 
@@ -449,14 +452,8 @@ async fn rerank_reaches_a_real_reranker_through_the_alias() {
 
 #[tokio::test]
 #[ignore = "needs a live audio server; set LLM_PROXY_TEST_AUDIO_URL"]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one real audio round trip: speech, then its two transcription formats, each with asserts"
-)]
 async fn speech_and_transcription_round_trip_through_a_real_audio_server() {
-    let Some(base) = live_base("LLM_PROXY_TEST_AUDIO_URL") else {
-        return;
-    };
+    let base = live_base("LLM_PROXY_TEST_AUDIO_URL");
     let speech_model = env_or(
         "LLM_PROXY_TEST_SPEECH_MODEL",
         "speaches-ai/Kokoro-82M-v1.0-ONNX-int8",
@@ -567,9 +564,7 @@ async fn speech_and_transcription_round_trip_through_a_real_audio_server() {
 #[tokio::test]
 #[ignore = "needs a live image server; set LLM_PROXY_TEST_IMAGES_URL"]
 async fn image_generation_reaches_a_real_diffusion_server() {
-    let Some(base) = live_base("LLM_PROXY_TEST_IMAGES_URL") else {
-        return;
-    };
+    let base = live_base("LLM_PROXY_TEST_IMAGES_URL");
     let model = env_or("LLM_PROXY_TEST_IMAGES_MODEL", "sd-turbo");
     let (app, bus) = proxy(&base, &[("live-image", &model)]);
 
@@ -609,9 +604,7 @@ async fn image_generation_reaches_a_real_diffusion_server() {
     reason = "one real files-and-batches lifecycle: upload, retrieve, list, download, batch to completion, output, delete"
 )]
 async fn files_and_batches_run_their_whole_lifecycle_through_a_real_server() {
-    let Some(base) = live_base("LLM_PROXY_TEST_FILES_URL") else {
-        return;
-    };
+    let base = live_base("LLM_PROXY_TEST_FILES_URL");
     let model = env_or("LLM_PROXY_TEST_BATCH_MODEL", "vllm/smollm2-135m");
     let (app, bus) = proxy(&base, &[]);
 

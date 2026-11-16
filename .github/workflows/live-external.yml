@@ -1,0 +1,106 @@
+# The live suites that need real third-party implementations, on a
+# schedule; the store suites (Redis, Postgres) run on every push in
+# ci.yml's live-stores job. Every version and image below is pinned so
+# an upstream release cannot masquerade as one of ours.
+#
+# Skipped, so the gap is explicit — these have no automated live
+# evidence and stay manual (see crates/llm-proxy-server/tests/live_families.rs):
+# - images: stable-diffusion.cpp's `sd-server` has no published image to pin;
+# - files and batches: llama-stack 0.7.3 is the pinned version, but its
+#   reference `inline::reference` run needs a hand-written run.yaml and a
+#   llama.cpp chat server behind `remote::vllm`, neither validated in CI;
+# - the OpenAI Python SDK and Cohere SDK checks: no in-repo live tests
+#   exist for them (they were run by hand, per docs/completed/09).
+name: live-external
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  # The official reference MCP implementations, both directions:
+  # server-everything as the gateway's upstream, the inspector CLI as a
+  # real client against the gateway's own POST /mcp.
+  mcp-live:
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROXY_TEST_MCP_UPSTREAM: http://127.0.0.1:3001/mcp
+      LLM_PROXY_TEST_MCP_CLIENT: "1"
+      LLM_PROXY_TEST_INSPECTOR: "@modelcontextprotocol/inspector@2.14.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Reference MCP server (@modelcontextprotocol/server-everything@2.2.1)
+        run: |
+          npx -y @modelcontextprotocol/server-everything@2.2.1 streamableHttp &
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null http://127.0.0.1:3001/mcp; then exit 0; fi
+            sleep 1
+          done
+          echo "server-everything did not come up on 3001"
+          exit 1
+
+      - name: Gateway over the reference server (live_upstream)
+        run: cargo test -p llm-proxy-mcp --test live_upstream -- --ignored --locked
+
+      - name: Reference inspector client through the gateway (live_client)
+        run: cargo test -p llm-proxy-mcp --test live_client -- --ignored --test-threads 1 --locked
+
+  # The endpoint families whose reference implementations can be pinned:
+  # llama.cpp (embeddings, rerank) and speaches (speech, transcriptions).
+  families-live:
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROXY_TEST_EMBEDDINGS_URL: http://127.0.0.1:18081/v1
+      LLM_PROXY_TEST_RERANK_URL: http://127.0.0.1:18082/v1
+      LLM_PROXY_TEST_AUDIO_URL: http://127.0.0.1:18084/v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+
+      # Pulls the GGUF model from Hugging Face at startup; the tests'
+      # model aliases are echoed from the request, so the loaded model
+      # only has to serve embeddings/rerank well.
+      - name: llama.cpp embeddings server (ghcr.io/ggml-org/llama.cpp:server-b7205)
+        run: |
+          docker run -d -p 18081:8080 ghcr.io/ggml-org/llama.cpp:server-b7205 \
+            -hf ggml-org/bge-small-en-v1.5-Q8_0-GGUF \
+            --embeddings --host 0.0.0.0 --port 8080
+
+      - name: llama.cpp reranker server (same pin)
+        run: |
+          docker run -d -p 18082:8080 ghcr.io/ggml-org/llama.cpp:server-b7205 \
+            -hf ggml-org/jina-reranker-v1-turbo-en-GGUF \
+            --reranking --host 0.0.0.0 --port 8080
+
+      # The tests name the models they need; preloading them here keeps
+      # the first test request from paying the download.
+      - name: speaches audio server (ghcr.io/speaches-ai/speaches:0.7.0-cpu)
+        run: |
+          docker run -d -p 18084:8000 ghcr.io/speaches-ai/speaches:0.7.0-cpu
+          for _ in $(seq 1 120); do
+            if curl -sf -o /dev/null http://127.0.0.1:18084/health; then break; fi
+            sleep 2
+          done
+          curl -sf -X POST http://127.0.0.1:18084/v1/models/Systran/faster-whisper-base.en
+          curl -sf -X POST http://127.0.0.1:18084/v1/models/speaches-ai/Kokoro-82M-v1.0-ONNX-int8
+
+      - name: Families live suite (embeddings, rerank, audio)
+        run: |
+          cargo test -p llm-proxy-server --features endpoint-families --test live_families \
+            embeddings_reach_a_real_server_through_the_alias -- --ignored --locked
+          cargo test -p llm-proxy-server --features endpoint-families --test live_families \
+            rerank_reaches_a_real_reranker_through_the_alias -- --ignored --locked
+          cargo test -p llm-proxy-server --features endpoint-families --test live_families \
+            speech_and_transcription_round_trip_through_a_real_audio_server -- --ignored --locked

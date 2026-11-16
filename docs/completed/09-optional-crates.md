@@ -138,7 +138,11 @@ unless real use says otherwise.
   schema creation behind a transaction-scoped advisory lock
   (`pg_advisory_xact_lock`), verified by three consecutive concurrent
   clean runs. Both suites are `#[ignore]`d without their env vars; the
-  default test run still uses the in-repo loopback fakes.
+  default test run still uses the in-repo loopback fakes. CI now runs
+  both suites against Redis 7 and Postgres 16 service containers on
+  every push (the `live-stores` job in `.github/workflows/ci.yml`), and
+  an `--ignored` run without the env var fails naming it instead of
+  passing vacuously.
 - Live MCP verification (both directions), against the official
   reference implementations run locally: the reference "everything"
   server (`@modelcontextprotocol/server-everything` 2.2.1, Streamable
@@ -184,3 +188,12 @@ unless real use says otherwise.
   like). This environment has no upstream API keys, so the families were
   verified against the self-hosted servers above, which implement the
   same documented wire APIs.
+- Ongoing live evidence: the MCP suites (server-everything 2.2.1,
+  inspector 2.14.0) and the embeddings, rerank and audio family tests
+  (llama.cpp `server-b7205`, speaches `0.7.0-cpu`) run nightly in
+  `.github/workflows/live-external.yml`; every live test fails naming
+  its env var when the server is missing, so a run cannot pass
+  vacuously. Still manual only: images (no published `sd-server` image
+  to pin), files and batches (the llama-stack 0.7.3 reference run needs
+  a run.yaml and llama.cpp chat backend not validated in CI), and the
+  OpenAI/Cohere SDK checks (no in-repo live tests).

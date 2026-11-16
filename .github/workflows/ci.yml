@@ -180,3 +180,49 @@ jobs:
       - name: Publish dry-run
         run: cargo publish --workspace --dry-run --locked
 
+  # The live store suites: `#[ignore]`d tests that run only when their
+  # environment variable names a server, and fail that run naming the
+  # variable when it is missing, so "ran the live suite" cannot be
+  # claimed without one. Redis and Postgres come from service
+  # containers, so the suites (including the monotonic-cooldown script
+  # of fix 09-3) get automated evidence on every push. The
+  # external-implementation suites (MCP, endpoint families) run on a
+  # schedule in live-external.yml.
+  live-stores:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: llm-proxy-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      LLM_PROXY_TEST_REDIS: redis://127.0.0.1:6379
+      LLM_PROXY_TEST_POSTGRES: postgres://postgres:llm-proxy-ci@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Redis live suite
+        run: cargo test -p llm-proxy-store-redis --test live_server -- --ignored --locked
+
+      - name: Postgres live suite
+        run: cargo test -p llm-proxy-store-postgres -- --ignored --locked

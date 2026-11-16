@@ -25,9 +25,10 @@
 //!
 //! The integration tests in `tests/` need a live Postgres and are
 //! `#[ignore]`d: set `LLM_PROXY_TEST_POSTGRES` to a connection string
-//! (for example `postgres://localhost/llm_proxy_test`) to run them. This
-//! environment has no Postgres server, so they were compiled but not
-//! executed here.
+//! (for example `postgres://localhost/llm_proxy_test`) to run them; a
+//! run without the variable fails naming it. CI runs the suite against
+//! a Postgres 16 service container on every push (the `live-stores` job
+//! in `.github/workflows/ci.yml`).
 
 #![deny(missing_docs)]
 

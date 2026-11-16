@@ -14,6 +14,12 @@
 //! LLM_PROXY_TEST_MCP_CLIENT=1 \
 //!     cargo test -p llm-proxy-mcp --test live_client -- --ignored --test-threads 1
 //! ```
+//!
+//! The pinned package versions (`@modelcontextprotocol/server-everything`
+//! 2.2.1, inspector 2.14.0, set through `LLM_PROXY_TEST_INSPECTOR`)
+//! live in `.github/workflows/live-external.yml`, which runs this suite
+//! nightly. An `--ignored` run without the two variables above fails
+//! naming them; it never passes silently.
 
 #![cfg(test)]
 
@@ -25,18 +31,31 @@ use llm_proxy_storage::{EventBus, NoopBus};
 use llm_proxy_transport::ProxyClient;
 use secrecy::SecretString;
 
-fn want_live() -> bool {
-    std::env::var("LLM_PROXY_TEST_MCP_CLIENT").is_ok()
-        && std::env::var("LLM_PROXY_TEST_MCP_UPSTREAM").is_ok()
+/// The package spec for the inspector subprocess, so a runner can pin
+/// the version (CI pins 2.14.0 in `.github/workflows/live-external.yml`);
+/// unset means latest, as an ad-hoc local run always did.
+fn inspector_spec() -> String {
+    std::env::var("LLM_PROXY_TEST_INSPECTOR")
+        .unwrap_or_else(|_| "@modelcontextprotocol/inspector".to_owned())
 }
 
-async fn spawn_gateway() -> String {
+/// An explicitly requested live run must fail when its server variables
+/// are missing: `--ignored` selects this test, and a silent skip would
+/// let "ran the live suite" be claimed with nothing behind it.
+fn require(var: &str) -> String {
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("{var} must be set when running the ignored live tests"))
+}
+
+async fn spawn_gateway(upstream: &str) -> String {
     let config = llm_proxy_core::McpGatewayConfig {
         bind: "127.0.0.1:0".parse().expect("bind"),
         tokens: vec![SecretString::from("live-gateway-token")],
         upstreams: vec![llm_proxy_core::McpUpstreamConfig {
             name: "everything".to_owned(),
-            url: std::env::var("LLM_PROXY_TEST_MCP_UPSTREAM").expect("upstream url"),
+            url: upstream.to_owned(),
             token: None,
         }],
         session_ttl: Duration::from_secs(600),
@@ -79,9 +98,8 @@ async fn inspector(endpoint: &str, call: Option<(&str, &str)>) -> String {
 
 fn inspector_blocking(endpoint: &str, tool: Option<(&str, &str)>) -> String {
     let mut command = std::process::Command::new("npx");
+    command.arg("-y").arg(inspector_spec());
     command.args([
-        "-y",
-        "@modelcontextprotocol/inspector",
         "--cli",
         "--transport",
         "http",
@@ -114,11 +132,9 @@ fn inspector_blocking(endpoint: &str, tool: Option<(&str, &str)>) -> String {
 #[tokio::test]
 #[ignore = "shells out to npx; set LLM_PROXY_TEST_MCP_CLIENT and LLM_PROXY_TEST_MCP_UPSTREAM"]
 async fn the_official_mcp_inspector_lists_and_calls_the_gateways_tools() {
-    if !want_live() {
-        // --ignored runs this even without the env; nothing to do then.
-        return;
-    }
-    let endpoint = spawn_gateway().await;
+    require("LLM_PROXY_TEST_MCP_CLIENT");
+    let upstream = require("LLM_PROXY_TEST_MCP_UPSTREAM");
+    let endpoint = spawn_gateway(&upstream).await;
 
     // tools/list through the real client: the reference server's echo
     // tool, namespaced, is visible to it.
