@@ -24,8 +24,9 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
    field is carried, mapped or rejected, and reject unknown fields by naming them.
    A per-route `lossy` opt-in turns a rejection into a drop with a logged warning.
 4. **Missing fields.** Carry `response_format`, `parallel_tool_calls`, `seed`,
-   `image_url`, `stop_sequences`, `top_k`, `output_config` and server tools wherever
-   the provider supports them.
+   `image_url`, `stop_sequences`, `top_k`, `output_config` where the provider
+   supports them. Server tools reach same-format upstreams verbatim and are
+   rejected by name cross-format.
 5. **Reasoning translation (BUG-20, backlog 13).** Convert between `reasoning_effort`,
    `thinking.budget_tokens` and Gemini's `thinkingBudget` with per-model limits, at
    the provider edge rather than in `llm-proxy-protocol`. Stop forwarding these
