@@ -74,9 +74,11 @@ All eleven steps landed, each with regression tests:
 6. `llm_proxy_app::provenance` — `validate` prints every resolved setting
    with its layer (config / default / env) under one stated precedence,
    CLI > env > config file > default. Secrets never appear.
-7. `Snapshot::to_prometheus_text` + the token-gated `/metrics` route on the
-   admin surface; opt-in `[server.metrics.otlp]` pushes the same counters
-   as OTLP/HTTP JSON (tested against a live local collector).
+7. `Snapshot::to_prometheus_text` + a token-gated `/metrics` route: on the
+   `admin-ui` dedicated admin listener (no `[storage]` needed), and on the
+   `/usage` surface (dedicated or `admin_on_main_listener`) when
+   `[storage]` is configured. Opt-in `[server.metrics.otlp]` pushes the
+   same counters as OTLP/HTTP JSON (tested against a live local collector).
 8. `/usage/requests` rows carry a derived `state`
    (`in_flight`/`failed`/`completed`) and in-flight rows carry `elapsed_ms`
    measured at query time.

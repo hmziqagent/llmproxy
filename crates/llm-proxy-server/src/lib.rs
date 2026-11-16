@@ -40,8 +40,11 @@ pub fn build_router(state: AppState) -> Router {
 ///
 /// Returns `None` when no `[auth.admin]` token or `[storage]` is configured
 /// or the `admin` cargo feature is off; every route is a read-only `GET`.
-/// With metrics attached the same surface serves `/metrics` (Prometheus
-/// exposition, plan 07 step 7) behind the same token.
+/// Metrics (plan 07 step 7) is `Snapshot::to_prometheus_text` + a
+/// token-gated `/metrics` route: on the `admin-ui` dedicated admin listener
+/// (no `[storage]` needed), and on the `/usage` surface (dedicated or
+/// `admin_on_main_listener`) when `[storage]` is configured — served here
+/// behind the same admin token.
 #[must_use = "the Router must be used with a server"]
 pub fn admin_router(state: &AppState) -> Option<Router> {
     #[cfg(feature = "admin")]
