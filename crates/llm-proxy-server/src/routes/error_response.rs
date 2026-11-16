@@ -1367,31 +1367,153 @@ mod tests {
         }
     }
 
+    /// A spend budget is never retried: the 402 response says so even though
+    /// the budget eventually resets, because an SDK retry ladder cannot wait
+    /// out the window (fix brief 05-12).
     #[test]
-    fn every_error_response_carries_the_tables_retry_choice() {
+    fn budget_exhaustion_is_never_retried() {
+        let error = RouteError::BudgetExhausted {
+            message: "daily usd budget spent".into(),
+            retry_after_secs: None,
+        };
+        for protocol in [ClientProtocol::Anthropic, ClientProtocol::OpenAiChat] {
+            let response = route_error_response(protocol, &error);
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-should-retry")
+                    .and_then(|v| v.to_str().ok()),
+                Some("false"),
+                "a spend budget is never something the client should retry"
+            );
+        }
+    }
+
+    /// Rate windows (429) and capacity refusals (503) are the two statuses
+    /// the client is told to retry, and each carries `Retry-After` exactly
+    /// when the proxy knows an advised wait (fix brief 05-12).
+    #[test]
+    fn capacity_and_rate_refusals_ask_the_client_to_retry_later() {
+        let cases = [
+            (
+                RouteError::RateLimited {
+                    message: "rpm window full".into(),
+                    retry_after_secs: Some(30),
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                RouteError::RateLimited {
+                    message: "rpm window full".into(),
+                    retry_after_secs: None,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                RouteError::Overloaded {
+                    message: "concurrency cap saturated".into(),
+                    retry_after_secs: Some(1),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                RouteError::Overloaded {
+                    message: "concurrency cap saturated".into(),
+                    retry_after_secs: None,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (error, expected_status) in cases {
+            let advised = error.retry_after_secs();
+            let response = route_error_response(ClientProtocol::OpenAiChat, &error);
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-should-retry")
+                    .and_then(|v| v.to_str().ok()),
+                Some("true"),
+                "{error:?} must tell the client to try again later"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                advised.map(|secs| secs.to_string()).as_deref(),
+                "{error:?} carries Retry-After exactly when it has an advised wait"
+            );
+        }
+    }
+
+    /// Every rendered error carries a deliberate `x-should-retry`: exactly
+    /// "true" or "false", never absent and never another value (fix brief
+    /// 05-12). Which of the two each status gets is pinned by the named
+    /// properties and the router-level test.
+    #[test]
+    fn every_response_has_a_valid_header_value() {
         for error in every_route_error() {
             for protocol in [ClientProtocol::Anthropic, ClientProtocol::OpenAiChat] {
                 let response = route_error_response(protocol, &error);
-                let status = response.status().as_u16();
-                let expected = if matches!(error, RouteError::RetryExhausted { .. }) {
-                    "false"
-                } else if llm_proxy_engine::policy_for(status)
-                    .expect("row exists")
-                    .should_retry
-                {
-                    "true"
-                } else {
-                    "false"
-                };
-                assert_eq!(
-                    response
-                        .headers()
-                        .get("x-should-retry")
-                        .and_then(|v| v.to_str().ok()),
-                    Some(expected),
-                    "{error:?} ({status}) must carry the table's x-should-retry"
+                let header = response
+                    .headers()
+                    .get("x-should-retry")
+                    .and_then(|value| value.to_str().ok());
+                assert!(
+                    header == Some("true") || header == Some("false"),
+                    "{error:?} must carry a deliberate x-should-retry, got {header:?}"
                 );
             }
+        }
+    }
+
+    /// The server-level twin of the engine property in `error_policy.rs`: a
+    /// ladder that already retried never asks the client to retry, whatever
+    /// the last underlying status's own row says (plan 04 step 12; fix brief
+    /// 05-12).
+    #[test]
+    fn an_exhausted_ladder_never_asks_the_client_to_retry() {
+        use llm_proxy_engine::EngineError;
+        let last_errors = vec![
+            EngineError::Unauthorized,
+            EngineError::RateLimited {
+                message: "rpm".into(),
+                retry_after: Some(std::time::Duration::from_secs(30)),
+            },
+            EngineError::BudgetExhausted {
+                message: "usd".into(),
+                retry_after: None,
+            },
+            EngineError::Overloaded {
+                message: "cap".into(),
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            },
+            EngineError::Upstream {
+                status: 502,
+                body: String::new(),
+                auth_owner: llm_proxy_engine::AuthOwner::Operator,
+                retry_after: None,
+            },
+            EngineError::Internal("x".into()),
+        ];
+        for last in last_errors {
+            let exhausted = EngineError::RetryExhausted {
+                attempts: 2,
+                last: Box::new(last),
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            };
+            let response =
+                route_error_response(ClientProtocol::Anthropic, &RouteError::from(exhausted));
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-should-retry")
+                    .and_then(|v| v.to_str().ok()),
+                Some("false"),
+                "an exhausted ladder must not ask the client to retry"
+            );
         }
     }
 

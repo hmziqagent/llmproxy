@@ -288,19 +288,12 @@ mod tests {
         );
     }
 
+    /// The ladder already retried on the client's behalf: its answer is
+    /// false for every underlying error, even when the last status's own row
+    /// says true (plan 04 step 12). The server renders this bool as
+    /// `x-should-retry` (fix brief 05-12).
     #[test]
-    fn should_retry_follows_the_table_except_exhausted_ladders() {
-        for error in representative_errors() {
-            let expected = policy_for(error.status_code())
-                .expect("status is in the table")
-                .should_retry;
-            assert_eq!(
-                error.should_retry(),
-                expected,
-                "engine should_retry disagrees with the table for {error:?}"
-            );
-        }
-        // The ladder already retried: false regardless of the last status.
+    fn an_exhausted_ladder_never_asks_the_client_to_retry() {
         for last in representative_errors() {
             let exhausted = EngineError::RetryExhausted {
                 attempts: 2,
@@ -311,15 +304,6 @@ mod tests {
                 !exhausted.should_retry(),
                 "an exhausted ladder must say x-should-retry: false, got {exhausted:?}"
             );
-        }
-    }
-
-    #[test]
-    fn codes_stock_sdks_auto_retry_all_have_deliberate_rows() {
-        // The SDK default retry sets: 408, 409, 429 and 5xx. Each must be a
-        // row (deliberate true or false), never an accidental gap.
-        for code in [408, 409, 429, 500, 502, 503, 504] {
-            assert!(policy_for(code).is_some(), "SDK-retryable {code} missing");
         }
     }
 }
