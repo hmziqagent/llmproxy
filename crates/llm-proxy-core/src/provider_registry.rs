@@ -470,14 +470,19 @@ impl ProviderRegistry {
             let available = if provider.adapters.is_empty() {
                 "(none)".to_owned()
             } else {
-                let keys: Vec<&str> = provider.adapters.keys().map(|s| s.as_str()).collect();
+                let mut keys: Vec<&str> = provider.adapters.keys().map(|s| s.as_str()).collect();
+                keys.sort_unstable();
                 if keys.len() <= MAX_ADAPTERS_IN_ERROR {
                     keys.join(", ")
                 } else {
                     format!(
                         "{} (+{} more)",
-                        keys[..MAX_ADAPTERS_IN_ERROR].join(", "),
-                        keys.len() - MAX_ADAPTERS_IN_ERROR
+                        keys.iter()
+                            .take(MAX_ADAPTERS_IN_ERROR)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        keys.len().saturating_sub(MAX_ADAPTERS_IN_ERROR)
                     )
                 }
             };
@@ -979,6 +984,63 @@ members = [{members}]
             ProviderRouteResolutionError::MissingAdapter { provider, adapter, .. }
                 if provider == "broken" && adapter == "nonexistent_adapter"
         ));
+    }
+
+    #[test]
+    fn adapter_error_lists_at_most_n_adapters_sorted() {
+        let adapter_names: Vec<String> = (0..MAX_ADAPTERS_IN_ERROR + 3)
+            .map(|i| format!("adapter_{i:02}"))
+            .collect();
+        let adapters: HashMap<String, ProviderAdapterConfig> = adapter_names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "http://127.0.0.1:1/v1".to_owned(),
+                        headers: Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
+                    },
+                )
+            })
+            .collect();
+        let provider = ProviderConfig {
+            name: "many".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters,
+            routes: ProviderRoutesConfig {
+                chat_completions: Some("missing_adapter".to_owned()),
+                messages: None,
+                ..Default::default()
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+
+        let error = registry
+            .resolve_provider_route("many", ProviderRouteKind::ChatCompletions, "model")
+            .expect_err("missing adapter");
+
+        let ProviderRouteResolutionError::MissingAdapter { available, .. } = error else {
+            panic!("expected MissingAdapter, got: {error:?}");
+        };
+        assert_eq!(
+            available, "adapter_00, adapter_01, adapter_02, adapter_03, adapter_04 (+3 more)",
+            "first {MAX_ADAPTERS_IN_ERROR} adapter names in sorted order, then the overflow count"
+        );
     }
 
     #[test]
