@@ -19,7 +19,6 @@ use crate::sse::SseFrame;
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 
 fn sanitize_tool_name(name: &str) -> (String, bool) {
-    use std::fmt::Write;
     let sentinel = "__llmp_";
     let max_len = 128;
     let mut result = String::with_capacity(name.len() * 3 + sentinel.len());
@@ -31,12 +30,8 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         } else {
             let mut buf = [0u8; 4];
             let encoded = ch.encode_utf8(&mut buf);
-            #[expect(
-                clippy::expect_used,
-                reason = "writing into a String cannot fail (no formatter errors on a String)"
-            )]
             for &byte in encoded.as_bytes() {
-                write!(result, "_0x{:02x}_", byte).expect("write! to String is infallible");
+                result.push_str(&format!("_0x{byte:02x}_"));
             }
             changed = true;
         }
