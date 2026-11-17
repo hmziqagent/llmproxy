@@ -1992,6 +1992,140 @@ async fn a_streaming_joiner_of_a_failed_shared_stream_records_a_failed_row() {
     );
 }
 
+/// A streaming upstream that emits its `message_start` frame immediately and
+/// then stalls `stall` before any further frame, so a leader commits and goes
+/// quiet long before a terminal event exists.
+fn stall_after_message_start_upstream(calls: Arc<AtomicUsize>, stall: Duration) -> Router {
+    Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let start = bytes::Bytes::from_static(
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stall\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                );
+                let rest = vec![
+                    bytes::Bytes::from_static(
+                        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"after the stall\"}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ),
+                ];
+                let body_stream = futures::stream::iter(vec![start])
+                    .map(Ok::<_, std::convert::Infallible>)
+                    .chain(
+                        futures::stream::once(async move {
+                            tokio::time::sleep(stall).await;
+                            rest
+                        })
+                        .map(futures::stream::iter)
+                        .map(|stream| stream.map(Ok::<_, std::convert::Infallible>))
+                        .flatten(),
+                    );
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_leader_dropped_after_commit_ends_its_joiners_with_collected_events_and_an_error() {
+    // The documented known limitation (plan 06, docs/completed/
+    // 06-cache-and-dedup.md): once a shared stream has committed, a
+    // disconnecting leader ends it for its joiners, who receive the events
+    // collected so far and an in-band error rather than the remainder of the
+    // response. The leader's client disconnects (drops its stream) while the
+    // upstream is stalled before the terminal; the joiner parked on the share
+    // must not hang and must not be handed a clean MessageStop.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(stall_after_message_start_upstream(
+        Arc::clone(&calls),
+        Duration::from_millis(500),
+    ))
+    .await;
+    let engine = build_engine(endpoint, Arc::new(RecordingBus::new()), None);
+
+    let leader = engine
+        .execute_stream(engine_request(
+            true,
+            "committed then dropped",
+            "caller-a",
+            None,
+        ))
+        .await
+        .expect("the leader commits on its first event");
+    let first = leader.head.first().cloned();
+    assert!(
+        matches!(first, Some(CoreEvent::MessageStart { .. })),
+        "the leader's first event is the commit boundary: {first:?}"
+    );
+
+    // A joiner arriving while the committed leader still holds the share
+    // (the upstream is stalled): it must join the share, not run its own
+    // upstream call.
+    let joiner_engine = engine.clone();
+    let joiner = tokio::spawn(async move {
+        let stream = joiner_engine
+            .execute_stream(
+                engine_request(true, "committed then dropped", "caller-a", None)
+                    .with_request_id("req-joiner"),
+            )
+            .await
+            .expect("the joiner joins the committed share");
+        collect_stream(stream).await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        in_flight(&engine),
+        (0, 1),
+        "no flight runs and the leader's share is still held: {engine:?}"
+    );
+    assert!(
+        !joiner.is_finished(),
+        "the joiner is parked on the share's outcome"
+    );
+
+    // The leader's client disconnects: dropping its stream is that
+    // disconnect, before the upstream ever reaches its terminal.
+    drop(leader);
+    let joiner_events = joiner.await.expect("the joiner task joins");
+
+    assert!(
+        joiner_events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStart { .. })),
+        "the joiner receives the events collected before the drop: {joiner_events:?}"
+    );
+    assert!(
+        !joiner_events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the joiner never receives the remainder of the response: {joiner_events:?}"
+    );
+    match joiner_events.last() {
+        Some(CoreEvent::Error { error }) => assert!(
+            error.message().contains("ended early"),
+            "the joiner's replay ends in the shared-stream-ended-early error, got {error:?}"
+        ),
+        other => panic!("the joiner's replay must end in-band with an error, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one leader, one upstream call; the joiner never executed on its own"
+    );
+}
+
 #[tokio::test]
 async fn served_copies_record_no_cost() {
     // Plan 05 step 6: cache hits charge nothing. The row keeps the stored
