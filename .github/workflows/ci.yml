@@ -222,7 +222,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Redis live suite
-        run: cargo test -p llm-proxy-store-redis --test live_server -- --ignored --locked
+        run: cargo test -p llm-proxy-store-redis --test live_server --locked -- --ignored
 
       - name: Postgres live suite
         run: cargo test -p llm-proxy-store-postgres -- --ignored --locked
