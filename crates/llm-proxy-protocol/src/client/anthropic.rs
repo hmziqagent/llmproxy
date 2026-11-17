@@ -428,12 +428,8 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             is_error,
             cache,
         } => {
-            let content_val = if content.len() == 1 {
-                if let CoreContent::Text { ref text, .. } = content[0] {
-                    Some(serde_json::Value::String(text.clone()))
-                } else {
-                    Some(serde_json::to_value(&content).unwrap_or(serde_json::Value::Null))
-                }
+            let content_val = if let [CoreContent::Text { text, .. }] = content.as_slice() {
+                Some(serde_json::Value::String(text.clone()))
             } else if content.is_empty() {
                 None
             } else {
