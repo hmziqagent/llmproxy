@@ -17,7 +17,7 @@ pub mod provider_config;
 /// Provider registry: load provider TOML files and resolve route targets.
 pub mod provider_registry;
 /// Self-loop prevention (egress hop header, config-time upstream checks).
-pub mod self_loop;
+mod self_loop;
 /// Token counting utilities.
 pub mod token;
 
