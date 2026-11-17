@@ -673,6 +673,45 @@ mod tests {
         ];
         assert!(cors_layer_for(Some(&origins)).is_some());
     }
+
+    #[test]
+    fn source_guards_forbid_global_model_routing() {
+        // Model routing is per-provider by URL; a global model route must be
+        // reintroduced nowhere in the route modules. Each file is cut at its
+        // first `#[cfg(test)]` so the guard list below does not trip itself.
+        let forbidden = [
+            "resolve_model_route",
+            "ModelRoute",
+            "resolve_adapter_target",
+            "ModelRouteError",
+            "ProviderModelConfig",
+        ];
+        let modules = [
+            ("chat.rs", include_str!("chat.rs")),
+            ("messages.rs", include_str!("messages.rs")),
+            ("responses.rs", include_str!("responses.rs")),
+            ("gemini_generate.rs", include_str!("gemini_generate.rs")),
+            ("models.rs", include_str!("models.rs")),
+            ("token_count.rs", include_str!("token_count.rs")),
+            ("families.rs", include_str!("families.rs")),
+            ("ollama.rs", include_str!("ollama.rs")),
+            ("core_pipeline.rs", include_str!("core_pipeline.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+        ];
+        for (file, source) in modules {
+            let prod = source
+                .split_once("#[cfg(test)]")
+                .map(|(prod, _)| prod)
+                .unwrap_or(source);
+            for pattern in &forbidden {
+                assert!(
+                    !prod.contains(pattern),
+                    "routes/{file} production code must not contain '{pattern}' \
+                     (route modules resolve providers by URL, not a global model route)"
+                );
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod auth_gate_tests {
