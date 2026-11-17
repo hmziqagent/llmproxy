@@ -373,6 +373,7 @@ mod tests {
     use super::*;
     use axum::Json;
     use axum::Router;
+    use axum::extract::Query;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::get;
@@ -675,6 +676,190 @@ mod tests {
             matches!(error, ProviderError::InvalidConfig(ref message) if message.contains("has_more")),
             "expected InvalidConfig mentioning 'has_more', got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn anthropic_pagination_follows_has_more_with_after_id() {
+        #[derive(Clone)]
+        struct Seen {
+            calls: Arc<AtomicUsize>,
+            after_id_hits: Arc<AtomicUsize>,
+            versions: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        async fn paged_models(
+            State(seen): State<Seen>,
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+        ) -> Json<Value> {
+            seen.calls.fetch_add(1, Ordering::SeqCst);
+            seen.versions.lock().expect("versions lock").push(
+                headers
+                    .get(ANTHROPIC_VERSION_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_owned(),
+            );
+            if params.get("after_id").map(String::as_str) == Some("b") {
+                seen.after_id_hits.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"data": [{"id": "a"}], "has_more": false}))
+            } else {
+                Json(json!({"data": [{"id": "b"}], "has_more": true, "last_id": "b"}))
+            }
+        }
+
+        let seen = Seen {
+            calls: Arc::new(AtomicUsize::new(0)),
+            after_id_hits: Arc::new(AtomicUsize::new(0)),
+            versions: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(paged_models))
+                .with_state(seen.clone()),
+        )
+        .await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::AnthropicModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect("anthropic pagination must follow has_more via after_id");
+
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"], "both pages must be merged and sorted");
+        assert_eq!(
+            seen.calls.load(Ordering::SeqCst),
+            2,
+            "two pages: the first and the after_id=b follow-up"
+        );
+        assert_eq!(
+            seen.after_id_hits.load(Ordering::SeqCst),
+            1,
+            "the server must see after_id=b exactly once"
+        );
+        let versions = seen.versions.lock().expect("versions lock").clone();
+        assert_eq!(
+            versions,
+            vec![
+                DEFAULT_ANTHROPIC_VERSION.to_owned(),
+                DEFAULT_ANTHROPIC_VERSION.to_owned()
+            ],
+            "every discovery request must carry anthropic-version 2023-06-01"
+        );
+    }
+
+    #[tokio::test]
+    async fn fireworks_account_models_parse_models_and_next_page_token() {
+        async fn account_models(
+            State(seen): State<Arc<std::sync::Mutex<Vec<Option<String>>>>>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            seen.lock()
+                .expect("page-token lock")
+                .push(params.get("pageToken").cloned());
+            if params.get("pageToken").map(String::as_str) == Some("t1") {
+                Json(json!({"data": [{"id": "m2"}]}))
+            } else {
+                Json(json!({
+                    "models": [{"name": "accounts/x/models/m1", "displayName": "M1"}],
+                    "nextPageToken": "t1"
+                }))
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(account_models))
+                .with_state(Arc::clone(&seen)),
+        )
+        .await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::FireworksAccountModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect("fireworks account models must parse both page shapes");
+
+        assert_eq!(models.len(), 2, "both pages must be consumed");
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["accounts/x/models/m1", "m2"], "output must be sorted");
+        assert_eq!(
+            models[0].display_name.as_deref(),
+            Some("M1"),
+            "displayName must map to display_name"
+        );
+        assert_eq!(
+            *seen.lock().expect("page-token lock"),
+            vec![None, Some("t1".to_owned())],
+            "the next page must be requested with pageToken=t1 exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_deduplicates_ids_across_pages_keeping_first_seen_metadata() {
+        async fn duplicated_pages(
+            State(calls): State<Arc<AtomicUsize>>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if params.contains_key("after_id") {
+                Json(json!({"data": [{"id": "dup", "display_name": "Second"}], "has_more": false}))
+            } else {
+                Json(json!({
+                    "data": [{"id": "zzz"}, {"id": "dup", "display_name": "First"}],
+                    "has_more": true,
+                    "last_id": "zzz"
+                }))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(duplicated_pages))
+                .with_state(Arc::clone(&calls)),
+        )
+        .await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::AnthropicModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect("duplicate ids across pages must be deduplicated, not fail");
+
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["dup", "zzz"],
+            "duplicates removed, deterministic sorted order"
+        );
+        let dup = models
+            .iter()
+            .find(|model| model.id == "dup")
+            .expect("dup entry kept");
+        assert_eq!(
+            dup.display_name.as_deref(),
+            Some("First"),
+            "dedup must keep the first-seen metadata"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
