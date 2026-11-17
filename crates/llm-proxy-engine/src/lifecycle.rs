@@ -970,9 +970,11 @@ async fn record_attempt_failure(
     error: &EngineError,
     attempt_start: Instant,
 ) {
+    let upstream_model = ladder.member_model(member);
     tracing::debug!(
         route = %ladder.plan.route,
         member = %member,
+        upstream_model = %upstream_model,
         error = %error,
         "upstream attempt failed"
     );
@@ -985,7 +987,7 @@ async fn record_attempt_failure(
             seq: ladder.seq - 1,
             route: &ladder.plan.route,
             provider: member,
-            model: &ladder.member_model(member),
+            model: &upstream_model,
             credential_id: ladder.current_credential.as_deref(),
             outcome: AttemptOutcome::Failed,
             error: Some(error),
@@ -1497,6 +1499,13 @@ async fn run_ladder_once(
                 req.inbound.auth.as_ref(),
             )
             .await?;
+            tracing::debug!(
+                request_id = %req.request_id,
+                provider = %attempt.target.provider_name,
+                requested_model = %attempt.target.requested_model,
+                upstream_model = %attempt.target.upstream_model,
+                "dispatching upstream attempt"
+            );
             ladder.current_credential = attempt.credential_id.clone();
             avoid_credential = attempt.credential_id.clone();
 
@@ -2628,6 +2637,13 @@ async fn stream_attempt(
                 return false;
             }
         };
+        tracing::debug!(
+            request_id = %req.request_id,
+            provider = %attempt.target.provider_name,
+            requested_model = %attempt.target.requested_model,
+            upstream_model = %attempt.target.upstream_model,
+            "dispatching upstream attempt"
+        );
         stream.ladder.current_credential = attempt.credential_id.clone();
 
         let mut wire: ClientWireRequest = req.inbound.wire.clone();

@@ -166,11 +166,15 @@ fn core_request(stream: bool) -> CoreRequest {
 }
 
 fn engine_request(stream: bool) -> EngineRequest {
+    engine_request_with_core(core_request(stream))
+}
+
+fn engine_request_with_core(core: CoreRequest) -> EngineRequest {
     EngineRequest::new(
         "fake",
         ProviderRouteKind::Messages,
         ClientDialect::Anthropic,
-        core_request(stream),
+        core,
         InboundRequest {
             auth: None,
             headers: Default::default(),
@@ -185,13 +189,34 @@ fn engine_request(stream: bool) -> EngineRequest {
 }
 
 fn build_engine(endpoint: String, bus: Arc<RecordingBus>) -> Engine {
-    let registry =
-        ProviderRegistry::from_providers(vec![provider(endpoint)]).expect("provider registry");
+    build_engine_for(provider(endpoint), bus)
+}
+
+fn build_engine_for(provider: ProviderConfig, bus: Arc<RecordingBus>) -> Engine {
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("provider registry");
     EngineBuilder::new(test_config())
         .providers(Arc::new(registry))
         .event_bus(bus as Arc<dyn EventBus>)
         .build()
         .expect("engine builds")
+}
+
+/// A fake upstream that records every request body it receives and always
+/// answers with the same successful Anthropic body.
+fn upstream_capturing_body(seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move |body: axum::body::Bytes| async move {
+            let value = serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap_or(serde_json::Value::Null);
+            seen.lock().expect("captured bodies lock").push(value);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello from upstream"}],"model":"real-model","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}"#,
+            )
+        }),
+    )
 }
 
 #[tokio::test]
@@ -411,4 +436,51 @@ async fn unknown_provider_fails_without_egress() {
         error,
         llm_proxy_engine::EngineError::UnknownProvider(_)
     ));
+}
+
+/// The alias maps the client's `fast` to `real-model`: the rewritten model
+/// reaches the upstream body, and the ledger row records it as the request's
+/// upstream model. These are the observable counterparts of the engine's
+/// `upstream_model` tracing field (fix brief R-10); the log field itself has
+/// no assertion here — capturing tracing output is not worth a subscriber in
+/// this suite, so the field is checked by the `upstream_model = %` grep in
+/// the item's done-when instead.
+#[tokio::test]
+async fn aliased_model_reaches_upstream_as_upstream_model() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let upstream = spawn_upstream(upstream_capturing_body(Arc::clone(&captured))).await;
+    let bus = Arc::new(RecordingBus::new());
+    let mut provider_config = provider(upstream);
+    provider_config
+        .model_aliases
+        .insert("fast".to_owned(), "real-model".to_owned());
+    let engine = build_engine_for(provider_config, Arc::clone(&bus));
+
+    let mut core = core_request(false);
+    core.model = ModelRef {
+        requested: "fast".to_owned(),
+        upstream: None,
+    };
+    engine
+        .execute(engine_request_with_core(core))
+        .await
+        .expect("execute ok");
+
+    let bodies = captured.lock().expect("captured bodies lock");
+    assert_eq!(bodies.len(), 1, "exactly one upstream request");
+    assert_eq!(
+        bodies[0].get("model").and_then(|model| model.as_str()),
+        Some("real-model"),
+        "the alias must be rewritten before the body reaches the upstream"
+    );
+
+    let ledger_upstream_model = bus.snapshot().into_iter().find_map(|event| match event {
+        ProxyEvent::ResponseCompleted(completed) => Some(completed.model.upstream),
+        _ => None,
+    });
+    assert_eq!(
+        ledger_upstream_model,
+        Some(Some("real-model".to_owned())),
+        "the ledger row must name the upstream model"
+    );
 }
