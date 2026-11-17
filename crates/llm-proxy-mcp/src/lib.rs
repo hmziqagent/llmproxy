@@ -16,8 +16,11 @@
 //! The gateway's *own* session model (which the protocol does not
 //! define) is per-token: each presented gateway token identifies a
 //! client whose session ages out after the configured TTL, and admission
-//! is charged per session caller (`mcp:<token-id>`), so one MCP client
-//! cannot outspend the limits the operator set for it.
+//! is charged per gateway token (caller id `mcp-token-<n>`, the token's
+//! index in `[mcp] tokens`), so one MCP client cannot outspend the
+//! limits the operator set for it. Those indexes shift when an operator
+//! reorders the `[mcp] tokens` list, which changes the caller ids the
+//! usage rows and budgets key on.
 //!
 //! Provenance for wire shapes: the MCP Streamable HTTP transport
 //! specification, revision 2026-07-28
