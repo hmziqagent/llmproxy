@@ -49,10 +49,10 @@ jobs:
           exit 1
 
       - name: Gateway over the reference server (live_upstream)
-        run: cargo test -p llm-proxy-mcp --test live_upstream -- --ignored --locked
+        run: cargo test -p llm-proxy-mcp --test live_upstream --locked -- --ignored
 
       - name: Reference inspector client through the gateway (live_client)
-        run: cargo test -p llm-proxy-mcp --test live_client -- --ignored --test-threads 1 --locked
+        run: cargo test -p llm-proxy-mcp --test live_client --locked -- --ignored --test-threads 1
 
   # The endpoint families whose reference implementations can be pinned:
   # llama.cpp (embeddings, rerank) and speaches (speech, transcriptions).
@@ -98,9 +98,9 @@ jobs:
 
       - name: Families live suite (embeddings, rerank, audio)
         run: |
-          cargo test -p llm-proxy-server --features endpoint-families --test live_families \
-            embeddings_reach_a_real_server_through_the_alias -- --ignored --locked
-          cargo test -p llm-proxy-server --features endpoint-families --test live_families \
-            rerank_reaches_a_real_reranker_through_the_alias -- --ignored --locked
-          cargo test -p llm-proxy-server --features endpoint-families --test live_families \
-            speech_and_transcription_round_trip_through_a_real_audio_server -- --ignored --locked
+          cargo test -p llm-proxy-server --features endpoint-families --test live_families --locked \
+            -- --ignored embeddings_reach_a_real_server_through_the_alias
+          cargo test -p llm-proxy-server --features endpoint-families --test live_families --locked \
+            -- --ignored rerank_reaches_a_real_reranker_through_the_alias
+          cargo test -p llm-proxy-server --features endpoint-families --test live_families --locked \
+            -- --ignored speech_and_transcription_round_trip_through_a_real_audio_server
