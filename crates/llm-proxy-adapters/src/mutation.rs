@@ -7,7 +7,10 @@
 //!    foreign fields the target wire format does not define, and (for
 //!    cross-format requests) encoding the normalized core request under
 //!    the field policy. On a same-format route these never alter prompt
-//!    content: `tools`, `system` and `messages` survive byte-for-byte.
+//!    content: `tools`, `system` and `messages` survive byte-for-byte,
+//!    with one deterministic exception: a foreign `signature` field on
+//!    `tool_use` blocks is dropped on every turn alike, so the prefix
+//!    stays stable across turns.
 //! 3. **Operator hygiene** (opt-in, `[provider.prompt_cache]`, plan 06
 //!    step 7) — volatile-byte removal and cache-marker injection at the
 //!    provider edge, applied last, immediately before serialization.
