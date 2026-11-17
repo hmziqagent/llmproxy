@@ -1220,3 +1220,83 @@ async fn a_fully_consumed_stream_that_is_dropped_stays_completed() {
     drop(stream);
     assert_completed_without_client_cancel(&bridge).await;
 }
+
+/// Every bridge in the process shares one async runtime, and that one
+/// runtime serves them all: two differently-configured bridges each run a
+/// request through `runtime().block_on` — the exact pattern the Python
+/// binding uses — from two plain interpreter-like threads at the same time,
+/// against the same runtime. The multi-thread test flavor keeps the fake
+/// upstream serving while the test thread waits on those threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_bridges_in_a_process_share_one_runtime() {
+    let upstream = spawn_fake_upstream().await;
+    let chat_only = json!({
+        "providers": [{
+            "name": "chatco",
+            "api_key": "operator-key",
+            "auth_style": "bearer",
+            "adapters": {
+                "chat": {
+                    "protocol": "openai_chat_completions",
+                    "endpoint": format!("{}/v1/chat/completions", upstream.base_url)
+                }
+            },
+            "routes": { "chat_completions": "chat" }
+        }]
+    });
+    let a = Bridge::from_json(&bridge_config(&upstream, false)).expect("bridge builds");
+    let b = Bridge::from_json(&chat_only).expect("second bridge builds");
+
+    let a_runtime = a.runtime();
+    let b_runtime = b.runtime();
+    assert!(
+        std::ptr::eq(a_runtime, b_runtime),
+        "both bridges must hand out the same process-wide runtime"
+    );
+
+    let (first, second) = std::thread::scope(|scope| {
+        let left = scope.spawn(move || {
+            a.runtime().block_on(a.execute(
+                "acme",
+                "anthropic_messages",
+                &anthropic_body(),
+                &ExecuteOptions::default(),
+            ))
+        });
+        let right = scope.spawn(move || {
+            b.runtime().block_on(b.execute(
+                "chatco",
+                "openai_chat_completions",
+                &openai_body(),
+                &ExecuteOptions::default(),
+            ))
+        });
+        (left.join(), right.join())
+    });
+    let first = first
+        .expect("the first thread joins")
+        .expect("the request on the first bridge succeeds");
+    let second = second
+        .expect("the second thread joins")
+        .expect("the request on the second bridge succeeds");
+    assert_eq!(first["id"], "msg_bridge_1");
+    assert_eq!(second["object"], "chat.completion");
+}
+
+/// Dropping the last bridge from inside an async context must not panic:
+/// the runtime the bridge hands out is process-wide and never dropped. A
+/// per-bridge runtime dropped here would panic ("cannot drop a runtime in a
+/// context where blocking is not allowed") — the exact failure mode the
+/// shared runtime exists to prevent, since language embedders cannot control
+/// which of their threads drops the last bridge.
+#[tokio::test]
+async fn a_bridge_can_be_dropped_inside_an_async_context() {
+    // Acquire the bridge off the async worker, the way a language runtime's
+    // setup thread would, then drop it on the async path.
+    let bridge = tokio::task::spawn_blocking(|| {
+        Bridge::from_json(&offline_bridge_config()).expect("bridge builds")
+    })
+    .await
+    .expect("the building thread joins");
+    drop(bridge);
+}
