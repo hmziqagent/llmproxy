@@ -205,13 +205,14 @@ fn read_line<R: Read>(reader: &mut R, buffer: &mut Vec<u8>) -> Option<()> {
         if reader.read_exact(&mut byte).is_err() {
             return None;
         }
-        if byte[0] == b'\n' {
+        let [value] = byte;
+        if value == b'\n' {
             if buffer.last() == Some(&b'\r') {
                 buffer.pop();
             }
             return Some(());
         }
-        buffer.push(byte[0]);
+        buffer.push(value);
     }
 }
 
