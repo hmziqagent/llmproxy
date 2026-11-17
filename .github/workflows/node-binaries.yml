@@ -11,7 +11,8 @@ name: Node binaries
 # install-tested by consumers, but not executed here. Cross-compilation
 # invocations for the pinned CLI (@napi-rs/cli 3.10.12): --use-napi-cross
 # drives the @napi-rs/cross-toolchain compilers shipped with the CLI for
-# both the aarch64-gnu and the x86_64-musl Linux targets, and a --target
+# the aarch64-gnu Linux target; musl is not a napi-cross target, so that
+# leg cross-compiles with musl-gcc via --cross-compile; and a --target
 # build on a foreign triple never generates the loader files, so the
 # linux-x64-gnu leg builds it with a plain `npm run build`. The release
 # workflow (10-13) reuses this file through workflow_call.
@@ -46,10 +47,11 @@ jobs:
             build_mode: napi-cross
             build_targets: aarch64-unknown-linux-gnu
             artifact: node-binary-linux-aarch64-gnu
-          # cross-built with @napi-rs/cross-toolchain; install-only, not run
+          # cross-built with musl-gcc (--cross-compile: napi-cross does not
+          # support musl); install-only, not run
           - name: linux-x64-musl
             os: ubuntu-22.04
-            build_mode: napi-cross
+            build_mode: musl-cross
             build_targets: x86_64-unknown-linux-musl
             artifact: node-binary-linux-x64-musl
           - name: darwin-x64-and-arm64
@@ -87,6 +89,10 @@ jobs:
             npm run build
           elif [ "${{ matrix.build_mode }}" = "napi-cross" ]; then
             npx napi build --platform --release --target ${{ matrix.build_targets }} --use-napi-cross
+          elif [ "${{ matrix.build_mode }}" = "musl-cross" ]; then
+            sudo apt-get update && sudo apt-get install -y musl-tools
+            CC_x86_64_unknown_linux_musl=musl-gcc \
+              npx napi build --platform --release --target x86_64-unknown-linux-musl --cross-compile
           elif [ "${{ matrix.build_mode }}" = "darwin" ]; then
             npx napi build --platform --release --target x86_64-apple-darwin
             npx napi build --platform --release --target aarch64-apple-darwin
