@@ -69,8 +69,10 @@ asserts that no recorded row contains prompt or response text.
 
 - **Stores:** nothing. It edits outgoing request bytes (strips configured
   volatile pointers, optionally injects cache markers) at the provider
-  edge. It reads `[provider.prompt_cache]` from config; no request or
-  response data is retained.
+  edge. Markers are injected only into array-form `system`/`content`; a
+  request whose `system` or message `content` is a plain string is passed
+  through untouched. It reads `[provider.prompt_cache]` from config; no
+  request or response data is retained.
 
 ## Opt-in stores from the optional crates (plan 09)
 

@@ -74,8 +74,9 @@ prompt caches from the proxy's own edits.
   operator opted in.
 - `[provider.prompt_cache]` strips configured volatile JSON pointers and
   injects Anthropic `cache_control` markers within the four-breakpoint budget
-  (newest message never marked, client markers kept). Malformed pointers are
-  refused at config load. No fingerprinting.
+  (newest message never marked, client markers kept). Markers go only into
+  array-form `system`/`content`; string-form prompts are passed through
+  untouched. Malformed pointers are refused at config load. No fingerprinting.
 - Fix that fell out: `AppState`'s engine cell is `Arc`-shared across state
   clones — axum clones the state per request, and a per-clone cell gave every
   request a fresh engine, which would have silently emptied the cache,

@@ -107,6 +107,11 @@ fn has_invalid_escape(token: &str) -> bool {
 /// never marked (it changes every turn), and each earlier message carries
 /// at most one new marker. Markers the client already set count against
 /// the budget and are kept where they are.
+///
+/// Markers are injected only into array-form `system`/`content`. A request
+/// whose `system` or message `content` is a plain string is passed through
+/// untouched: injection never rewrites content shape, only marks existing
+/// blocks.
 pub(crate) fn inject_anthropic_markers(request: &mut Value) {
     // A client may carry more markers than the provider's budget allows:
     // its own markers all stay (the budget for new ones is simply spent).
@@ -442,6 +447,30 @@ mod tests {
         assert!(
             request["system"][1]["cache_control"].is_null(),
             "a whitespace-only system block is never marked"
+        );
+    }
+
+    #[test]
+    fn string_form_content_is_left_alone() {
+        // Simple clients send `system` and message `content` as plain
+        // strings. Injection never rewrites content shape — markers go
+        // only into array-form `system`/`content` — so a string-form
+        // request must come out byte-identical.
+        let mut request = json!({
+            "model": "claude-sonnet-4-6",
+            "system": "you are a proxy",
+            "messages": [
+                {"role": "user", "content": "turn 1"},
+                {"role": "assistant", "content": "reply 1"},
+                {"role": "user", "content": "turn 2 (newest)"}
+            ]
+        });
+        let before = request.to_string();
+        inject_anthropic_markers(&mut request);
+        assert_eq!(
+            request.to_string(),
+            before,
+            "a string-form request is passed through byte-identical"
         );
     }
 
