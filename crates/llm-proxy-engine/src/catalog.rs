@@ -671,6 +671,43 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn failed_refresh_leaves_cache_file_bytes_unchanged() {
+        let (endpoint, count) = failing_server().await;
+        let directory = temp_dir();
+        write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
+        let cache_path = directory.join("test-provider.toml");
+        let before = std::fs::read(&cache_path).unwrap();
+
+        let service = catalog_service(Some(directory.clone()));
+        let models = service.catalog(&provider(endpoint), true).await.unwrap();
+
+        assert_eq!(
+            models.len(),
+            1,
+            "the stale cached model must still be served"
+        );
+        assert_eq!(models[0].id, "cached-model");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize,
+            "the failing endpoint must have been reached"
+        );
+        let after = std::fs::read(&cache_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a failed refresh must not truncate or replace the last known good cache"
+        );
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.ends_with(".tmp"),
+                "no temporary catalog file may survive a failed refresh: {name}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// A discovery endpoint whose `nextPageToken` never changes, so live
     /// refresh must fail instead of caching a one-page truncation.
     async fn stalled_pagination_server() -> String {
@@ -1135,6 +1172,82 @@ mod tests {
             count.load(Ordering::SeqCst),
             0,
             "a cache fresh under the default TTL must not be refetched"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `refresh=live` refreshes only when the cache TTL has expired: a cache
+    /// written "now" with an explicit 1h TTL must serve from the cache on
+    /// every call without contacting discovery.
+    #[tokio::test]
+    async fn live_refresh_skips_discovery_while_cache_is_fresh() {
+        let directory = temp_dir();
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write_catalog_atomic(&directory, &catalog_file(&now)).unwrap();
+        let (endpoint, count) = succeeding_server(vec!["live-model"]).await;
+        let mut p = provider(endpoint);
+        p.catalog
+            .as_mut()
+            .expect("fixture provider has a catalog section")
+            .cache_ttl = Duration::from_secs(3600);
+        let service = catalog_service(Some(directory.clone()));
+
+        let first = service.catalog(&p, true).await.unwrap();
+        let second = service.catalog(&p, true).await.unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a cache fresh within its 1h TTL must not be refetched on refresh=live"
+        );
+        assert_eq!(
+            first[0].id, "cached-model",
+            "the cached model must be served without a live refresh"
+        );
+        assert_eq!(second[0].id, "cached-model");
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The counterpart: an expired cache makes `refresh=live` run discovery
+    /// once, rewrite the on-disk cache with the new models, and then stay
+    /// fresh for the next call.
+    #[tokio::test]
+    async fn live_refresh_runs_once_when_cache_is_expired() {
+        let directory = temp_dir();
+        write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
+        let (endpoint, count) = succeeding_server(vec!["live-model"]).await;
+        let p = provider(endpoint);
+        let service = catalog_service(Some(directory.clone()));
+
+        let models = service.catalog(&p, true).await.unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "an expired cache must trigger exactly one live refresh"
+        );
+        assert_eq!(models.len(), 1, "the discovered model must be served");
+        assert_eq!(models[0].id, "live-model");
+
+        service.catalog(&p, true).await.unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the just-refreshed cache must be fresh, so no second refresh"
+        );
+
+        let raw = std::fs::read_to_string(directory.join("test-provider.toml")).unwrap();
+        let decoded: CatalogFile = toml::from_str(&raw).unwrap();
+        assert_eq!(decoded.catalog.source, "live");
+        assert_eq!(decoded.catalog.models.len(), 1);
+        assert_eq!(
+            decoded.catalog.models[0].id, "live-model",
+            "the file on disk must hold the newly discovered model"
         );
 
         std::fs::remove_dir_all(directory).unwrap();
