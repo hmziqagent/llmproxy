@@ -876,6 +876,32 @@ mod tests {
     }
 
     #[test]
+    fn clones_share_one_engine_instance() {
+        let state = AppState::new(
+            make_app_config(),
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::try_new().expect("client"),
+            make_build_info(),
+        )
+        .expect("app state");
+        let a = state.clone();
+        let b = state.clone();
+        // Build order matters: the first call lazily materializes the shared
+        // slot; a per-clone cell would build a fresh engine per clone here.
+        let ea = a.engine().expect("engine builds on the first clone");
+        let eb = b.engine().expect("engine builds on the second clone");
+        assert!(
+            Arc::ptr_eq(&ea, &eb),
+            "clones must share one lazily built engine, not rebuild per clone"
+        );
+        assert!(
+            Arc::ptr_eq(&state.engine().expect("engine builds on the original"), &ea),
+            "the original state must hold the same engine as its clones"
+        );
+    }
+
+    #[test]
     fn multi_provider_toml_mixed_protocols() {
         use llm_proxy_core::{
             AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
