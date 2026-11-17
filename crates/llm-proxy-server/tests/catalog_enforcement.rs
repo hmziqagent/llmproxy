@@ -15,11 +15,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{
     AppConfig, AuthStyle, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode,
-    ProviderConfig, ProviderRegistry, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
+    ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderRegistry,
+    ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
 };
 use llm_proxy_server::{AppState, BuildInfo, build_router};
 use llm_proxy_transport::ProxyClient;
@@ -170,6 +171,10 @@ fn provider_with_catalog(
 }
 
 fn state_with_provider(provider: ProviderConfig) -> AppState {
+    state_with_providers(vec![provider])
+}
+
+fn state_with_providers(providers: Vec<ProviderConfig>) -> AppState {
     let app_config = AppConfig {
         server: ServerConfig {
             bind: "127.0.0.1:3456".parse().expect("bind address"),
@@ -198,7 +203,7 @@ fn state_with_provider(provider: ProviderConfig) -> AppState {
         replica: None,
         mcp: None,
     };
-    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    let registry = ProviderRegistry::from_providers(providers).expect("registry");
     AppState::new(
         app_config,
         registry,
@@ -472,5 +477,161 @@ async fn enforcement_rejection_is_openai_shaped_on_messages_route_too() {
         upstream.hit_count(),
         0,
         "the messages route must reject before any upstream call"
+    );
+}
+
+/// A fake OpenAI-compatible discovery endpoint that counts how many times
+/// the proxy fetched the model list (fix-brief R-18).
+async fn spawn_counting_discovery() -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let router = {
+        let hits = Arc::clone(&hits);
+        Router::new().route(
+            "/{*path}",
+            get(move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"data":[{"id":"live-model"}]}"#,
+                    )
+                        .into_response()
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake discovery endpoint");
+    let addr = listener.local_addr().expect("fake discovery addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::trace!(%error, "fake discovery endpoint stopped");
+        }
+    });
+    (format!("http://{addr}/models"), hits)
+}
+
+/// Provider selection is URL-only (fix-brief R-18): `X-LLM-Provider` and
+/// `x-provider` headers must not divert a request from the provider named in
+/// the path to another configured provider.
+#[tokio::test]
+async fn provider_header_does_not_select_the_provider() {
+    let upstream_a = spawn_counting_upstream().await;
+    let upstream_b = spawn_counting_upstream().await;
+    let app = build_router(state_with_providers(vec![
+        provider_with_catalog("a", &upstream_a, None, &[], false),
+        provider_with_catalog("b", &upstream_b, None, &[], false),
+    ]));
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/providers/a/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-llm-provider", "b")
+        .header("x-provider", "b")
+        .body(Body::from(
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .expect("chat request");
+    let response = app.oneshot(request).await.expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        upstream_a.hit_count(),
+        1,
+        "the URL names provider a, so a's upstream must serve the request"
+    );
+    assert_eq!(
+        upstream_b.hit_count(),
+        0,
+        "X-LLM-Provider/x-provider headers must not route the request to b"
+    );
+}
+
+/// Building the app state and serving health plus one completion never calls
+/// discovery when catalog enforcement is off (fix-brief R-18): only
+/// `/models?refresh=live` may fetch the model list.
+#[tokio::test]
+async fn building_state_never_calls_discovery() {
+    let chat = spawn_counting_upstream().await;
+    let (discovery_endpoint, discovery_hits) = spawn_counting_discovery().await;
+    let mut provider = provider_with_catalog(
+        "p",
+        &chat,
+        Some(ProviderCatalogConfig {
+            mode: ProviderCatalogMode::Discovered,
+            enforce: false,
+            ..Default::default()
+        }),
+        &[],
+        false,
+    );
+    provider.discovery = Some(ProviderDiscoveryConfig {
+        kind: ProviderDiscoveryKind::OpenAiCompatibleModels,
+        endpoint: discovery_endpoint,
+        headers: HashMap::new(),
+        max_pages: 100,
+        max_models: 20_000,
+        max_response_bytes: 4 * 1024 * 1024,
+    });
+    let app = build_router(state_with_provider(provider));
+
+    let health = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .expect("health request");
+    let response = app.clone().oneshot(health).await.expect("health response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        0,
+        "building the state and answering /health must not call discovery"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(chat_request("/providers/p/v1/chat/completions", "gpt-4"))
+        .await
+        .expect("chat response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "completions must succeed with enforcement off"
+    );
+    assert_eq!(
+        chat.hit_count(),
+        1,
+        "the completion must reach the provider's own upstream"
+    );
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        0,
+        "completions must never call discovery when enforcement is off"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(models_request("/providers/p/v1/models"))
+        .await
+        .expect("models response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        0,
+        "listing models without refresh=live must not call discovery"
+    );
+
+    let response = app
+        .oneshot(models_request("/providers/p/v1/models?refresh=live"))
+        .await
+        .expect("models response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        1,
+        "refresh=live is the only path that calls discovery"
     );
 }

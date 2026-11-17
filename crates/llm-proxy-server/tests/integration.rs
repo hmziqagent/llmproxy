@@ -219,6 +219,88 @@ mod tests {
         .expect("app state")
     }
 
+    /// A provider that only serves the chat-completions route (plan-remodel
+    /// R-18): `/v1/messages` must answer a client-error 404 naming the
+    /// provider and route, never a 500.
+    fn state_with_chat_only_provider() -> AppState {
+        let provider = ProviderConfig {
+            name: "p".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://127.0.0.1:0/v1/chat/completions".to_owned(),
+                        headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
+                    },
+                );
+                m
+            },
+            routes: ProviderRoutesConfig {
+                chat_completions: Some("chat".to_owned()),
+                messages: None,
+                ..Default::default()
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        AppState::new(
+            AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:3456".parse().unwrap(),
+                    request_timeout: Duration::from_secs(300),
+                    shutdown_timeout: Duration::from_secs(30),
+                    log_level: "info".to_owned(),
+                    hot_reload: false,
+                    allowed_origins: None,
+                    server_name: "test-proxy".to_owned(),
+                    rate_limit_rpm: 100,
+                    trust_forwarded_headers: false,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
+                    log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
+                },
+                auth: Default::default(),
+                storage: None,
+                replica: None,
+                mcp: None,
+            },
+            registry,
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::try_new().expect("client"),
+            BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+        .expect("app state")
+    }
+
     #[tokio::test]
     async fn health_returns_ok_with_body() {
         let app = build_router(state());
@@ -310,6 +392,48 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unsupported_route_returns_404_with_actionable_message() {
+        // The provider is reachable and healthy, but only serves the
+        // chat-completions route: an Anthropic-dialect client hitting
+        // `/v1/messages` must get a client-error 404 whose message names
+        // both the provider and the unsupported route, never a 500.
+        let app = build_router(state_with_chat_only_provider());
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 16
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/providers/p/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unsupported route is a client error, got {status}"
+        );
+        let resp_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let message = resp_body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("\"p\""),
+            "the 404 message must name the provider: {resp_body}"
+        );
+        assert!(
+            message.contains("\"messages\""),
+            "the 404 message must name the unsupported route: {resp_body}"
+        );
     }
 
     #[tokio::test]

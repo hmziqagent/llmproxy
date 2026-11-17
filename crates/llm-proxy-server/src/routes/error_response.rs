@@ -434,11 +434,9 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             "not_found_error",
             format!("unknown provider: {provider}"),
         ),
-        RouteError::UnsupportedRoute(msg) => (
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            msg.clone(),
-        ),
+        RouteError::UnsupportedRoute(msg) => {
+            (StatusCode::NOT_FOUND, "not_found_error", msg.clone())
+        }
         RouteError::InvalidProviderName(msg) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -1576,6 +1574,12 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (EngineError::Forbidden("no".into()), StatusCode::FORBIDDEN),
+            (
+                EngineError::UnsupportedRoute(
+                    "provider \"p\" does not support route \"messages\"".into(),
+                ),
+                StatusCode::NOT_FOUND,
+            ),
         ];
         for (engine_error, expected) in cases {
             let engine_status = engine_error.status_code();
