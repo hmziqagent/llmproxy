@@ -493,19 +493,21 @@ fn edit_raw_chat_request(
     // Edit 3: the proxy needs real usage on streams for the ledger, whatever
     // the client asked to see (the client encoder decides what is exposed).
     if core.stream {
-        let include_usage = serde_json::json!({"include_usage": true});
+        let include_usage = serde_json::Value::Bool(true);
         match obj
             .get_mut("stream_options")
             .and_then(serde_json::Value::as_object_mut)
         {
             Some(options) => {
-                options.insert(
-                    "include_usage".to_owned(),
-                    include_usage["include_usage"].clone(),
-                );
+                options.insert("include_usage".to_owned(), include_usage);
             }
             None => {
-                obj.insert("stream_options".to_owned(), include_usage);
+                let mut stream_options = serde_json::Map::new();
+                stream_options.insert("include_usage".to_owned(), include_usage);
+                obj.insert(
+                    "stream_options".to_owned(),
+                    serde_json::Value::Object(stream_options),
+                );
             }
         }
     }
