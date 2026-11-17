@@ -1991,6 +1991,120 @@ mod tests {
         );
     }
 
+    /// With every opt-in off, the persisted SQLite ledger must carry no
+    /// prompt or response bytes: a full router request is driven through a
+    /// real `SqliteEventBus` and the raw file bytes (plus WAL/SHM sidecars)
+    /// are scanned, while at least one `requests` row proves the scan
+    /// covered stored data.
+    #[tokio::test]
+    async fn the_sqlite_ledger_never_contains_prompt_or_response_text() {
+        use std::path::PathBuf;
+
+        use llm_proxy_storage::{
+            EventBus, RequestFilter, RetentionPolicy, SqliteEventBus, UsageReader,
+        };
+
+        const PROMPT_MARKER: &str = "SECRET-PROMPT-ZQ7";
+        const REPLY_MARKER: &str = "SECRET-REPLY-ZQ7";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("usage.db");
+        let bus = Arc::new(
+            SqliteEventBus::open(
+                &db,
+                RetentionPolicy {
+                    max_age: None,
+                    max_rows: None,
+                    prune_every: Duration::from_secs(3600),
+                },
+            )
+            .expect("ledger opens"),
+        );
+
+        let upstream_reply = json!({
+            "id": "msg_secretreply",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": format!("upstream says {REPLY_MARKER}")
+            }],
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        });
+        let mock_url = spawn_mock_server(
+            serde_json::to_vec(&upstream_reply).expect("reply serializes"),
+            "application/json",
+        )
+        .await;
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
+        let app = build_router(state);
+
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": format!("tell me about {PROMPT_MARKER}")
+            }],
+            "max_tokens": 64,
+            "stream": false
+        })
+        .to_string();
+        let resp = app
+            .oneshot(messages_request(&body))
+            .await
+            .expect("request runs");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body reads");
+        let client_text = String::from_utf8_lossy(&bytes);
+        assert!(
+            client_text.contains(REPLY_MARKER),
+            "control: the client must actually receive the reply marker: {client_text}"
+        );
+
+        // Close drains the writer queue into the file before any byte is
+        // read, so the scan cannot race a pending batch.
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close joins");
+
+        let mut raw = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", db.display()));
+            if let Ok(ledger_bytes) = std::fs::read(&sidecar) {
+                raw.extend_from_slice(&ledger_bytes);
+            }
+        }
+        assert!(!raw.is_empty(), "the ledger file must exist on disk");
+        let ledger_text = String::from_utf8_lossy(&raw);
+        assert!(
+            !ledger_text.contains(PROMPT_MARKER),
+            "prompt bytes leaked into the raw ledger bytes"
+        );
+        assert!(
+            !ledger_text.contains(REPLY_MARKER),
+            "response bytes leaked into the raw ledger bytes"
+        );
+
+        let page = UsageReader::new(&db)
+            .requests(RequestFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .expect("ledger reads back");
+        assert!(
+            !page.rows.is_empty(),
+            "the run must persist at least one requests row for the scan to be meaningful"
+        );
+    }
+
     #[tokio::test]
     async fn priced_provider_attaches_cost_to_response_completed() {
         use std::sync::Arc;
