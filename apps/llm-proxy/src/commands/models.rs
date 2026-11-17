@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -12,19 +13,20 @@ use llm_proxy_transport::DiscoveryClient;
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};
 
-fn print_provider_routes(provider: &ProviderConfig) {
+fn print_provider_routes(out: &mut dyn Write, provider: &ProviderConfig) -> std::io::Result<()> {
     let has_routes =
         provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
-    println!("    routes:");
+    writeln!(out, "    routes:")?;
     if let Some(ref adapter) = provider.routes.chat_completions {
-        println!("      chat_completions -> {adapter}");
+        writeln!(out, "      chat_completions -> {adapter}")?;
     }
     if let Some(ref adapter) = provider.routes.messages {
-        println!("      messages -> {adapter}");
+        writeln!(out, "      messages -> {adapter}")?;
     }
     if !has_routes {
-        println!("      (none configured)");
+        writeln!(out, "      (none configured)")?;
     }
+    Ok(())
 }
 
 fn discovered_catalog_file(
@@ -43,21 +45,54 @@ fn discovered_catalog_file(
     }
 }
 
-fn print_model_entries(entries: &[StaticModelCatalogEntry]) {
-    println!("    models:");
+fn print_model_entries(
+    out: &mut dyn Write,
+    entries: &[StaticModelCatalogEntry],
+) -> std::io::Result<()> {
+    writeln!(out, "    models:")?;
     if entries.is_empty() {
-        println!("      (none available)");
+        writeln!(out, "      (none available)")?;
     } else {
         for entry in entries {
-            println!("      {}", entry.id);
+            writeln!(out, "      {}", entry.id)?;
         }
     }
+    Ok(())
 }
 
 /// Run the `models` command.
 ///
 /// Lists provider routes and static, cached, or live model catalogs.
 pub async fn cmd_models(
+    config_path: Option<PathBuf>,
+    provider_filter: Option<String>,
+    live: bool,
+    write_catalog: bool,
+    require_success: bool,
+) -> Result<()> {
+    let mut out = std::io::stdout();
+    run_models(
+        &mut out,
+        config_path,
+        provider_filter,
+        live,
+        write_catalog,
+        require_success,
+    )
+    .await
+}
+
+/// The body of the `models` command, writing its report into `out`.
+///
+/// Split from [`cmd_models`] so tests can capture the printed report without
+/// seizing the process stdout.
+///
+/// # Errors
+///
+/// Returns config-loading errors, `--live` misconfiguration, and discovery
+/// failures when `require_success` is set.
+async fn run_models(
+    out: &mut dyn Write,
     config_path: Option<PathBuf>,
     provider_filter: Option<String>,
     live: bool,
@@ -78,8 +113,8 @@ pub async fn cmd_models(
     };
 
     if registry.is_empty() {
-        println!("No providers configured.");
-        println!("Add provider files to {}", providers_dir.display());
+        writeln!(out, "No providers configured.")?;
+        writeln!(out, "Add provider files to {}", providers_dir.display())?;
         return Ok(());
     }
 
@@ -105,12 +140,12 @@ pub async fn cmd_models(
         DiscoveryClient::try_new().context("building the HTTP client for model discovery")?;
     let catalogs = ModelCatalogService::new(Some(cache_dir.clone()), discovery.clone());
 
-    println!("Provider models (from {}):", providers_dir.display());
-    println!();
+    writeln!(out, "Provider models (from {}):", providers_dir.display())?;
+    writeln!(out)?;
     for provider in &providers {
-        println!("  {}:", provider.name);
+        writeln!(out, "  {}:", provider.name)?;
 
-        print_provider_routes(provider);
+        print_provider_routes(out, provider)?;
 
         let catalog_config = provider.catalog.clone().unwrap_or_default();
         let entries = if live {
@@ -144,7 +179,7 @@ pub async fn cmd_models(
             catalogs.catalog(provider, false).await?
         };
 
-        print_model_entries(&entries);
+        print_model_entries(out, &entries)?;
     }
 
     Ok(())
@@ -296,5 +331,160 @@ auth_style = "bearer"
         .expect_err("--live requires discovery configuration");
 
         assert!(error.to_string().contains("no discovery configuration"));
+    }
+
+    /// Serve `/models` with a bare 500 so `discover` fails after its retries.
+    async fn start_erroring_discovery_server() -> std::net::SocketAddr {
+        let app = Router::new().route(
+            "/models",
+            get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        address
+    }
+
+    fn write_provider_with_discovery_at(
+        providers: &std::path::Path,
+        name: &str,
+        address: std::net::SocketAddr,
+    ) {
+        std::fs::write(
+            providers.join(format!("{name}.toml")),
+            format!(
+                r#"[provider]
+name = "{name}"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "http://{address}/models"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_catalog_cache(providers: &std::path::Path, name: &str, model_id: &str) -> String {
+        let cache = format!(
+            r#"[catalog]
+provider = "{name}"
+source = "live"
+generated_at = "2026-01-01T00:00:00Z"
+
+[[catalog.models]]
+id = "{model_id}"
+"#
+        );
+        let cache_dir = providers.join(".catalog");
+        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(format!("{name}.toml")), &cache).unwrap();
+        cache
+    }
+
+    #[tokio::test]
+    async fn models_without_live_never_touches_the_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+        let providers = directory.path().join("providers");
+        std::fs::create_dir(&providers).unwrap();
+        std::fs::write(
+            providers.join("no-net.toml"),
+            // Discovery points at a port nothing listens on; the hybrid
+            // default merges the static entry with the cached discovery.
+            r#"[provider]
+name = "no-net"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "http://127.0.0.1:9/v1/models"
+
+[[provider.catalog.models]]
+id = "static-model"
+"#,
+        )
+        .unwrap();
+        write_catalog_cache(&providers, "no-net", "cached-model");
+
+        let mut report = Vec::new();
+        let started = std::time::Instant::now();
+        run_models(&mut report, Some(config), None, false, false, false)
+            .await
+            .expect("listing without --live must succeed from static and cache alone");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a non-live listing must not wait on the unreachable discovery \
+             endpoint, took {:?}",
+            started.elapsed()
+        );
+        let report = String::from_utf8(report).expect("the models report is UTF-8");
+        assert!(
+            report.contains("static-model"),
+            "static entry listed: {report}"
+        );
+        assert!(
+            report.contains("cached-model"),
+            "cached entry listed: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_live_require_success_fails_when_discovery_fails() {
+        let address = start_erroring_discovery_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+        let providers = directory.path().join("providers");
+        std::fs::create_dir(&providers).unwrap();
+        write_provider_with_discovery_at(&providers, "failing", address);
+        let cache_before = write_catalog_cache(&providers, "failing", "pre-existing");
+        let cache_path = providers.join(".catalog").join("failing.toml");
+
+        let error = cmd_models(Some(config), Some("failing".to_owned()), true, true, true)
+            .await
+            .expect_err("--require-success must fail the command when discovery fails");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("500"),
+            "the failure names the discovery status: {message}"
+        );
+        let cache_after =
+            std::fs::read(&cache_path).expect("the pre-existing cache file must survive");
+        assert_eq!(
+            cache_after,
+            cache_before.as_bytes(),
+            "--write-catalog must not touch the cache when discovery failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_live_without_require_success_falls_back_to_cache() {
+        let address = start_erroring_discovery_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+        let providers = directory.path().join("providers");
+        std::fs::create_dir(&providers).unwrap();
+        write_provider_with_discovery_at(&providers, "fallback", address);
+        let cache_before = write_catalog_cache(&providers, "fallback", "pre-existing");
+        let cache_path = providers.join(".catalog").join("fallback.toml");
+
+        cmd_models(Some(config), Some("fallback".to_owned()), true, true, false)
+            .await
+            .expect("without --require-success a discovery failure falls back to the cache");
+
+        let cache_after = std::fs::read(&cache_path).unwrap();
+        assert_eq!(
+            cache_after,
+            cache_before.as_bytes(),
+            "the failed live refresh must leave the cached catalog untouched"
+        );
     }
 }

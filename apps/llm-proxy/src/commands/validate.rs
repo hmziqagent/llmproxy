@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -84,8 +85,10 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     if registry.is_empty() {
         println!("  (no providers loaded)");
     } else {
+        let mut out = std::io::stdout();
         for provider in registry.iter() {
-            print_provider_routes(provider);
+            print_provider_routes(&mut out, provider)
+                .context("printing the provider route table")?;
         }
     }
 
@@ -121,33 +124,133 @@ fn configured_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<(&'static
         .collect()
 }
 
-/// Print every route `provider` configures as `route_key -> adapter/protocol`.
+/// Write every route `provider` configures as `route_key -> adapter/protocol`
+/// into `out`.
 ///
-/// Display only: `validate_provider_config` already refused dangling or
-/// empty route adapter names when the file was loaded, so this never runs
-/// as the route-existence guard.
-fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) {
-    println!("{}:", provider.name);
+/// Takes a writer so tests can capture the route table without seizing the
+/// process stdout. Display only: `validate_provider_config` already refused
+/// dangling or empty route adapter names when the file was loaded, so this
+/// never runs as the route-existence guard.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when a write fails.
+fn print_provider_routes(
+    out: &mut dyn Write,
+    provider: &llm_proxy_core::ProviderConfig,
+) -> std::io::Result<()> {
+    writeln!(out, "{}:", provider.name)?;
 
     let route_entries = configured_routes(provider);
 
     if route_entries.is_empty() {
-        println!("  (no routes configured)");
-        return;
+        writeln!(out, "  (no routes configured)")?;
+        return Ok(());
     }
 
     for (route_kind, adapter_name) in route_entries {
         match provider.adapters.get(adapter_name) {
-            Some(adapter) => println!("  {route_kind} -> {adapter_name}/{}", adapter.protocol),
-            None => println!("  {route_kind} -> {adapter_name}"),
+            Some(adapter) => {
+                writeln!(out, "  {route_kind} -> {adapter_name}/{}", adapter.protocol)?
+            }
+            None => writeln!(out, "  {route_kind} -> {adapter_name}")?,
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::defaults::DEFAULT_CONFIG_TOML;
+
+    fn provider_from_toml(raw: &str) -> llm_proxy_core::ProviderConfig {
+        toml::from_str::<toml::Table>(raw)
+            .ok()
+            .and_then(|table| table.get("provider").cloned())
+            .and_then(|provider| provider.try_into().ok())
+            .expect("provider parses")
+    }
+
+    #[test]
+    fn validate_prints_route_table_line_per_route() {
+        let provider = provider_from_toml(
+            r#"[provider]
+name = "tabled"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.openai]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/chat/completions"
+[provider.adapters.anthropic]
+protocol = "anthropic_messages"
+endpoint = "http://127.0.0.1:9/v1/messages"
+[provider.routes]
+chat_completions = "openai"
+messages = "anthropic"
+"#,
+        );
+
+        let mut buffer = Vec::new();
+        print_provider_routes(&mut buffer, &provider).expect("writing to a Vec buffer cannot fail");
+        let printed = String::from_utf8(buffer).expect("the route table is UTF-8");
+
+        let route_lines: Vec<&str> = printed.lines().filter(|line| line.contains("->")).collect();
+        assert_eq!(
+            route_lines,
+            vec![
+                "  chat_completions -> openai/openai_chat_completions",
+                "  messages -> anthropic/anthropic_messages",
+            ],
+            "one route-table line per configured route, got: {printed:?}"
+        );
+    }
+
+    #[test]
+    fn validate_reports_dangling_route_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/dangling.toml"),
+            r#"[provider]
+name = "dangling"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.files]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/files"
+
+[provider.routes]
+files = "ghost"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#,
+        )
+        .unwrap();
+
+        let error = cmd_validate(Some(&config))
+            .expect_err("a route naming an adapter that does not exist must fail validation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ghost"),
+            "the error names the dangling adapter: {message}"
+        );
+        assert!(
+            message.contains("files"),
+            "the error names the route kind that dangles: {message}"
+        );
+    }
 
     #[test]
     fn validate_lists_every_configured_route_kind() {
