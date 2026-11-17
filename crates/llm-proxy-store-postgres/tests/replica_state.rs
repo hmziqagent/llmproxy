@@ -39,6 +39,22 @@ fn claim<'a>(caller: &'a str) -> AdmissionClaim<'a> {
     }
 }
 
+/// The same claim, addressed to a named pool member: the rekey tests
+/// price members "a" and "b" separately, so their reserves must claim
+/// member "a" before failing over.
+fn claim_on<'a>(caller: &'a str, member: &'a str) -> AdmissionClaim<'a> {
+    AdmissionClaim {
+        caller,
+        provider: member,
+        member,
+        model: "m",
+        requested_model: "m",
+        body_hash: "h",
+        estimated_input_tokens: 500,
+        max_output_tokens: Some(500),
+    }
+}
+
 fn pricing() -> HashMap<(String, String), ModelPricing> {
     let price = ModelPricing {
         input: "0.001".parse().expect("decimal"),
@@ -352,11 +368,11 @@ async fn a_rekey_to_a_pricier_member_moves_the_shared_day_reservation() {
     // a's estimate (0.001) fits twice; the lease then fails over to b,
     // whose estimate (0.01) fills the budget exactly.
     let first = admission
-        .reserve(&claim(&caller))
+        .reserve(&claim_on(&caller, "a"))
         .await
         .expect("a's estimate fits");
     admission
-        .reserve(&claim(&caller))
+        .reserve(&claim_on(&caller, "a"))
         .await
         .expect("a's estimate fits twice");
 
@@ -366,7 +382,7 @@ async fn a_rekey_to_a_pricier_member_moves_the_shared_day_reservation() {
         .expect("b's pricier estimate still fits once");
 
     let refused = admission
-        .reserve(&claim(&caller))
+        .reserve(&claim_on(&caller, "a"))
         .await
         .expect_err("a's estimate no longer fits beside b's");
     assert_eq!(refused.status_code(), 402);
@@ -383,7 +399,7 @@ async fn a_rekey_to_a_pricier_member_moves_the_shared_day_reservation() {
     );
     let released = async {
         loop {
-            if admission.reserve(&claim(&caller)).await.is_ok() {
+            if admission.reserve(&claim_on(&caller, "a")).await.is_ok() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -421,7 +437,7 @@ async fn a_rekey_that_would_exceed_the_shared_budget_is_refused() {
     ));
 
     let ticket = admission
-        .reserve(&claim(&caller))
+        .reserve(&claim_on(&caller, "a"))
         .await
         .expect("a's estimate fits");
     let refused = admission
@@ -433,7 +449,7 @@ async fn a_rekey_that_would_exceed_the_shared_budget_is_refused() {
     // Nothing moved: a's estimate still fits beside the untouched
     // reservation.
     admission
-        .reserve(&claim(&caller))
+        .reserve(&claim_on(&caller, "a"))
         .await
         .expect("a's estimate still fits beside the untouched reservation");
 
@@ -449,7 +465,7 @@ async fn a_rekey_that_would_exceed_the_shared_budget_is_refused() {
     );
     let released = async {
         loop {
-            if admission.reserve(&claim(&caller)).await.is_ok() {
+            if admission.reserve(&claim_on(&caller, "a")).await.is_ok() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
