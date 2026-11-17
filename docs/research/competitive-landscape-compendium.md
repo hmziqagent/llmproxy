@@ -995,7 +995,7 @@ analysis" marks items the audited report carried no usable findings for.
 | uni-api and GPT-Load | Findings noted | Market map; Auth, Routing and resilience, Rate limiting, Cost, Caching (absence), Guardrails, Observability, Protocol, Prompt caching, Admin; gap 5 |
 | Martian and Not Diamond | Findings noted | Market map status (Martian live 2026-10-27); Protocol |
 | OpenPipe and Keywords AI (now Respan) | Findings noted — OpenPipe: sunset status only; Respan: detailed | Market map status (OpenPipe); Auth, Routing, Rate limiting, Cost, Caching, Guardrails, MCP, Protocol, Admin (Respan) |
-| Upstash AI Gateway | Negative finding — verified not to exist (11 live checks incl. sitemap, llms.txt, GitHub, npm, DNS) | Market map |
+| Upstash AI Gateway (not a product) | Negative finding — verified not to exist (11 live checks incl. sitemap, llms.txt, GitHub, npm, DNS); see the note under the product tables | Market map |
 
 ### Wave 2 — doc sweeps (10)
 
