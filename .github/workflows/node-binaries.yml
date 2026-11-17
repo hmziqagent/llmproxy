@@ -41,10 +41,12 @@ jobs:
             build_mode: native-with-loader
             build_targets: x86_64-unknown-linux-gnu
             artifact: node-binary-linux-x64-gnu
-          # cross-built with @napi-rs/cross-toolchain; install-only, not run
+          # cross-built with gcc-aarch64-linux-gnu (--cross-compile: the
+          # committed lockfile does not carry the napi-cross toolchain
+          # packages); install-only, not run
           - name: linux-aarch64-gnu
             os: ubuntu-22.04
-            build_mode: napi-cross
+            build_mode: gnu-cross
             build_targets: aarch64-unknown-linux-gnu
             artifact: node-binary-linux-aarch64-gnu
           # cross-built with musl-gcc (--cross-compile: napi-cross does not
@@ -87,8 +89,11 @@ jobs:
             # the target above, so this rebuild is incremental and produces
             # binding.js/binding.d.ts for the main package.
             npm run build
-          elif [ "${{ matrix.build_mode }}" = "napi-cross" ]; then
-            npx napi build --platform --release --target ${{ matrix.build_targets }} --use-napi-cross
+          elif [ "${{ matrix.build_mode }}" = "gnu-cross" ]; then
+            sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+              CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8" \
+              npx napi build --platform --release --target aarch64-unknown-linux-gnu --cross-compile
           elif [ "${{ matrix.build_mode }}" = "musl-cross" ]; then
             sudo apt-get update && sudo apt-get install -y musl-tools
             CC_x86_64_unknown_linux_musl=musl-gcc \

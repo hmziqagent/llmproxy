@@ -194,7 +194,7 @@ unless real use says otherwise.
   same documented wire APIs.
 - Ongoing live evidence: the MCP suites (server-everything 2.2.1,
   inspector 2.14.0) and the embeddings, rerank and audio family tests
-  (llama.cpp `server-b7205`, speaches `0.7.0-cpu`) run nightly in
+  (llama.cpp `server-b7205`, speaches `0.8.0-cpu`) run nightly in
   `.github/workflows/live-external.yml`; every live test fails naming
   its env var when the server is missing, so a run cannot pass
   vacuously. Still manual only: images (no published `sd-server` image
