@@ -1,8 +1,6 @@
 //! Anthropic Messages API provider adapter: translates core requests,
 //! responses, and event streams to and from the Anthropic wire format.
 
-use std::sync::LazyLock;
-
 use llm_proxy_protocol::anthropic::{MessageEvent, MessageResponse};
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreResponse, CoreRole,
@@ -19,14 +17,6 @@ use crate::protocols;
 use crate::sse::SseFrame;
 
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
-
-#[expect(
-    clippy::expect_used,
-    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
-              error caught the moment this static is first used, not a runtime input"
-)]
-static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
 fn sanitize_tool_name(name: &str) -> (String, bool) {
     use std::fmt::Write;
@@ -150,7 +140,16 @@ const fn hex_digit(b: u8) -> Option<u8> {
 }
 
 fn sanitize_tool_use_id(id: &str) -> String {
-    let sanitized: String = INVALID_TOOL_USE_ID_CHAR.replace_all(id, "_").into_owned();
+    let sanitized: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     if sanitized.len() > 256 {
         let mut end = 256;
         while !sanitized.is_char_boundary(end) && end > 0 {
@@ -1330,6 +1329,13 @@ mod tests {
     #[test]
     fn sanitize_tool_use_id_empty_becomes_default() {
         assert_eq!(sanitize_tool_use_id(""), "tool_result");
+    }
+
+    #[test]
+    fn sanitised_tool_use_id_keeps_ascii_word_chars_and_replaces_the_rest() {
+        assert_eq!(sanitize_tool_use_id("call-1.x"), "call_1_x");
+        assert_eq!(sanitize_tool_use_id("é"), "_");
+        assert_eq!(sanitize_tool_use_id("ok_1"), "ok_1");
     }
 
     #[test]
