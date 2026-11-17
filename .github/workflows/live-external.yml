@@ -43,8 +43,11 @@ jobs:
       - name: Reference MCP server (@modelcontextprotocol/server-everything@2.2.1)
         run: |
           npx -y @modelcontextprotocol/server-everything@2.2.1 streamableHttp &
+          # A plain GET /mcp is refused by the streamable HTTP transport
+          # (405), so readiness is "the port answers HTTP at all", not a
+          # 2xx on that path.
           for _ in $(seq 1 60); do
-            if curl -sf -o /dev/null http://127.0.0.1:3001/mcp; then exit 0; fi
+            if curl -s -o /dev/null http://127.0.0.1:3001/mcp; then exit 0; fi
             sleep 1
           done
           echo "server-everything did not come up on 3001"
@@ -86,23 +89,17 @@ jobs:
             -hf ggml-org/jina-reranker-v1-turbo-en-GGUF \
             --reranking --host 0.0.0.0 --port 8080
 
-      # The tests name the models they need; preloading them here keeps
-      # the first test request from paying the download.
+      # v0.7.0 loads models on their first use — it has no load endpoint
+      # (POST /v1/models/{id} answers 405) — so the tests pay the one-time
+      # downloads themselves; this step only waits for the API to answer.
       - name: speaches audio server (ghcr.io/speaches-ai/speaches:0.7.0-cpu)
         run: |
           docker run -d -p 18084:8000 ghcr.io/speaches-ai/speaches:0.7.0-cpu
-          # /health answers while the API is still booting, so readiness is
-          # the model preloads themselves: poll both until they succeed,
-          # then assert them once more so a timeout still fails the step.
           for _ in $(seq 1 120); do
-            if curl -sf -o /dev/null -X POST http://127.0.0.1:18084/v1/models/Systran/faster-whisper-base.en \
-              && curl -sf -o /dev/null -X POST http://127.0.0.1:18084/v1/models/speaches-ai/Kokoro-82M-v1.0-ONNX-int8; then
-              break
-            fi
+            if curl -sf -o /dev/null http://127.0.0.1:18084/v1/models; then break; fi
             sleep 2
           done
-          curl -sf -X POST http://127.0.0.1:18084/v1/models/Systran/faster-whisper-base.en
-          curl -sf -X POST http://127.0.0.1:18084/v1/models/speaches-ai/Kokoro-82M-v1.0-ONNX-int8
+          curl -sf -o /dev/null http://127.0.0.1:18084/v1/models
 
       - name: Families live suite (embeddings, rerank, audio)
         run: |
