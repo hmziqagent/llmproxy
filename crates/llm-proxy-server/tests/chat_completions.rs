@@ -6,6 +6,7 @@
 mod tests {
 
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use axum::{
@@ -377,6 +378,147 @@ mod tests {
         )
     }
 
+    fn openai_chat_success_response_with_id(id: &str) -> Vec<u8> {
+        let mut response: Value = serde_json::from_slice(&openai_chat_success_response()).unwrap();
+        response["id"] = json!(id);
+        serde_json::to_vec(&response).unwrap()
+    }
+
+    async fn spawn_mock_with_body_capture_and_hits(
+        response_id: &str,
+    ) -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+        std::sync::Arc<AtomicUsize>,
+    ) {
+        let captured: std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let captured_clone = std::sync::Arc::clone(&captured);
+        let hits_clone = std::sync::Arc::clone(&hits);
+        let response_body = openai_chat_success_response_with_id(response_id);
+        let app = Router::new().route(
+            "/{*path}",
+            post(move |body: axum::body::Bytes| {
+                let captured = std::sync::Arc::clone(&captured_clone);
+                let hits = std::sync::Arc::clone(&hits_clone);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut guard = captured.lock().await;
+                    *guard = Some(body.to_vec());
+                    drop(guard);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        response_body.clone(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        (
+            format!(
+                "http://{}/providers/mock-provider/v1/chat/completions",
+                addr
+            ),
+            captured,
+            hits,
+        )
+    }
+
+    fn openai_chat_provider(name: &str, api_key: &str, endpoint: &str) -> ProviderConfig {
+        let mut adapters = HashMap::new();
+        adapters.insert(
+            "chat".to_owned(),
+            ProviderAdapterConfig {
+                protocol: "openai_chat_completions".to_owned(),
+                endpoint: endpoint.to_owned(),
+                headers: std::sync::Arc::new(HashMap::new()),
+                forward_inbound_headers: None,
+                lossy: false,
+            },
+        );
+        ProviderConfig {
+            name: name.to_owned(),
+            api_key: secrecy::SecretString::from(api_key),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters,
+            routes: llm_proxy_core::ProviderRoutesConfig {
+                chat_completions: Some("chat".to_owned()),
+                messages: None,
+                ..Default::default()
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        }
+    }
+
+    fn state_with_providers(providers: Vec<ProviderConfig>) -> AppState {
+        let registry = ProviderRegistry::from_providers(providers).expect("registry");
+        let app_config = AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                allowed_origins: None,
+                server_name: "test-proxy".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
+                log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
+            },
+            auth: Default::default(),
+            storage: None,
+            replica: None,
+            mcp: None,
+        };
+        AppState::new(
+            app_config,
+            registry,
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::try_new().expect("client"),
+            BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+        .expect("app state")
+    }
+
+    fn chat_request_for_provider(provider: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/providers/{provider}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
     fn empty_state() -> AppState {
         let app_config = AppConfig {
             server: ServerConfig {
@@ -721,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_model_returns_openai_shaped_400() {
+    async fn unknown_provider_returns_openai_shaped_404() {
         let app = build_router(empty_state());
         let body = make_chat_body("nonexistent-model", false);
         let resp = app.oneshot(chat_request(&body)).await.unwrap();
@@ -1846,151 +1988,105 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one end-to-end routing scenario: two provider registries, two \
-                 dispatches, and their divergent assertions read as a single \
-                 narrative"
-    )]
     #[tokio::test]
     async fn same_model_routes_to_different_providers() {
-        let mut adapters_a = HashMap::new();
-        adapters_a.insert(
-            "chat".to_owned(),
-            ProviderAdapterConfig {
-                protocol: "openai_chat_completions".to_owned(),
-                endpoint: "https://provider-a.example.com/v1/chat/completions".to_owned(),
-                headers: std::sync::Arc::new(HashMap::new()),
-                forward_inbound_headers: None,
-                lossy: false,
-            },
-        );
-        let provider_a = ProviderConfig {
-            name: "provider-a".to_owned(),
-            api_key: secrecy::SecretString::from("key-a"),
-            auth_style: AuthStyle::Bearer,
-            passthrough_auth: false,
-            api_keys: None,
-            retry: None,
-            egress: None,
-            adapters: adapters_a,
-            routes: llm_proxy_core::ProviderRoutesConfig {
-                chat_completions: Some("chat".to_owned()),
-                messages: None,
-                ..Default::default()
-            },
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-            pricing: Default::default(),
-            concurrency: None,
-            pricing_sync: None,
-            prompt_cache: None,
-        };
+        let (url_a, captured_a, hits_a) = spawn_mock_with_body_capture_and_hits("from-a").await;
+        let (url_b, captured_b, hits_b) = spawn_mock_with_body_capture_and_hits("from-b").await;
+        let app = build_router(state_with_providers(vec![
+            openai_chat_provider("provider-a", "key-a", &url_a),
+            openai_chat_provider("provider-b", "key-b", &url_b),
+        ]));
 
-        let mut adapters_b = HashMap::new();
-        adapters_b.insert(
-            "chat".to_owned(),
-            ProviderAdapterConfig {
-                protocol: "openai_chat_completions".to_owned(),
-                endpoint: "https://provider-b.example.com/v1/chat/completions".to_owned(),
-                headers: std::sync::Arc::new(HashMap::new()),
-                forward_inbound_headers: None,
-                lossy: false,
-            },
-        );
-        let provider_b = ProviderConfig {
-            name: "provider-b".to_owned(),
-            api_key: secrecy::SecretString::from("key-b"),
-            auth_style: AuthStyle::Bearer,
-            passthrough_auth: false,
-            api_keys: None,
-            retry: None,
-            egress: None,
-            adapters: adapters_b,
-            routes: llm_proxy_core::ProviderRoutesConfig {
-                chat_completions: Some("chat".to_owned()),
-                messages: None,
-                ..Default::default()
-            },
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-            pricing: Default::default(),
-            concurrency: None,
-            pricing_sync: None,
-            prompt_cache: None,
-        };
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }]
+        })
+        .to_string();
 
-        let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).unwrap();
-        let state = AppState::new(
-            AppConfig {
-                server: ServerConfig {
-                    bind: "127.0.0.1:3456".parse().unwrap(),
-                    request_timeout: Duration::from_secs(30),
-                    shutdown_timeout: Duration::from_secs(30),
-                    log_level: "info".to_owned(),
-                    hot_reload: false,
-                    allowed_origins: None,
-                    server_name: "test".to_owned(),
-                    rate_limit_rpm: 100,
-                    trust_forwarded_headers: false,
-                    cache: Default::default(),
-                    idempotency: Default::default(),
-                    metrics: Default::default(),
-                    log_format: Default::default(),
-                    admin_bind: None,
-                    admin_on_main_listener: false,
-                    endpoint_families: Default::default(),
-                    upstream_timeouts: Default::default(),
-                    bare_v1: Default::default(),
-                    preflight: Default::default(),
-                    semantic_cache: Default::default(),
-                },
-                auth: Default::default(),
-                storage: None,
-                replica: None,
-                mcp: None,
-            },
-            registry,
-            ProviderAdapterRegistry::builtin(),
-            ProxyClient::try_new().expect("client"),
-            BuildInfo {
-                name: "test",
-                version: "0.0.0",
-                target: "test",
-                git_sha: "test",
-            },
-        )
-        .expect("app state");
-        let app = build_router(state);
-
-        let body = serde_json::json!({"model": "gpt-4o", "messages": []}).to_string();
-
-        let req_a = Request::builder()
-            .method("POST")
-            .uri("/providers/provider-a/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(body.clone()))
+        let resp_a = app
+            .clone()
+            .oneshot(chat_request_for_provider("provider-a", &body))
+            .await
             .unwrap();
-        let resp_a = app.clone().oneshot(req_a).await.unwrap();
-        assert_ne!(
+        assert_eq!(
             resp_a.status(),
-            StatusCode::NOT_FOUND,
-            "provider-a should resolve, not 404"
+            StatusCode::OK,
+            "provider-a must proxy to its own mock upstream"
+        );
+        let resp_a_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp_a.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resp_a_body["id"], "from-a",
+            "provider-a response must carry mock A's marker"
         );
 
-        let req_b = Request::builder()
-            .method("POST")
-            .uri("/providers/provider-b/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
+        let resp_b = app
+            .clone()
+            .oneshot(chat_request_for_provider("provider-b", &body))
+            .await
             .unwrap();
-        let resp_b = app.oneshot(req_b).await.unwrap();
-        assert_ne!(
+        assert_eq!(
             resp_b.status(),
+            StatusCode::OK,
+            "provider-b must proxy to its own mock upstream"
+        );
+        let resp_b_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp_b.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resp_b_body["id"], "from-b",
+            "provider-b response must carry mock B's marker"
+        );
+
+        let upstream_a: Value = {
+            let guard = captured_a.lock().await;
+            serde_json::from_slice(guard.as_ref().expect("mock A captured a request body"))
+                .expect("captured body is valid JSON")
+        };
+        assert_eq!(upstream_a["model"], "gpt-4o");
+        let upstream_b: Value = {
+            let guard = captured_b.lock().await;
+            serde_json::from_slice(guard.as_ref().expect("mock B captured a request body"))
+                .expect("captured body is valid JSON")
+        };
+        assert_eq!(upstream_b["model"], "gpt-4o");
+
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            1,
+            "mock A must have served exactly one request"
+        );
+        assert_eq!(
+            hits_b.load(Ordering::SeqCst),
+            1,
+            "mock B must have served exactly one request"
+        );
+
+        let resp_c = app
+            .oneshot(chat_request_for_provider("provider-c", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_c.status(),
             StatusCode::NOT_FOUND,
-            "provider-b should resolve, not 404"
+            "unknown provider must 404 without reaching any upstream"
+        );
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            1,
+            "provider-c 404 must not hit mock A"
+        );
+        assert_eq!(
+            hits_b.load(Ordering::SeqCst),
+            1,
+            "provider-c 404 must not hit mock B"
         );
     }
 }
