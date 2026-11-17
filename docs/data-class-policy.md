@@ -30,10 +30,14 @@ asserts that no recorded row contains prompt or response text.
   flight (single-flight) but never stored.
 - **Where:** in process memory. Nothing is written to disk. A restart
   empties it.
-- **Retention:** `ttl` (default 10m) from storage; at most `max_entries`
-  (default 1000), oldest stored evicted first.
+- **Retention:** `ttl` (default 10m) from the moment it is stored (when the
+  response completes); at most `max_entries` (default 1000), oldest stored
+  evicted first.
 - **Served to:** the same caller only. Keys include the caller identity, so
-  one caller's stored response is never returned to another.
+  one caller's stored response is never returned to another. Under
+  `auth.mode = "none"` every request is the `anonymous` caller, so these
+  stores are shared by all clients of that (loopback-only) listener; use
+  client keys to separate callers.
 
 ### `Idempotency-Key` replay — `[server.idempotency] enabled = true`
 
@@ -47,6 +51,10 @@ asserts that no recorded row contains prompt or response text.
   most `max_entries` (default 1000) completed outcomes, oldest completed
   evicted first. Failed requests are not stored — their key is released so a
   retry executes.
+- **Served to:** the caller that stored the outcome, replayed on a retry
+  carrying the same key. Under `auth.mode = "none"` every request is the
+  `anonymous` caller, so these stores are shared by all clients of that
+  (loopback-only) listener; use client keys to separate callers.
 - **While in flight:** the first request holds the key; a concurrent request
   with the same key gets 409 until it finishes. Nothing is stored for the
   conflict itself.
@@ -93,12 +101,16 @@ feature off, nothing it would store exists anywhere.
   streaming lookup misses).
 - **Where:** in process memory. Nothing is written to disk; a restart
   empties it.
-- **Retention:** `ttl` (default 10m) from storage; at most `max_entries`
-  (default 256) per caller, oldest evicted first.
+- **Retention:** `ttl` (default 10m) from the moment it is stored (when the
+  response completes); at most `max_entries` (default 256) per caller,
+  oldest evicted first.
 - **Served to:** the same caller only — the caller is part of the bucket
   key, so one caller's stored response is never returned to another. A
   stored prompt must reach the `threshold` cosine similarity (default
-  0.95) to be served; `1.0` behaves like an exact cache.
+  0.95) to be served; `1.0` behaves like an exact cache. Under
+  `auth.mode = "none"` every request is the `anonymous` caller, so these
+  stores are shared by all clients of that (loopback-only) listener; use
+  client keys to separate callers.
 - **Note:** the default embedder is offline and deterministic (hashed
   character trigrams); it stores only the derived vector, never the
   prompt text.

@@ -63,7 +63,10 @@ prompt caches from the proxy's own edits.
 - The response cache (opt-in, `[server.cache]`) is an exact-match,
   caller-scoped, TTL-aged, capacity-bounded `MemoryCache` behind the `Cache`
   trait; hits and served copies record a row under plan 05's rule (usage
-  kept for the record, nothing charged) and bump a cache-hit metric.
+  kept for the record, nothing charged) and bump a cache-hit metric. Under
+  `auth.mode = "none"` every request is the `anonymous` caller, so these
+  stores are shared by all clients of that (loopback-only) listener; use
+  client keys to separate callers.
 - The data-class policy (`docs/data-class-policy.md`) states what each
   opt-in stores, where and for how long; prompts and responses are stored
   nowhere by default, and a test asserts no ledger row carries their bytes.
