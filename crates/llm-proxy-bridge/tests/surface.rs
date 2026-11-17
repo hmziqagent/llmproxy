@@ -211,6 +211,118 @@ async fn execute_cross_format_encodes_the_caller_dialect_back() {
     );
 }
 
+/// Serves one fixed Anthropic body that carries an unknown top-level field
+/// and an unknown field inside a content block, so the passthrough and
+/// re-encode branches of `execute` can be told apart by where those fields
+/// end up (fix brief 10-15, report row 7).
+const PASSTHROUGH_UPSTREAM_BODY: &str = r#"{"id":"msg_bridge_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello from the fake","novel_block_meta":{"budget":4096}}],"model":"claude-sonnet-4-5","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":11,"output_tokens":3},"upstream_custom_field":"kept"}"#;
+
+async fn spawn_passthrough_upstream() -> String {
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                PASSTHROUGH_UPSTREAM_BODY,
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "passthrough upstream stopped");
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// One Anthropic-protocol provider, no model alias, routed under both
+/// dialect names so the cross-format companion can reach it too.
+fn passthrough_bridge_config(base_url: &str) -> Value {
+    json!({
+        "providers": [
+            {
+                "name": "acme",
+                "api_key": "operator-key",
+                "auth_style": "bearer",
+                "adapters": {
+                    "messages": {
+                        "protocol": "anthropic_messages",
+                        "endpoint": format!("{base_url}/v1/messages")
+                    }
+                },
+                "routes": { "messages": "messages", "chat_completions": "messages" }
+            }
+        ]
+    })
+}
+
+/// Same-format `execute` passthrough: an `anthropic_messages` caller
+/// reaching the Anthropic protocol gets the upstream body verbatim, so
+/// unknown top-level fields and unknown fields inside content blocks
+/// survive — the same guarantee the HTTP route gives.
+#[tokio::test]
+async fn a_same_format_response_is_returned_verbatim_including_unknown_fields() {
+    let base_url = spawn_passthrough_upstream().await;
+    let bridge = Bridge::from_json(&passthrough_bridge_config(&base_url)).expect("bridge builds");
+
+    let response = bridge
+        .execute(
+            "acme",
+            "anthropic_messages",
+            &anthropic_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("execute succeeds");
+
+    let served: Value =
+        serde_json::from_str(PASSTHROUGH_UPSTREAM_BODY).expect("the served body parses");
+    assert_eq!(
+        response, served,
+        "the client sees the upstream body verbatim, unknown fields included"
+    );
+}
+
+/// Cross-format companion: the same upstream body through a
+/// `chat_completions` caller drops the unknown fields, which is what proves
+/// the verbatim test really rides the passthrough branch rather than an
+/// encoder that happens to keep them.
+#[tokio::test]
+async fn a_cross_format_response_drops_unknown_fields() {
+    let base_url = spawn_passthrough_upstream().await;
+    let bridge = Bridge::from_json(&passthrough_bridge_config(&base_url)).expect("bridge builds");
+
+    let response = bridge
+        .execute(
+            "acme",
+            "openai_chat_completions",
+            &openai_body(),
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("cross-format execute succeeds");
+
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "hello from the fake"
+    );
+    let encoded = serde_json::to_string(&response).expect("response serializes");
+    assert!(
+        !encoded.contains("upstream_custom_field"),
+        "the unknown top-level field must not survive the re-encode"
+    );
+    assert!(
+        !encoded.contains("novel_block_meta"),
+        "the unknown content-block field must not survive the re-encode"
+    );
+}
+
 #[tokio::test]
 async fn forwarded_headers_reach_the_upstream_and_credentials_do_not() {
     let upstream = spawn_fake_upstream().await;
