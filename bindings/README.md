@@ -12,13 +12,21 @@ Native packages wrapping the in-process engine through one shared surface,
 
 Each package's suite replays the same plan-02 contract fixtures and compares
 against the same snapshots, so the three implementations cannot drift apart.
-Linux artifacts are built and install-tested here. Windows x64 artifacts are
-produced by mingw-w64 cross-compilation and run-verified under wine 10.0
-with the official Windows node.exe and embeddable CPython (the full Node
-contract suite and the Python driver both pass; see the package READMEs);
-the Node package also carries an msvc binary (cargo-xwin), verified the same
-way. macOS artifacts are produced by zig cross-compilation (universal2 for
-the Python wheel) and verified structurally. CI builds the Node binaries per
-platform and runs the contract suite against them on the native legs
-(`.github/workflows/node-binaries.yml`); every Python wheel is
-install-tested by `.github/workflows/python-wheels.yml`.
+Every artifact is built and verified in CI — nothing here depends on local
+cross-compilation:
+
+- `.github/workflows/python-wheels.yml` builds every Python wheel (Linux
+  x86_64 manylinux and musllinux_1_2, Linux aarch64, Windows x64, macOS
+  universal2) plus an sdist, and install-tests each OS wheel into a fresh
+  venv — the full pytest suite runs against the installed wheel on Linux,
+  Windows and macOS for CPython 3.9 and 3.13.
+- `.github/workflows/node-binaries.yml` builds one prebuilt binary per
+  `napi.targets` platform (darwin x64/arm64, Linux x64/arm64-gnu, Linux
+  x64-musl, Windows x64/arm64-msvc) and runs the contract suite against the
+  built binaries on the native Linux, Windows and macOS legs.
+
+Both workflows end in a clean-install job that removes every Rust toolchain
+from the runner, fails if cargo/rustc/rustup stay resolvable, and does the
+consumer install; see the package READMEs and
+`.github/workflows/bindings-release.yml` for the version-synced release
+path.

@@ -44,12 +44,13 @@ the engine and add no logic of their own, so they start once its API has stopped
   `retry_after` and `should_retry`. One process-wide tokio runtime is shared
   by every bridge (a per-bridge runtime panics when dropped from an async
   context).
-- **Maintenance check (steps 2–3).** crates.io, 2026-11-07: `pyo3` 0.30.1
-  (updated 2026-10-14, 298M downloads), `maturin` 1.16.0 (2026-10-29),
-  `napi` 3.16.1 (2026-10-31), `napi-derive` 3.7.0, `napi-build` 2.6.0. The
+- **Maintenance check (steps 2–3).** Verified on the release pages,
+  2026-11-17: crates.io lists `pyo3` 0.30.1 (updated 2026-10-14), `maturin`
+  1.16.0 (2026-10-29), `napi` 3.16.2 and `napi-derive` 3.7.1 (both updated
+  2026-11-11); npm lists `@napi-rs/cli` 3.10.12. The
   Node crate resolves napi 3.4.0/napi-derive 3.3.0 instead: the workspace
   MSRV (1.85) caps dependency resolution, and newer napi releases need a
-  newer rustc. `@napi-rs/cli` ^3 comes from npm.
+  newer rustc.
 - **Python package (step 2).** `bindings/python`: pyo3 0.30 (abi3-py39) +
   maturin. The extension converts dicts/lists to JSON and back; the
   pure-Python layer (`llm_proxy/__init__.py`) unpacks the error tuple into a
@@ -59,29 +60,17 @@ the engine and add no logic of their own, so they start once its API has stopped
   explicit `cancel()`/`close()`, or releasing the last reference cancels the
   upstream request and settles it as `ClientCancelled`, while releasing a
   stream that has run to its end leaves the completed settlement in place.
-  Two wheels are
-  built here: `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl`
-  (installed into a fresh venv whose `pip install` runs no Rust; 22 pytest
-  tests pass against the installed wheel) and
-  `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation),
-  which is run-verified with the embeddable Windows CPython 3.13.5 under
-  wine 10.0: every shared-contract case, the error shape, streaming,
-  cancellation (including a watchdog `cancel()` releasing a reader thread
-  blocked in `next()` on a stalled upstream) and the `ClientCancelled`
-  settlement pass (`bindings/python/tests/windows_driver.py`). The macOS
-  wheel is a
-  universal2 build produced by zig cross-compilation (`maturin build
-  --zig --target universal2-apple-darwin`; zig supplies the macOS libc
-  stubs, `llvm-lipo` merges the slices): structurally verified as a fat
-  `x86_64 + arm64` Mach-O whose undefined `Py_*` symbols resolve from the
-  host interpreter and which links only system libraries. All the wheels
-  plus an sdist are now built in CI by `.github/workflows/python-wheels.yml`
+  Every wheel plus an sdist is built in CI by
+  `.github/workflows/python-wheels.yml`
   (Linux x86_64 manylinux and musllinux_1_2, Linux aarch64 via the
   rust-cross manylinux container, Windows x64, macOS universal2), each wheel
   is checked to be `abi3`, and each OS wheel is pip-installed into a fresh
   venv (no Rust toolchain in the job) on ubuntu-22.04, windows-latest and
-  macos-15 for CPython 3.9 and 3.13, with the pytest suite run against the
-  install. The Node binaries are built per platform by
+  macos-15 for CPython 3.9 and 3.13, with the full pytest suite — every
+  shared-contract case, the error shape, streaming, cancellation (including
+  a `cancel()` releasing a reader thread blocked in `next()` on a stalled
+  upstream) and the `ClientCancelled` settlement — run against the install.
+  The Node binaries are built per platform by
   `.github/workflows/node-binaries.yml`, Windows arm64-msvc included.
   Both workflows also run a `clean-install`
   job on ubuntu-22.04, windows-latest and macos-15 that removes every Rust
@@ -99,26 +88,18 @@ the engine and add no logic of their own, so they start once its API has stopped
   `ProxyError`s and an async-iterable `Stream` whose `cancel()` settles as
   `ClientCancelled`, whose iterator `return()` cancels on a `for await`
   early exit (`break` or a throw in the loop body) and which defines
-  `Symbol.asyncDispose` for `await using` on runtimes that have it. The
-  `node --test` suite passes; the main npm package ships the loader
+  `Symbol.asyncDispose` for `await using` on runtimes that have it. CI runs
+  the `node --test` suite against the built binaries on its native legs;
+  the main npm package ships the loader
   (`binding.js`/`binding.d.ts`) plus one optional
   `@freeoxide/llm-proxy-<platform>` dependency per `napi.targets` entry
   (the `npm/<platform>/` scaffolding is committed), so `npm install` pulls
-  the prebuilt binary for the running platform with no Rust toolchain. A
-  Windows x64 binary (`llm-proxy.win32-x64-gnu.node`) is produced by
-  mingw-w64 cross-compilation — the napi import library generated from the
-  official `node.exe` exports (objdump export table → dlltool) — and
-  run-verified: the full contract suite passed under wine 10.0 with the
-  official node-v20.19.2 win-x64 `node.exe`. The npm name
+  the prebuilt binary for the running platform with no Rust toolchain. The
+  npm name
   is scoped
   (`@freeoxide/llm-proxy`) because the unscoped `llm-proxy` on npm belongs
-  to an unrelated package. An msvc binary
-  (`llm-proxy.win32-x64-msvc.node`) is produced by cargo-xwin
-  cross-compilation (the MSVC CRT/SDK libraries are fetched from Microsoft;
-  on msvc the napi symbols resolve dynamically from the host node.exe at
-  load, so no node import library is needed) and run-verified the same way:
-  with only the msvc binary present, and with both Windows binaries
-  present. Every platform binary (`llm-proxy.<platform>.node` for the seven
+  to an unrelated package. Every platform binary
+  (`llm-proxy.<platform>.node` for the seven
   `napi.targets` triples: darwin x64/arm64, Linux x64/arm64-gnu, Linux
   x64-musl, Windows x64/arm64-msvc) is built in CI by
   `.github/workflows/node-binaries.yml`; its native legs run the contract
@@ -141,8 +122,8 @@ the engine and add no logic of their own, so they start once its API has stopped
   stamps with a marker). The Python and Node suites replay the same cases
   against their own fake upstreams and compare to the same snapshots: the
   same fixtures give the same results through Rust, Python and Node
-  (13 tests through Python and Node; the Rust bridge drives the same cases
-  inside 4 aggregate tests). Streaming and cancellation are
+  (the Rust bridge replays them inside its aggregate contract tests; all
+  three suites run in CI). Streaming and cancellation are
   exercised in all three: events flow incrementally, `cancel()` stops
   delivery, the `ClientCancelled` usage row lands, and the proxy stays
   usable.

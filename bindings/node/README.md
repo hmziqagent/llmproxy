@@ -22,37 +22,15 @@ one optional dependency per supported platform
 (`@freeoxide/llm-proxy-<platform>`, listed in `package.json`); npm installs
 only the one matching the running platform, and the loader requires from it
 when no binary sits next to the package. Every platform binary is built in
-CI by `.github/workflows/node-binaries.yml`, which also runs the contract
-suite against the built binaries on the native legs (Linux x64-gnu,
-Windows x64-msvc, macOS arm64).
+CI by `.github/workflows/node-binaries.yml` (darwin x64/arm64, Linux
+x64/arm64-gnu, Linux x64-musl, Windows x64/arm64-msvc); the native Linux,
+Windows and macOS legs run the contract suite against the built binaries,
+and a final clean-install job removes every Rust toolchain from the runner,
+packs the main package and its platform package and installs both from
+local tarballs with no compiler on PATH.
 
-The local build produces the Linux binary
-(`llm-proxy.linux-x64-gnu.node`). A Windows x64 binary
-(`llm-proxy.win32-x64-gnu.node`) is produced by mingw-w64 cross-compilation:
-the napi import library is generated from the official `node.exe` exports
-(objdump export table -> dlltool), then
-
-    RUSTC_WRAPPER= LIBNODE_PATH=<dir with libnode.dll> \
-      cargo build --release --target x86_64-pc-windows-gnu
-
-(`RUSTC_WRAPPER=` disables the host's rustc cache, which does not handle
-cross-compiler names.) The Windows binary links against `node.exe`'s
-`napi_*` exports.
-Run-verified under wine 10.0 with the official node-v20.19.2 win-x64
-`node.exe`:
-
-    wine <node.exe> test/bindings.test.js   # 13/13 with llm-proxy.win32-x64-gnu.node
-
-An msvc binary (`llm-proxy.win32-x64-msvc.node`) is produced by cargo-xwin
-cross-compilation (the msvc CRT and Windows-SDK libraries are fetched from
-Microsoft; no node import library is needed, because on msvc the napi
-symbols resolve dynamically from the host `node.exe` at load):
-
-    RUSTC_WRAPPER= cargo xwin build --release --target x86_64-pc-windows-msvc
-    # llm_proxy_node.dll -> llm-proxy.win32-x64-msvc.node
-
-Run-verified the same way: 13/13 with only the msvc binary present, and
-13/13 with both Windows binaries present.
+The package requires Node >= 18 (`engines` in `package.json`; the suite
+runs on `node --test`, which needs 18).
 
 ## Use
 
@@ -96,6 +74,10 @@ Dialect names: `anthropic_messages`, `openai_chat_completions`,
 
 Failures throw `ProxyError` with `kind`, `status`, `message`,
 `retryAfterSeconds` and `shouldRetry`.
+
+recorded usage rows are kept in memory for the life of the process; drain
+with `usageEvents()` periodically, or leave `record_usage` off in
+long-running services.
 
 ## Build and test
 

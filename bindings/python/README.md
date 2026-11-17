@@ -13,27 +13,15 @@ Prebuilt wheels install with no Rust toolchain:
 pip install llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl
 ```
 
-Three wheels are produced here: the Linux x86_64 manylinux wheel (built and
-install-tested), a Windows x64 wheel
-(`llm_proxy-0.1.0-cp39-abi3-win_amd64.whl`, mingw-w64 cross-compilation via
-`RUSTC_WRAPPER= .venv/bin/maturin build --release --target
-x86_64-pc-windows-gnu -o dist`), and a macOS universal2 wheel
-(`llm_proxy-0.1.0-cp39-abi3-macosx_10_12_universal2.macosx_10_12_x86_64.macosx_11_0_arm64.whl`,
-zig cross-compilation via `RUSTC_WRAPPER= .venv/bin/maturin build --release
---zig --target universal2-apple-darwin -o dist`; zig supplies the macOS libc
-stubs and `llvm-lipo` merges the two slices). The Windows wheel is
-run-verified with the embeddable Windows CPython 3.13.5 under wine 10.0 —
-every shared-contract case, the error shape, streaming, cancellation and the
-ClientCancelled settlement pass (see `tests/windows_driver.py`). The macOS
-wheel's extension is a fat `x86_64 + arm64` Mach-O whose undefined `Py_*`
-symbols resolve from the host interpreter and which links only system
-libraries (`libSystem`, `libiconv`, `libcharset`). All the wheels are built
-in CI: the `python-wheels` workflow (`.github/workflows/python-wheels.yml`)
-builds the Linux x86_64 (manylinux and musllinux) and aarch64 wheels, the
-Windows x64 wheel and the macOS universal2 wheel, plus an sdist, then
-installs each OS wheel into a fresh venv (no Rust toolchain) and runs the
-full pytest suite against the install on Linux, Windows and macOS for
-CPython 3.9 and 3.13. The abi3 wheels support CPython 3.9+.
+Every wheel is built in CI by the `python-wheels` workflow
+(`.github/workflows/python-wheels.yml`): Linux x86_64 manylinux and
+musllinux_1_2, Linux aarch64, Windows x64 and macOS universal2, plus an
+sdist. Each OS wheel is pip-installed into a fresh venv with no Rust
+toolchain and the full pytest suite runs against the install on Linux,
+Windows and macOS for CPython 3.9 and 3.13; a final clean-install job
+removes every Rust toolchain from the runner and installs the wheel with
+`--no-index --only-binary=:all:` so nothing can compile. The wheels are
+abi3 and support CPython >= 3.9.
 
 ## Use
 
@@ -82,6 +70,10 @@ Dialect names: `anthropic_messages`, `openai_chat_completions`,
 `execute` blocks and releases the GIL while waiting. Failures raise
 `ProxyError` with `kind`, `status`, `message`, `retry_after_seconds` and
 `should_retry`.
+
+recorded usage rows are kept in memory for the life of the process; drain
+with `usage_events()` periodically, or leave `record_usage` off in
+long-running services.
 
 ## Build and test
 
