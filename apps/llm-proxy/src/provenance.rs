@@ -2,12 +2,13 @@
 //! layer it came from. One stated precedence — CLI > env > config file >
 //! default — and this module attributes the config file and default layers;
 //! the env layer appears when a `${VAR}` interpolation resolved a value or a
-//! documented env override (like `RUST_LOG_FORMAT`) wins; the CLI layer
-//! (`--port`) is applied by the serve command before this report could see
-//! it and is announced in the header instead.
+//! documented env override (like `RUST_LOG_FORMAT`) wins. The CLI layer
+//! (`--port` on `serve`) is applied by the serve command and does not appear
+//! in this report; `validate` has no CLI overrides.
 //!
 //! Only operator-facing settings are reported: no secrets (client verifiers,
-//! the admin token, provider keys) ever appear.
+//! the admin token, provider keys) ever appear. Provider files are out of
+//! scope: they carry no layering.
 
 use llm_proxy_core::AppConfig;
 
