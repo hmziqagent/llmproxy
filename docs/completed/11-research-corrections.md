@@ -40,7 +40,8 @@ references are in the [audit report](../research/audit-2026-11-05/REPORT.md).
   llm-proxy and other-products subsections) is corrected in place, marked
   "(corrected 2026-11-08 per research audit)" and cross-checked against the
   same audit line references; GA and CO carry a dated banner scoping their
-  baseline to the audited commit `79cf406`.
+  baseline to the audited commit `79cf406`, and `repo-intelligence.md`
+  carries the same scoping after its intro paragraph.
 - The paid-edition and beta features (Kong, Portkey, LiteLLM, Tyk,
   Cloudflare) are separated from self-hostable ones, and the affected
   prevalence counts are restated on that basis in both gap lists.

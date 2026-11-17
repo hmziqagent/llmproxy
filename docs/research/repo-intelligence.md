@@ -21,6 +21,12 @@ are relative to `/tmp/intel-mistral/mistral.rs` @ 52b3c49. Maintenance
 statistics (merge counts, issue tallies, dates, star counts) are reads of
 those same `research-issues/` snapshots and clone refs captured by the
 harvest; they carry no per-claim URL beyond that provenance.
+
+Statements and `path:line` citations about llm-proxy's own code describe
+commit `79cf406` (2026-11-05). Plans 01–10 have since rebuilt most of it;
+current behaviour is in [docs/goal.md](../goal.md) and
+[docs/completed/](../completed/).
+
 Nothing was built or run; llm-proxy-side statements come from the wave's
 provided inventory plus spot-checks verified this session at llm-proxy
 commit `6bcf1ef4e4d32fc0eae69b528f0e10cfea3e433b` (`git rev-parse HEAD`,
