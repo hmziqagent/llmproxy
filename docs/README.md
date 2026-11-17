@@ -10,7 +10,6 @@ Finished plans are linked under Completed below.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
-| 12 | [Fix brief: finish every completed plan](fix-brief/README.md) | Open | 01–11, remodel |
 
 How to use them:
 
