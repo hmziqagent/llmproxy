@@ -228,12 +228,10 @@ mod tests {
         }
     }
 
-    /// The structural invariant under fire: while a writer swaps whole
-    /// pairs, every snapshot a reader takes matches some installed
-    /// generation on BOTH halves. Two adjacent half-swaps (the design this
-    /// type replaces) install a mixed pair between them — one half from
-    /// the old generation, one from the new — which no generation matches,
-    /// so this test fails against that regression.
+    /// Guards against a torn read: the type offers no half-swap, so this
+    /// checks every observed snapshot is one installed generation; a
+    /// regression to separate slots would be a type-level change this test
+    /// would catch only by sampling.
     #[test]
     fn swaps_under_fire_never_serve_a_mixed_pair() {
         const SWAPS: usize = 4_096;
