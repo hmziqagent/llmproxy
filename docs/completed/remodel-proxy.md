@@ -125,9 +125,11 @@ trust_forwarded_headers = false
 server_name = "llm-proxy"
 ```
 
-`hot_reload = true` is rejected because hot reload is not implemented.
-`rate_limit_rpm = 0` disables rate limiting; direct loopback clients are
-exempt. Forwarding headers are ignored unless `trust_forwarded_headers = true`.
+`hot_reload = true` enables SIGHUP reload of provider and pool files (plan 07).
+`dedup_window` was retired (plan 06); the key is rejected at load.
+`rate_limit_rpm = 0` disables rate limiting; unauthenticated direct loopback
+clients are exempt; callers with a client key are always limited.
+Forwarding headers are ignored unless `trust_forwarded_headers = true`.
 Identical requests are never rejected; see plan 06 for single-flight, `Idempotency-Key` and the opt-in response cache.
 
 Provider config owns provider details, adapters, inbound route mapping, and
@@ -350,8 +352,11 @@ pub fn resolve_provider_route(
     provider_name: &str,
     route_kind: ProviderRouteKind,
     requested_model: &str,
-) -> Result<ProviderAdapterTargetConfig, CoreError>
+) -> Result<ProviderAdapterTargetConfig, ProviderRouteResolutionError>
 ```
+
+`RegistryRouter` maps a `ProviderRouteResolutionError` to `EngineError` with
+`EngineError::from_route_error`.
 
 The returned target keeps:
 
@@ -371,15 +376,15 @@ This preserves current provider adapter behavior:
 
 ## Server Pipeline Changes
 
-`core_pipeline::resolve_target` should resolve by provider route:
+`RegistryRouter::resolve_one` (`crates/llm-proxy-engine/src/traits.rs`) resolves
+by provider route with catalog enforcement:
 
 ```rust
-fn resolve_target(
-    state: &AppState,
-    provider_name: &str,
-    route_kind: ProviderRouteKind,
-    core: &CoreRequest,
-) -> Result<(ProviderAdapterTarget, ProviderAdapter), RouteError>
+async fn resolve_one(
+    &self,
+    query: &RouteQuery<'_>,
+    provider: &str,
+) -> Result<ResolvedTarget, EngineError>
 ```
 
 Handlers extract `Path(provider)` for canonical routes and pass it into the
@@ -611,8 +616,8 @@ Catalog normalization rules:
 - Preserve the exact upstream model ID in `id`.
 - Add display fields when the provider returns them.
 - Keep unknown provider metadata in a raw JSON field only if needed later.
-- For Gemini, strip a leading `models/` prefix only for display; preserve the
-  exact value required by the adapter path.
+- For Gemini, discovery keeps the exact id (including `models/`) and uses
+  `displayName` for display.
 - Gemini catalog enforcement treats `gemini-x` and `models/gemini-x` as the
   same model ID, matching endpoint-template expansion behavior.
 - Filter Gemini models to ones whose `supportedActions` include
@@ -684,19 +689,23 @@ Design decision from refs:
 - Catalog entry types and validation.
 - No HTTP calls.
 
-`llm-proxy-provider`:
+`llm-proxy-transport`:
 
-- GET-capable discovery HTTP client.
+- GET-capable discovery HTTP client (`discovery.rs`).
 - Discovery protocol parsers and pagination.
 - Authentication/header construction.
 - Response sanitization.
 
+`llm-proxy-engine`:
+
+- `ModelCatalogService` runtime cache and single-flight refresh coordination
+  (`catalog.rs`).
+- Catalog enforcement before upstream dispatch.
+
 `llm-proxy-server`:
 
 - Provider-scoped Axum routes.
-- `ModelCatalogService` runtime cache and single-flight refresh coordination.
 - Model-list response encoding.
-- Catalog enforcement before upstream dispatch.
 
 `apps/llm-proxy`:
 
@@ -767,7 +776,7 @@ provider selection key.
   implemented.
 - Keep `ProviderRegistry` immutable.
 
-`crates/llm-proxy-provider/src/transport.rs`:
+`crates/llm-proxy-transport/src/client.rs`:
 
 - Apply validated adapter static headers in addition to auth headers for
   streaming and non-streaming requests.
@@ -954,13 +963,13 @@ rg "resolve_model_route|ModelRoute|ProviderModelConfig|provider\\.models" crates
 These are intentionally outside the initial implementation:
 
 - Header-based provider selection.
-- Global model routing or weighted provider selection.
+- Global model routing: only the opt-in `[server.bare_v1].models` table
+  (goal.md decision 2).
 - Automatic discovery during server startup.
 - Background scheduled catalog refresh.
 - Native upstream token-count APIs.
 - Database-backed catalogs.
-- Per-client model access control, since the proxy currently has no inbound
-  authentication.
+- Per-client model access: `allow_models` on client keys.
 
 ## Research Sources
 
