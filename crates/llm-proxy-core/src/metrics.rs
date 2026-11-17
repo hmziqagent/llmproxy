@@ -397,7 +397,11 @@ fn percentile(samples: &[Duration], pct: f64) -> Duration {
         reason = "`pct` is clamped to 0.0..=100.0 and `n >= 1`, so `rank = pct/100 * (n+1)` is always >= 0.0 and the cast cannot lose a sign"
     )]
     let idx = (rank.floor() as usize).saturating_sub(1).min(n - 1);
-    sorted[idx]
+    sorted
+        .get(idx)
+        .or_else(|| sorted.last())
+        .copied()
+        .unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]
