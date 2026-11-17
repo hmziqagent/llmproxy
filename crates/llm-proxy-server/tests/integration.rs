@@ -154,6 +154,71 @@ mod tests {
         .expect("app state")
     }
 
+    /// A provider with no adapters and no routes. `/v1/messages/count_tokens`
+    /// is a local token estimate and must work without either (plan-remodel
+    /// R-13): provider existence is the only requirement.
+    fn state_with_adapterless_provider() -> AppState {
+        let provider = ProviderConfig {
+            name: "bare".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        AppState::new(
+            AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:3456".parse().unwrap(),
+                    request_timeout: Duration::from_secs(300),
+                    shutdown_timeout: Duration::from_secs(30),
+                    log_level: "info".to_owned(),
+                    hot_reload: false,
+                    allowed_origins: None,
+                    server_name: "test-proxy".to_owned(),
+                    rate_limit_rpm: 100,
+                    trust_forwarded_headers: false,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
+                    log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
+                },
+                auth: Default::default(),
+                storage: None,
+                replica: None,
+                mcp: None,
+            },
+            registry,
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::try_new().expect("client"),
+            BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+        .expect("app state")
+    }
+
     #[tokio::test]
     async fn health_returns_ok_with_body() {
         let app = build_router(state());
@@ -768,6 +833,54 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_works_for_a_provider_without_routes_or_adapters() {
+        let app = build_router(state_with_adapterless_provider());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/providers/bare/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{ "role": "user", "content": "hello world" }],
+                    "max_tokens": 1024
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body["input_tokens"].is_u64() && body["input_tokens"].as_u64().unwrap() > 0,
+            "input_tokens must be a positive integer, got {body}"
+        );
+
+        // With nothing configured but the provider itself, provider existence
+        // stays the only requirement: an unknown provider still gets 404.
+        let unknown = Request::builder()
+            .method("POST")
+            .uri("/providers/nonexistent/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "max_tokens": 64
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(unknown).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
