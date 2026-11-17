@@ -191,7 +191,7 @@ Citations verified against the working tree (wave-2 items re-verified
 | Admin API | Read-only `/usage/summary|requests|keys` with window/group_by filters and cursor paging | `crates/llm-proxy-api/src/routes.rs:53-55,116-117` |
 | Metrics | Lock-free atomic counters incl. per-provider-model counts; latency ring buffer up to 1000 samples with in-process percentile helpers (never exposed); request ids; graceful shutdown | `crates/llm-proxy-core/src/metrics.rs:34-35,210-239`, `crates/llm-proxy-server/src/shutdown.rs` |
 | Middleware | Per-identity token-bucket RPM, burst-tolerant with continuous refill, keyed by key id when authenticated else client IP (since 2026-10-13), loopback exempt; opt-in dedup window (off by default, 0 ms shipped) 409-rejecting an identical path+body seen within a fixed window of the first sighting — not in-flight tracking, caller-blind, bodies over 64 KiB exempt (rejection, not coalescing; corrected 2026-11-08 per research audit); opt-in forwarded-header trust, CORS, panic catching | `crates/llm-proxy-server/src/middleware.rs:117-129`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:172-176`, `config.toml.example:14-21`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185` |
-| Extras | Offline tiktoken counting, chars/4 fallback; per-provider fixed-point USD per-token prices, estimation only; per-provider egress forward proxy (socks5h/socks5/http/https); env-var interpolation; a musl single-binary release workflow exists but no release had shipped and unvendored `openssl-sys` behind the then-active native-tls left the musl build unproven (corrected 2026-11-08 per research audit; plan 03 later made rustls the only stack). Config changes require restart — `server.hot_reload=true` rejected at load | `crates/llm-proxy-core/src/token/tiktoken.rs` (HeuristicTokenizer; heuristic documented at `crates/llm-proxy-core/src/token/counter.rs:5`), `crates/llm-proxy-core/src/provider_config.rs:472,500`, `crates/llm-proxy-provider/src/transport.rs:124-125,293`, `crates/llm-proxy-core/src/provider_config.rs:1531-1538` |
+| Extras | Offline tiktoken counting, chars/4 fallback; per-provider fixed-point USD per-token prices, estimation only; per-provider egress forward proxy (socks5h/socks5/http/https); env-var interpolation; a musl single-binary release workflow exists but no release had shipped and unvendored `openssl-sys` behind the then-active native-tls left the musl build unproven (corrected 2026-11-08 per research audit; plan 03 later made rustls the only stack). Config changes require restart — `server.hot_reload=true` rejected at load (superseded: plan 07 hot-reloads provider and pool files on SIGHUP; `server.hot_reload = true` is accepted) | `crates/llm-proxy-core/src/token/tiktoken.rs` (HeuristicTokenizer; heuristic documented at `crates/llm-proxy-core/src/token/counter.rs:5`), `crates/llm-proxy-core/src/provider_config.rs:472,500`, `crates/llm-proxy-provider/src/transport.rs:124-125,293`, `crates/llm-proxy-core/src/provider_config.rs:1531-1538` |
 | Cancellation | `ClientCancelled` failure event persists with no usage payload — tokens delivered before cancellation never settle | `crates/llm-proxy-server/src/routes/core_pipeline.rs:952-985`, `crates/llm-proxy-storage/src/lib.rs:80` |
 
 ## Capability areas
@@ -624,7 +624,9 @@ row above for the full corrected statement).
 | Rust performance | LiteLLM migrating translation to a bundled Rust core (beta, off by default); Portkey self-hosted gateway runs a Rust front-end from v2.30.0; TensorZero claimed 0.94 ms p99 at 10k QPS — self-published and archived. llm-proxy overhead was not measured; no performance comparison asserted | https://docs.litellm.ai/docs/proxy/rust_gateway, https://portkey.ai/docs/self-hosting/major-performance-improvements.md, https://github.com/tensorzero/tensorzero/blob/main/docs/gateway/benchmarks.mdx |
 
 Verdict: gap #16 (low, hot reload, 8 products — llm-proxy rejects
-`server.hot_reload` at `crates/llm-proxy-core/src/provider_config.rs:1531-1538`);
+`server.hot_reload` at `crates/llm-proxy-core/src/provider_config.rs:1531-1538`)
+(superseded: plan 07 hot-reloads provider and pool files on SIGHUP;
+`server.hot_reload = true` is accepted);
 additional gap #19 (web admin UI, 11 products). Prompt management, audit
 trails, and hook systems have no llm-proxy counterpart but were surveyed as
 context.
@@ -685,7 +687,7 @@ at" counts products named across both waves.
 | 13 | medium | Weighted/multi-strategy load balancing per model group | 12 (LiteLLM, Portkey, Kong, gproxy, Bifrost, OpenRouter, Cloudflare Auto Router, Higress, uni-api, GPT-Load, AWS AgentCore, Tyk); 10 without a paid license or beta (Kong's is `ai-proxy-advanced`; Cloudflare Auto Router is Beta) | https://developer.konghq.com/plugins/ai-proxy-advanced/ | Alias resolves to exactly one provider (`crates/llm-proxy-core/src/provider_config.rs:392-394`); inline: https://developers.cloudflare.com/ai-gateway/features/auto-router/, https://github.com/higress-group/higress/blob/main/plugins/wasm-go/extensions/ai-load-balancer/README_EN.md |
 | 14 | medium | Cross-provider prompt-cache plumbing and cache-locality routing | 7 (OpenRouter, LiteLLM, Vercel, Helicone, Bifrost, GPT-Load, new-api) | https://vercel.com/docs/ai-gateway/models-and-providers/automatic-caching | `CacheControl` cannot express TTLs; system-block markers translate but message-level markers are dropped, and nothing injects or pins (`crates/llm-proxy-protocol/src/core.rs:261-286`, corrected 2026-11-08 per research audit) |
 | 15 | medium | Upstream credential encryption at rest / secret-manager references | 8 (gproxy, LiteLLM, Kong, Tyk, IBM ContextForge, new-api, GPT-Load, Portkey); 7 without a paid edition (Portkey secret references and KMS are enterprise/hosted) | https://docs.litellm.ai/docs/secret_managers/overview.md | Plaintext TOML |
-| 16 | low | Config hot reload without restart | 8 (agentgateway, uni-api, Higress, Kong, APISIX, LiteLLM, oc-go-cc, openproxy) | https://agentgateway.dev/docs/standalone/latest/documentation/setup/update | `server.hot_reload` rejected (`crates/llm-proxy-core/src/provider_config.rs:1531-1538`) |
+| 16 | low | Config hot reload without restart | 8 (agentgateway, uni-api, Higress, Kong, APISIX, LiteLLM, oc-go-cc, openproxy) | https://agentgateway.dev/docs/standalone/latest/documentation/setup/update | `server.hot_reload` rejected (`crates/llm-proxy-core/src/provider_config.rs:1531-1538`) (superseded: plan 07 hot-reloads provider and pool files on SIGHUP; `server.hot_reload = true` is accepted) |
 | 17 | low | No exposure surface for latency percentiles (no /metrics; snapshots and p95/p99 helpers exist in-process only, metrics.rs:210-239) | 9 (LiteLLM, agentgateway, Bifrost, oc-go-cc, vLLM stack, Kong, Tyk, Helicone, AWS AgentCore) | https://agentgateway.dev/docs/standalone/latest/documentation/observability/metrics/reference/ | Latency samples and percentile helpers in-process only (`crates/llm-proxy-core/src/metrics.rs:34-35,210-239`); TTFT unmeasured |
 | 18 | low | Model lifecycle metadata (deprecation dates, successor aliases) | 2 gateways (LiteLLM, OpenRouter); 3 providers publish fields (OpenAI, Anthropic, Bedrock) | https://openrouter.ai/docs/guides/overview/models | Discovery discards it (`crates/llm-proxy-provider/src/discovery.rs:272-288`) |
 | 19 | — (report rank 19) | Web admin UI | 11 (LiteLLM, gproxy, Bifrost, agentgateway, new-api, one-api, Higress, Tyk, IBM ContextForge, GPT-Load, Respan) | https://docs.litellm.ai/docs/proxy/virtual_keys | Admin is read-only JSON (`crates/llm-proxy-api/src/routes.rs:53-55,116-117`) |
@@ -848,8 +850,10 @@ shipped the wire TTL, block-level markers and the stream usage merge.
 ### 9. Hot-reloadable configuration (wave 2)
 
 Market: debounced file watch with validate-then-swap, last-known-good fallback, `config_synchronized` metric, `--validate-only`, startup-only exclusion list; immutable-snapshot swap with revision-CAS overlays; 30s DB polling with swallowed router-update errors (`ref/litellm/litellm/proxy/proxy_server.py:5027-5099`); fsnotify+SIGHUP; SIGUSR2 zero-downtime upgrade; no versioned config with in-gateway history/diff/rollback (Admin table). llm-proxy: `server.hot_reload=true` rejected at load
-(`crates/llm-proxy-core/src/provider_config.rs:1531-1538`). Deferred from
-near-term candidates: needs a config/schema decision.
+(`crates/llm-proxy-core/src/provider_config.rs:1531-1538`) (superseded: plan
+07 hot-reloads provider and pool files on SIGHUP; `server.hot_reload = true`
+is accepted). Deferred from near-term candidates: needs a config/schema
+decision.
 
 ### 10. Model lifecycle metadata in catalogs and /v1/models (wave 2)
 
@@ -869,7 +873,8 @@ of scope.
 From the analysis's near-term list; each names its code touchpoint and
 done-condition. Gaps without a candidate (OTel traces, MCP, key lifecycle,
 guardrails, load-balancing strategies, the Responses client endpoint, admin
-UI, cloud-native upstream auth, hot reload, credential encryption at rest,
+UI, cloud-native upstream auth, hot reload (hot reload since done: plan 07),
+credential encryption at rest,
 stream-cancellation usage settlement) are deferred: each needs a
 dependency, config/schema, or control-plane decision the candidates avoid.
 

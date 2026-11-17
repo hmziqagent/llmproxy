@@ -121,7 +121,8 @@ or run. Entries first added in the second wave are tagged `new:`.
   Config changes require a
   restart — `server.hot_reload=true` is rejected at load
   (`crates/llm-proxy-core/src/provider_config.rs:1531-1538`, verified
-  2026-10-27).
+  2026-10-27) (superseded: plan 07 hot-reloads provider and pool files on
+  SIGHUP; `server.hot_reload = true` is accepted).
 
 ## Auth and keys
 
@@ -398,7 +399,7 @@ Prevalence counts mean "someone sells this", not self-hostable parity (corrected
 13. **Weighted/multi-strategy load balancing per model group** — 12 products (LiteLLM, Portkey, Kong, gproxy, Bifrost, OpenRouter, Cloudflare Auto Router, Higress, uni-api, GPT-Load, AWS AgentCore, Tyk; sources in Routing and resilience, with Cloudflare and Higress sourced inline in the first edition's gap 11 at https://developers.cloudflare.com/ai-gateway/features/auto-router/ and https://github.com/higress-group/higress/blob/main/plugins/wasm-go/extensions/ai-load-balancer/README_EN.md); 10 without a paid license or beta (Kong's is `ai-proxy-advanced`, Cloudflare Auto Router is Beta). An llm-proxy alias resolves to exactly one provider (`crates/llm-proxy-core/src/provider_config.rs:392-394`).
 14. **new: Cross-provider prompt-cache plumbing and cache-locality routing** — 7 products (OpenRouter, LiteLLM, Vercel, Helicone, Bifrost, GPT-Load, new-api; sources in Prompt caching and cache locality). llm-proxy's `CacheControl` cannot express TTLs; system-block markers translate but message-level markers are dropped, and nothing injects or pins (`crates/llm-proxy-protocol/src/core.rs:261-286`, corrected 2026-11-08 per research audit).
 15. **new: Upstream credential encryption at rest / secret-manager references** — 8 products (gproxy, LiteLLM, Kong, Tyk, IBM ContextForge, new-api, GPT-Load, Portkey; sources in Auth and keys); 7 without a paid edition (Portkey secret references and KMS are enterprise/hosted). llm-proxy stores keys in plaintext TOML.
-16. **new: Config hot reload without restart** — 8 products (agentgateway, uni-api, Higress, Kong, APISIX, LiteLLM, oc-go-cc, openproxy; sources in Admin and tooling). llm-proxy rejects `server.hot_reload` (`crates/llm-proxy-core/src/provider_config.rs:1531-1538`).
+16. **new: Config hot reload without restart** — 8 products (agentgateway, uni-api, Higress, Kong, APISIX, LiteLLM, oc-go-cc, openproxy; sources in Admin and tooling). llm-proxy rejects `server.hot_reload` (`crates/llm-proxy-core/src/provider_config.rs:1531-1538`) (superseded: plan 07 hot-reloads provider and pool files on SIGHUP; `server.hot_reload = true` is accepted).
 17. **Latency histograms and TTFT metrics** — 9 products (LiteLLM, agentgateway, Bifrost, oc-go-cc, vLLM Production Stack, Kong, Tyk, Helicone, AWS AgentCore; sources in Observability). llm-proxy computes latency percentiles in-process (`crates/llm-proxy-core/src/metrics.rs:210-239`) but never exports them (corrected 2026-10-28 after code audit).
 18. **new: Model lifecycle metadata (deprecation dates, successor aliases) surfaced to clients** — 2 gateways consume it (LiteLLM, OpenRouter) and three providers publish machine-readable fields (OpenAI, Anthropic, Bedrock; sources in Model lifecycle metadata). llm-proxy discovery discards it (`crates/llm-proxy-provider/src/discovery.rs:272-288`).
 19. **Web admin UI** — 11 products (LiteLLM, gproxy, Bifrost, agentgateway, new-api, one-api, Higress, Tyk, IBM ContextForge, GPT-Load, Respan; sources in Admin and tooling). llm-proxy admin is read-only JSON (`crates/llm-proxy-api/src/routes.rs:53-55, 116-117`).
@@ -415,7 +416,7 @@ and a dedicated SDK there, each sourced in that section (corrected
 
 ## Near-term candidates
 
-Each candidate names its code touchpoint and a done-condition. Gaps without a candidate below (OTel traces, MCP, key lifecycle, guardrails, load-balancing strategies, the Responses client endpoint, admin UI, cloud-native upstream auth, hot reload, credential encryption at rest, stream-cancellation usage settlement) are deferred: each needs a dependency, config/schema, or control-plane decision the candidates avoid.
+Each candidate names its code touchpoint and a done-condition. Gaps without a candidate below (OTel traces, MCP, key lifecycle, guardrails, load-balancing strategies, the Responses client endpoint, admin UI, cloud-native upstream auth, hot reload (hot reload since done: plan 07), credential encryption at rest, stream-cancellation usage settlement) are deferred: each needs a dependency, config/schema, or control-plane decision the candidates avoid.
 
 - Pre-first-event retry/fallback: the first-byte window cannot host this as
   built. A 429, 5xx or connect error returns at `send_stream`
