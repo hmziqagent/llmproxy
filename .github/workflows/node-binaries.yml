@@ -9,13 +9,13 @@ name: Node binaries
 # the full Node contract suite against the artifact they built; the
 # cross-built legs are install-only: their binaries are uploaded and
 # install-tested by consumers, but not executed here. Cross-compilation
-# invocations for the pinned CLI (@napi-rs/cli 3.10.12): --use-napi-cross
-# drives the @napi-rs/cross-toolchain compilers shipped with the CLI for
-# the aarch64-gnu Linux target; musl is not a napi-cross target, so that
-# leg cross-compiles with musl-gcc via --cross-compile; and a --target
-# build on a foreign triple never generates the loader files, so the
-# linux-x64-gnu leg builds it with a plain `npm run build`. The release
-# workflow (10-13) reuses this file through workflow_call.
+# invocations for the pinned CLI (@napi-rs/cli 3.10.12): the two Linux
+# cross legs (aarch64-gnu, x86_64-musl) build with --cross-compile through
+# a pinned zig (the CLI's napi-cross toolchain packages are not carried by
+# the committed lockfile, and musl is not a napi-cross target); and a
+# --target build on a foreign triple never generates the loader files, so
+# the linux-x64-gnu leg builds it with a plain `npm run build`. The
+# release workflow (10-13) reuses this file through workflow_call.
 on:
   pull_request:
     paths:
@@ -75,6 +75,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      # napi's --cross-compile builds the C half (ring) through zig; the two
+      # Linux cross legs need it on PATH (0.13.0, pinned like every other
+      # tool in this workflow).
+      - uses: mlugg/setup-zig@v2
+        if: matrix.build_mode == 'gnu-cross' || matrix.build_mode == 'musl-cross'
+        with:
+          version: 0.13.0
       - name: Install pinned dependencies
         working-directory: bindings/node
         run: npm ci
@@ -90,14 +97,9 @@ jobs:
             # binding.js/binding.d.ts for the main package.
             npm run build
           elif [ "${{ matrix.build_mode }}" = "gnu-cross" ]; then
-            sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-              CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8" \
-              npx napi build --platform --release --target aarch64-unknown-linux-gnu --cross-compile
+            npx napi build --platform --release --target aarch64-unknown-linux-gnu --cross-compile
           elif [ "${{ matrix.build_mode }}" = "musl-cross" ]; then
-            sudo apt-get update && sudo apt-get install -y musl-tools
-            CC_x86_64_unknown_linux_musl=musl-gcc \
-              npx napi build --platform --release --target x86_64-unknown-linux-musl --cross-compile
+            npx napi build --platform --release --target x86_64-unknown-linux-musl --cross-compile
           elif [ "${{ matrix.build_mode }}" = "darwin" ]; then
             npx napi build --platform --release --target x86_64-apple-darwin
             npx napi build --platform --release --target aarch64-apple-darwin
