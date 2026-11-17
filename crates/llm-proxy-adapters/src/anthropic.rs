@@ -20,17 +20,6 @@ use crate::sse::SseFrame;
 
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 
-#[inline]
-#[expect(
-    clippy::expect_used,
-    reason = "every caller passes a json! {{...}} literal, which is always an object; the \
-              invariant is local to this module's call sites"
-)]
-fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
-    val.as_object_mut()
-        .expect("json! macro with {{...}} always produces a JSON object")
-}
-
 #[expect(
     clippy::expect_used,
     reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
@@ -698,13 +687,20 @@ fn encode_normalized_request(
     let tools = encode_tools_for_target(core, client, target);
     let tool_choice = encode_tool_choice_for_target(core, client, target)?;
 
-    let mut req = serde_json::json!({
-        "model": target.upstream_model,
-        "max_tokens": core.sampling.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
-        "messages": messages,
-    });
-
-    let obj = json_object(&mut req);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "model".to_owned(),
+        serde_json::Value::String(target.upstream_model.clone()),
+    );
+    obj.insert(
+        "max_tokens".to_owned(),
+        serde_json::Value::from(
+            core.sampling
+                .max_tokens
+                .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+        ),
+    );
+    obj.insert("messages".to_owned(), serde_json::Value::Array(messages));
 
     if let Some(sys) = system {
         obj.insert("system".to_owned(), sys);
@@ -761,7 +757,7 @@ fn encode_normalized_request(
         obj.insert(name, value);
     }
 
-    Ok(req)
+    Ok(serde_json::Value::Object(obj))
 }
 
 /// Tools for the cross-format path: plain function tools encode as usual;
@@ -931,11 +927,15 @@ fn build_anthropic_usage(
 fn encode_cache_control_marker(
     cache: &llm_proxy_protocol::core::CacheControl,
 ) -> serde_json::Value {
-    let mut marker = serde_json::json!({"type": cache.r#type.as_str()});
+    let mut marker = serde_json::Map::new();
+    marker.insert(
+        "type".to_owned(),
+        serde_json::Value::String(cache.r#type.as_str().to_owned()),
+    );
     if let Some(ttl) = &cache.ttl {
-        json_object(&mut marker).insert("ttl".to_owned(), serde_json::Value::String(ttl.clone()));
+        marker.insert("ttl".to_owned(), serde_json::Value::String(ttl.clone()));
     }
-    marker
+    serde_json::Value::Object(marker)
 }
 
 fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
@@ -946,17 +946,19 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                 if text.is_empty() {
                     return None;
                 }
-                let mut block = serde_json::json!({
-                    "type": "text",
-                    "text": text,
-                });
+                let mut block = serde_json::Map::new();
+                block.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String("text".to_owned()),
+                );
+                block.insert("text".to_owned(), serde_json::Value::String(text.clone()));
                 if let Some(cache) = cache {
-                    json_object(&mut block).insert(
+                    block.insert(
                         "cache_control".to_owned(),
                         encode_cache_control_marker(cache),
                     );
                 }
-                Some(block)
+                Some(serde_json::Value::Object(block))
             }
             CoreContent::ToolResult {
                 tool_use_id,
@@ -979,21 +981,26 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                     })
                     .collect::<String>();
                 let sanitized_id = sanitize_tool_use_id(tool_use_id);
-                let mut block = serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": sanitized_id,
-                    "content": result_text,
-                });
+                let mut block = serde_json::Map::new();
+                block.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String("tool_result".to_owned()),
+                );
+                block.insert(
+                    "tool_use_id".to_owned(),
+                    serde_json::Value::String(sanitized_id),
+                );
+                block.insert("content".to_owned(), serde_json::Value::String(result_text));
                 if *is_error {
-                    json_object(&mut block).insert("is_error".to_owned(), serde_json::json!(true));
+                    block.insert("is_error".to_owned(), serde_json::Value::Bool(true));
                 }
                 if let Some(cache) = cache {
-                    json_object(&mut block).insert(
+                    block.insert(
                         "cache_control".to_owned(),
                         encode_cache_control_marker(cache),
                     );
                 }
-                Some(block)
+                Some(serde_json::Value::Object(block))
             }
             CoreContent::Image { source } => Some(serde_json::json!({
                 "type": "image",
@@ -1028,15 +1035,16 @@ fn encode_system(system: &[CoreContent], messages: &[CoreMessage]) -> Option<ser
                 if text.is_empty() {
                     return None;
                 }
-                let mut block = serde_json::json!({
-                    "type": "text",
-                    "text": text,
-                });
+                let mut block = serde_json::Map::new();
+                block.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String("text".to_owned()),
+                );
+                block.insert("text".to_owned(), serde_json::Value::String(text.clone()));
                 if let Some(cc) = cache {
-                    json_object(&mut block)
-                        .insert("cache_control".to_owned(), encode_cache_control_marker(cc));
+                    block.insert("cache_control".to_owned(), encode_cache_control_marker(cc));
                 }
-                Some(block)
+                Some(serde_json::Value::Object(block))
             }
             other => {
                 tracing::warn!(
@@ -1103,17 +1111,16 @@ fn encode_tools(tools: &[CoreTool]) -> Vec<serde_json::Value> {
                 serde_json::json!({"type": "object", "properties": {}})
             };
             let (sanitized_name, _changed) = sanitize_tool_name(&t.name);
-            let mut tool = serde_json::json!({
-                "name": sanitized_name,
-                "input_schema": schema,
-            });
+            let mut tool = serde_json::Map::new();
+            tool.insert("name".to_owned(), serde_json::Value::String(sanitized_name));
+            tool.insert("input_schema".to_owned(), schema);
             if let Some(ref desc) = t.description {
-                json_object(&mut tool).insert(
+                tool.insert(
                     "description".to_owned(),
                     serde_json::Value::String(desc.clone()),
                 );
             }
-            tool
+            serde_json::Value::Object(tool)
         })
         .collect()
 }
@@ -1149,33 +1156,40 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
                 if text.is_empty() {
                     return None;
                 }
-                let mut block = serde_json::json!({
-                    "type": "text",
-                    "text": text,
-                });
+                let mut block = serde_json::Map::new();
+                block.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String("text".to_owned()),
+                );
+                block.insert("text".to_owned(), serde_json::Value::String(text.clone()));
                 if let Some(cache) = cache {
-                    json_object(&mut block).insert(
+                    block.insert(
                         "cache_control".to_owned(),
                         encode_cache_control_marker(cache),
                     );
                 }
-                Some(block)
+                Some(serde_json::Value::Object(block))
             }
             CoreContent::Thinking { text, signature } => {
                 if text.is_empty() {
                     return None;
                 }
-                let mut block = serde_json::json!({
-                    "type": "thinking",
-                    "thinking": text,
-                });
+                let mut block = serde_json::Map::new();
+                block.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String("thinking".to_owned()),
+                );
+                block.insert(
+                    "thinking".to_owned(),
+                    serde_json::Value::String(text.clone()),
+                );
                 if let Some(sig) = signature {
-                    json_object(&mut block).insert(
+                    block.insert(
                         "signature".to_owned(),
                         serde_json::Value::String(sig.clone()),
                     );
                 }
-                Some(block)
+                Some(serde_json::Value::Object(block))
             }
             CoreContent::ToolUse {
                 id, name, input, ..
