@@ -304,21 +304,47 @@ pub fn retry_after_from_headers(headers: &[(String, String)]) -> Option<std::tim
 
 const MAX_SANITIZE_LEN: usize = 512;
 const SANITIZE_SUFFIX: &str = "...[truncated]";
-#[expect(
-    clippy::expect_used,
-    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
-              error caught the moment this static is first used, not a runtime input"
-)]
-static URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
-});
+const URL_REDACTED: &str = "[url-redacted]";
+
+/// Redacts every URL in `msg`: each `http://` or `https://` and the run of
+/// non-whitespace after it becomes [`URL_REDACTED`]. Scans with
+/// [`str::split_once`] and [`str::strip_prefix`], so there is no byte-index
+/// slicing and no regex.
+fn redact_urls(msg: &str) -> String {
+    let mut redacted = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some((head, after)) = rest.split_once("http") {
+        redacted.push_str(head);
+        let url_body = after
+            .strip_prefix("s://")
+            .or_else(|| after.strip_prefix("://"));
+        let Some(url_body) = url_body else {
+            // An "http" that does not start a URL: keep it verbatim.
+            redacted.push_str("http");
+            rest = after;
+            continue;
+        };
+        redacted.push_str(URL_REDACTED);
+        // The URL ends at the next whitespace; keep that separator and
+        // continue scanning after it. A URL with no whitespace after it
+        // runs to the end of the message.
+        let mut chars = url_body.chars();
+        for c in chars.by_ref() {
+            if c.is_whitespace() {
+                redacted.push(c);
+                break;
+            }
+        }
+        rest = chars.as_str();
+    }
+    redacted.push_str(rest);
+    redacted
+}
 
 fn sanitize_with_len_limit(msg: &str) -> String {
     let truncated =
         llm_proxy_protocol::util::truncate_with_suffix(msg, MAX_SANITIZE_LEN, SANITIZE_SUFFIX);
-    URL_REDACT_REGEX
-        .replace_all(&truncated, "[url-redacted]")
-        .into_owned()
+    redact_urls(&truncated)
 }
 
 /// Truncates and redacts URLs from an upstream error message.
@@ -339,4 +365,29 @@ pub fn fully_sanitize_upstream_error(msg: &str) -> String {
 
 fn fully_sanitize(error: &ProviderError) -> String {
     fully_sanitize_upstream_error(&error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_urls_in_one_message_are_both_redacted() {
+        let sanitized = sanitize_upstream_error_body(
+            "upstream at https://one.example.com/v1 and http://two.example.com/v2 refused",
+        );
+        assert_eq!(
+            sanitized, "upstream at [url-redacted] and [url-redacted] refused",
+            "every URL in the message must be redacted, not just the first"
+        );
+    }
+
+    #[test]
+    fn a_url_at_the_very_end_is_redacted() {
+        let sanitized = sanitize_upstream_error_body("failed calling https://end.example.com/v1");
+        assert_eq!(
+            sanitized, "failed calling [url-redacted]",
+            "a URL with no whitespace after it must still be redacted"
+        );
+    }
 }
