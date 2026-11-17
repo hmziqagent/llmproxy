@@ -2266,20 +2266,27 @@ pub fn validate_provider_config(
     Ok(())
 }
 
+/// Canonical provider-name length limit, shared by config validation and the
+/// engine's URL path validation: 64 ASCII characters.
+pub const MAX_PROVIDER_NAME_LEN: usize = 64;
+
+/// Whether `name` is a canonical provider name: 1..=[`MAX_PROVIDER_NAME_LEN`]
+/// bytes of lowercase ASCII letters, digits, `_` or `-`. Config validation and
+/// the engine's URL path validation accept exactly this set.
+#[must_use]
+pub fn is_valid_provider_name(name: &str) -> bool {
+    (1..=MAX_PROVIDER_NAME_LEN).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
 fn validate_name(name: &str) -> Result<(), ConfigValidationError> {
     if name.trim().is_empty() {
         return Err(ConfigValidationError::EmptyProviderName);
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "the pattern is a compile-time-constant regex literal; a failure is a \
-                  programming error caught the moment this static is first used"
-    )]
-    static PROVIDER_NAME_SLUG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^[a-z0-9_-]{1,64}$").expect("valid provider name slug regex")
-    });
-    if !PROVIDER_NAME_SLUG.is_match(name) {
+    if !is_valid_provider_name(name) {
         return Err(ConfigValidationError::InvalidProviderNameFormat {
             provider: name.to_owned(),
         });
@@ -5688,7 +5695,7 @@ endpoint = "https://example.com/v1"
     #[test]
     fn validate_rejects_provider_name_exceeding_length_limit() {
         let provider = ProviderConfig {
-            name: "a".repeat(65),
+            name: "a".repeat(MAX_PROVIDER_NAME_LEN + 1),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
@@ -5714,7 +5721,7 @@ endpoint = "https://example.com/v1"
     #[test]
     fn validate_accepts_provider_name_at_max_length() {
         let provider = ProviderConfig {
-            name: "a".repeat(64),
+            name: "a".repeat(MAX_PROVIDER_NAME_LEN),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,

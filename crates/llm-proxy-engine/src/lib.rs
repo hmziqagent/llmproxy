@@ -58,7 +58,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use llm_proxy_adapters::{ProviderAdapterRegistry, ProviderAdapterTarget};
-use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
+use llm_proxy_core::{
+    AppConfig, Counter, MAX_PROVIDER_NAME_LEN, Metrics, ProviderRegistry, is_valid_provider_name,
+};
 use llm_proxy_storage::EventBus;
 use llm_proxy_transport::{DiscoveryClient, ProxyClient};
 
@@ -91,16 +93,6 @@ pub use traits::{
 };
 pub use types::{ClientDialect, EngineRequest, EngineResponse, EngineStream, InboundRequest};
 
-const MAX_PROVIDER_NAME_LEN: usize = 128;
-#[expect(
-    clippy::expect_used,
-    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
-              error caught the moment this static is first used, not a runtime input"
-)]
-static PROVIDER_NAME_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^[a-z0-9_-]+$").expect("valid provider name regex")
-});
-
 /// Every text block of a core request, in order — the guard-rewrite
 /// comparison (plan 09 step 4).
 pub(crate) fn guard_texts(
@@ -122,7 +114,8 @@ pub(crate) fn guard_texts(
         })
 }
 
-/// Validates a provider name from the URL path.
+/// Validates a provider name from the URL path against the same canonical
+/// form config load enforces ([`llm_proxy_core::is_valid_provider_name`]).
 ///
 /// # Errors
 ///
@@ -139,7 +132,7 @@ pub fn validate_provider_name(name: &str) -> Result<(), EngineError> {
             "provider name exceeds maximum length of {MAX_PROVIDER_NAME_LEN} characters"
         )));
     }
-    if !PROVIDER_NAME_REGEX.is_match(name) {
+    if !is_valid_provider_name(name) {
         return Err(EngineError::InvalidProviderName(format!(
             "provider name \"{name}\" contains invalid characters; \
              only lowercase ASCII letters, digits, hyphens, and underscores are allowed"
@@ -686,5 +679,17 @@ mod tests {
             }
         }
         validate_provider_name("a-b_1").expect("canonical slug stays accepted");
+    }
+
+    #[test]
+    fn provider_name_longer_than_core_limit_is_rejected_by_the_path_validator() {
+        let err = validate_provider_name(&"a".repeat(65)).expect_err(
+            "a 65-char name exceeds the 64-char shared limit and must not pass the path validator",
+        );
+        assert!(
+            matches!(err, EngineError::InvalidProviderName(_)),
+            "expected InvalidProviderName, got {err:?}"
+        );
+        validate_provider_name(&"a".repeat(64)).expect("64-char name is accepted");
     }
 }

@@ -9,7 +9,7 @@ use std::time::Instant;
 use llm_proxy_adapters::ProviderError;
 use llm_proxy_core::{
     CatalogFile, CatalogFileMetadata, ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig,
-    StaticModelCatalogEntry, merge_catalog,
+    StaticModelCatalogEntry, is_valid_provider_name, merge_catalog,
 };
 use llm_proxy_transport::DiscoveryClient;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -337,7 +337,7 @@ impl ModelCatalogService {
     }
 
     async fn load_disk_cache(&self, provider: &ProviderConfig) -> Result<(), ProviderError> {
-        if !is_safe_provider_slug(&provider.name) {
+        if !is_valid_provider_name(&provider.name) {
             return Err(ProviderError::InvalidConfig(
                 "catalog provider must be a lowercase URL-safe slug".to_owned(),
             ));
@@ -459,7 +459,7 @@ fn now_rfc3339() -> Result<String, ProviderError> {
 ///
 /// Returns an error for unsafe paths, serialization failures, or filesystem errors.
 pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), ProviderError> {
-    if !is_safe_provider_slug(&file.catalog.provider) {
+    if !is_valid_provider_name(&file.catalog.provider) {
         return Err(ProviderError::InvalidConfig(
             "catalog provider must be a lowercase URL-safe slug".to_owned(),
         ));
@@ -506,16 +506,6 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
     }
     write_result?;
     Ok(())
-}
-
-const MAX_PROVIDER_SLUG_LEN: usize = 128;
-
-fn is_safe_provider_slug(provider: &str) -> bool {
-    !provider.is_empty()
-        && provider.len() <= MAX_PROVIDER_SLUG_LEN
-        && provider.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
 }
 
 #[cfg(test)]
@@ -965,39 +955,41 @@ mod tests {
 
     #[test]
     fn safe_slug_accepts_valid_names() {
-        assert!(is_safe_provider_slug("openai"));
-        assert!(is_safe_provider_slug("my-provider"));
-        assert!(is_safe_provider_slug("provider_123"));
-        assert!(is_safe_provider_slug("a"));
+        assert!(is_valid_provider_name("openai"));
+        assert!(is_valid_provider_name("my-provider"));
+        assert!(is_valid_provider_name("provider_123"));
+        assert!(is_valid_provider_name("a"));
     }
 
     #[test]
     fn safe_slug_rejects_empty() {
-        assert!(!is_safe_provider_slug(""));
+        assert!(!is_valid_provider_name(""));
     }
 
     #[test]
     fn safe_slug_rejects_uppercase() {
-        assert!(!is_safe_provider_slug("OpenAI"));
+        assert!(!is_valid_provider_name("OpenAI"));
     }
 
     #[test]
     fn safe_slug_rejects_path_traversal() {
-        assert!(!is_safe_provider_slug("../outside"));
-        assert!(!is_safe_provider_slug("a/b"));
+        assert!(!is_valid_provider_name("../outside"));
+        assert!(!is_valid_provider_name("a/b"));
     }
 
     #[test]
     fn safe_slug_rejects_exceeds_max_length() {
-        let long_name = "a".repeat(129);
+        let long_name = "a".repeat(llm_proxy_core::MAX_PROVIDER_NAME_LEN + 1);
         assert!(
-            !is_safe_provider_slug(&long_name),
-            "129-char name should be rejected"
+            !is_valid_provider_name(&long_name),
+            "{}-char name should be rejected",
+            long_name.len()
         );
-        let at_limit = "a".repeat(128);
+        let at_limit = "a".repeat(llm_proxy_core::MAX_PROVIDER_NAME_LEN);
         assert!(
-            is_safe_provider_slug(&at_limit),
-            "128-char name should be accepted"
+            is_valid_provider_name(&at_limit),
+            "{}-char name should be accepted",
+            at_limit.len()
         );
     }
 
