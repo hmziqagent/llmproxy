@@ -556,7 +556,9 @@ Verdict: gap #4 (high, 6 products).
 `new:` llm-proxy: `CoreContent::Text` carries `cache:
 Option<CacheControl>`, but `CacheControl` has only a `type` field
 (`Ephemeral`/`Other`) — no TTL, so Anthropic's 1-hour lifetime is
-unrepresentable. The client adapters do translate system-block markers
+unrepresentable. At the audited commit a `ttl` on a marker also dropped the
+whole block from the upstream request while returning HTTP 200 (audit BUG-2;
+fixed by plan 01). The client adapters do translate system-block markers
 (`crates/llm-proxy-protocol/src/client/anthropic.rs:117-119`,
 `client/openai_chat.rs:84-95`); message-level markers are decoded and then
 dropped by the upstream Anthropic adapter
