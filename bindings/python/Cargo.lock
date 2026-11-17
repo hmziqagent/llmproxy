@@ -789,7 +789,6 @@ dependencies = [
  "llm-proxy-protocol",
  "llm-proxy-storage",
  "llm-proxy-transport",
- "regex",
  "rust_decimal",
  "secrecy",
  "serde_json",
