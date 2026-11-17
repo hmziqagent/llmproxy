@@ -2678,10 +2678,7 @@ fn validate_cleartext_endpoint(
 }
 
 fn scheme_region(endpoint: &str) -> &str {
-    match endpoint.find("://") {
-        Some(idx) => &endpoint[..idx],
-        None => "",
-    }
+    endpoint.split_once("://").map_or("", |(scheme, _)| scheme)
 }
 
 const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
