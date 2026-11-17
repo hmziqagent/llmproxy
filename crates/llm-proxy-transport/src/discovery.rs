@@ -18,6 +18,9 @@ const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
 const MAX_DISCOVERY_ERROR_BODY_BYTES: usize = 2048;
 
+const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// GET-capable HTTP client for provider model discovery.
 #[derive(Debug, Clone)]
 pub struct DiscoveryClient {
@@ -28,7 +31,17 @@ impl DiscoveryClient {
     /// Build a discovery client with short, independent timeouts; errors if the
     /// HTTP client cannot be constructed.
     pub fn try_new() -> Result<Self, ProviderError> {
-        let http = build_client(None)?;
+        Self::with_timeouts(DISCOVERY_CONNECT_TIMEOUT, DISCOVERY_REQUEST_TIMEOUT)
+    }
+
+    /// Build a discovery client with explicit, independent connect and
+    /// whole-request timeouts; [`Self::try_new`] applies the 10s/30s defaults,
+    /// tests inject small values so timeouts stay observable.
+    pub(crate) fn with_timeouts(
+        connect: Duration,
+        request: Duration,
+    ) -> Result<Self, ProviderError> {
+        let http = build_client(None, connect, request)?;
         Ok(Self { http })
     }
 
@@ -50,7 +63,11 @@ impl DiscoveryClient {
         // upstream traffic like chat: an `[provider.egress]` proxy must carry
         // it too (discovery is infrequent, so the client is built per call).
         let http = match provider.egress.as_ref() {
-            Some(egress) => build_client(Some(&egress.proxy))?,
+            Some(egress) => build_client(
+                Some(&egress.proxy),
+                DISCOVERY_CONNECT_TIMEOUT,
+                DISCOVERY_REQUEST_TIMEOUT,
+            )?,
             None => self.http.clone(),
         };
 
@@ -351,11 +368,15 @@ fn next_page(
 
 /// Build the discovery HTTP client: direct when `proxy` is `None`, otherwise
 /// routed through the configured `[provider.egress]` forward proxy, with the
-/// same timeouts and same-origin redirect policy either way.
-fn build_client(proxy: Option<&str>) -> Result<Client, ProviderError> {
+/// same independent timeouts and same-origin redirect policy either way.
+fn build_client(
+    proxy: Option<&str>,
+    connect: Duration,
+    request: Duration,
+) -> Result<Client, ProviderError> {
     let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(connect)
+        .timeout(request)
         .redirect(crate::client::same_origin_redirect_policy());
     if let Some(proxy_url) = proxy {
         crate::client::validate_egress_proxy_url(proxy_url)?;
@@ -382,6 +403,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -1164,6 +1186,176 @@ mod tests {
             failures.load(Ordering::SeqCst),
             1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize,
             "no attempt may be made beyond 1 + MAX_TRANSIENT_RETRIES"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_request_timeout_is_enforced_and_not_retried_forever() {
+        async fn slow_models(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Json(json!({"data": [{"id": "m"}]}))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(slow_models))
+                .with_state(Arc::clone(&calls)),
+        )
+        .await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+
+        let started = Instant::now();
+        let error =
+            DiscoveryClient::with_timeouts(Duration::from_secs(1), Duration::from_millis(200))
+                .expect("client")
+                .discover(&provider)
+                .await
+                .expect_err("a 200ms request timeout must abort a handler that sleeps 5s");
+
+        assert!(
+            matches!(
+                error,
+                ProviderError::Http {
+                    timeout: true,
+                    redirect: false,
+                    ..
+                }
+            ),
+            "expected Http {{ timeout: true }}, got: {error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize,
+            "a timing-out discovery request must be retried at most MAX_TRANSIENT_RETRIES times"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "discovery must give up before the handler answers; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_does_not_follow_cross_origin_redirects() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        #[derive(Clone)]
+        struct RedirectStub {
+            target_base: Arc<String>,
+            hits: Arc<AtomicUsize>,
+        }
+
+        async fn redirect_to_other_origin(
+            State(stub): State<RedirectStub>,
+        ) -> axum::response::Response {
+            stub.hits.fetch_add(1, Ordering::SeqCst);
+            let location = format!("{}/models", stub.target_base);
+            (
+                StatusCode::FOUND,
+                [(axum::http::header::LOCATION, location)],
+            )
+                .into_response()
+        }
+
+        async fn counting_models(State(hits): State<Arc<AtomicUsize>>) -> Json<Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"data": [{"id": "from-b"}]}))
+        }
+
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let b_hits = Arc::new(AtomicUsize::new(0));
+
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+
+        let origin_a = Router::new()
+            .route("/models", get(redirect_to_other_origin))
+            .with_state(RedirectStub {
+                target_base: Arc::new(format!("http://{addr_b}")),
+                hits: Arc::clone(&a_hits),
+            });
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener_a, origin_a).await {
+                tracing::trace!(%error, "test redirect origin stopped");
+            }
+        });
+
+        let origin_b = Router::new()
+            .route("/models", get(counting_models))
+            .with_state(Arc::clone(&b_hits));
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener_b, origin_b).await {
+                tracing::trace!(%error, "test redirect target stopped");
+            }
+        });
+
+        let provider = discovery_provider(
+            format!("http://{addr_a}/models"),
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+
+        let error = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect_err("a cross-origin redirect must fail discovery, not be followed");
+
+        assert!(
+            matches!(error, ProviderError::Http { redirect: true, .. }),
+            "expected Http {{ redirect: true }}, got: {error}"
+        );
+        assert_eq!(
+            a_hits.load(Ordering::SeqCst),
+            1,
+            "redirect violations are non-transient: the redirecting origin must see exactly one request"
+        );
+        assert_eq!(
+            b_hits.load(Ordering::SeqCst),
+            0,
+            "the cross-origin redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_error_body_never_contains_the_api_key() {
+        const KEY: &str = "sk-test-secret-123456789";
+        let endpoint = start_test_server(Router::new().route(
+            "/models",
+            get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "invalid key sk-test-secret-123456789",
+                )
+            }),
+        ))
+        .await;
+        let mut provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+        provider.api_key = secrecy::SecretString::from(KEY);
+
+        let error = DiscoveryClient::try_new()
+            .expect("client")
+            .discover(&provider)
+            .await
+            .expect_err("the upstream 401 must surface as an error");
+
+        let display = error.to_string();
+        assert!(
+            !display.contains(KEY),
+            "the configured api key leaked through the discovery error: {display}"
         );
     }
 }
