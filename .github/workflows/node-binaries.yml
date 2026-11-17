@@ -223,6 +223,9 @@ jobs:
           rm -rf "$HOME/.cargo" "$HOME/.rustup"
           sudo rm -rf /usr/local/cargo /usr/local/rustup 2>/dev/null || true
           sudo rm -f /usr/local/bin/rustc /usr/local/bin/cargo /usr/local/bin/rustup 2>/dev/null || true
+          # macos-15 images ship rustup through Homebrew
+          sudo rm -rf /opt/homebrew/opt/rustup 2>/dev/null || true
+          sudo rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init 2>/dev/null || true
           command -v cargo rustc rustup || true
           ! command -v cargo && ! command -v rustc && ! command -v rustup
       - name: Remove every Rust toolchain and fail if one stays resolvable
