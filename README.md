@@ -84,6 +84,11 @@ examples.
 See the [documentation index](docs/README.md) for the project goal, plans,
 protocol design and research.
 
+## Admin surface
+
+Keys, config view, UI and MCP tools are served only on the dedicated admin
+listener; `admin_on_main_listener = true` exposes the read-only usage API only.
+
 ## References
 
 These shaped the layout and scope:

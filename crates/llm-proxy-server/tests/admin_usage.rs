@@ -6,6 +6,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::body::Body;
+    use axum::http::Method;
     use axum::http::Request;
     use axum::http::StatusCode;
     use llm_proxy_core::{AppConfig, ServerConfig, StorageConfig};
@@ -111,8 +112,13 @@ mod tests {
         .expect("app state")
     }
 
-    async fn get(app: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, String) {
-        let mut builder = Request::builder().uri(uri);
+    async fn send(
+        app: axum::Router,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
@@ -125,6 +131,10 @@ mod tests {
             .await
             .expect("body");
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn get(app: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, String) {
+        send(app, Method::GET, uri, token).await
     }
 
     #[tokio::test]
@@ -223,5 +233,76 @@ mod tests {
             admin_router(&state).is_none(),
             "no [auth.admin] means no admin surface anywhere"
         );
+    }
+
+    // Plan 09-14: the full admin surface belongs to the dedicated admin
+    // listener only. Even with the `admin_on_main_listener` opt-in, the main
+    // router mounts the read-only `/usage` API and nothing else.
+    #[tokio::test]
+    async fn the_main_router_never_serves_keys_config_or_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_ledger_path(&dir).await;
+        let state = make_state(make_config(
+            path,
+            Some(llm_proxy_core::AdminAuthConfig {
+                token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
+            }),
+            true,
+        ));
+
+        for (method, uri) in [
+            (Method::GET, "/keys"),
+            (Method::GET, "/config"),
+            (Method::POST, "/mcp"),
+            (Method::GET, "/"),
+        ] {
+            let (status, _) = send(
+                build_router(state.clone()),
+                method.clone(),
+                uri,
+                Some(ADMIN_TOKEN),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "the main listener must 404 {method} {uri} even for the admin token"
+            );
+        }
+
+        #[cfg(feature = "admin")]
+        {
+            let (status, body) = get(
+                build_router(state.clone()),
+                "/usage/summary",
+                Some(ADMIN_TOKEN),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the read-only usage API is the only admin mount on the main listener: {body}"
+            );
+        }
+
+        let dir_off = tempfile::tempdir().unwrap();
+        let path_off = seeded_ledger_path(&dir_off).await;
+        let state_off = make_state(make_config(
+            path_off,
+            Some(llm_proxy_core::AdminAuthConfig {
+                token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
+            }),
+            false,
+        ));
+        for uri in ["/usage/summary", "/usage/requests", "/usage/keys"] {
+            let (status, _) = get(build_router(state_off.clone()), uri, Some(ADMIN_TOKEN)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "without the opt-in the main listener must 404 {uri} even for the admin token"
+            );
+        }
     }
 }

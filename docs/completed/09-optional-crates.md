@@ -77,7 +77,11 @@ unless real use says otherwise.
   MCP tools under protocol revision 2026-07-28 — single-JSON responses,
   202 for notifications, `-32020` header validation, 404/`-32601` for
   unknown methods, `initialize` answered for older-era clients — behind
-  the same admin token.
+  the same admin token. The main listener never serves that surface:
+  keys, config view, UI and MCP tools are served only on the dedicated
+  admin listener; `admin_on_main_listener = true` exposes the
+  read-only usage API only (pinned by
+  `the_main_router_never_serves_keys_config_or_mcp`).
 - `llm-proxy-guardrails` (step 4, conflict 9): every guard declares a
   mode (pre-call, buffered, post-hoc) and a fail policy (open or
   closed); the engine's `Guard` trait gained in-place
