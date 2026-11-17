@@ -3499,6 +3499,90 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_empty_catalog_entry_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("empty-catalog-id.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[[provider.catalog.models]]
+id = " "
+"#,
+        )
+        .expect("write provider toml");
+
+        let err = load_provider_config(&path, None).expect_err("whitespace id must be rejected");
+        match err.validation_error() {
+            Some(ConfigValidationError::EmptyCatalogEntryId { provider }) => {
+                assert_eq!(provider, "example");
+            }
+            other => panic!("expected EmptyCatalogEntryId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_provider_names_with_unsafe_characters() {
+        for name in [
+            "a/b", "a\\b", "a.b", "a b", "a\tb", "a\nb", "A", "", "é", "../x",
+        ] {
+            let provider = ProviderConfig {
+                name: name.to_owned(),
+                api_key: SecretString::from("secret"),
+                auth_style: AuthStyle::Bearer,
+                passthrough_auth: false,
+                api_keys: None,
+                retry: None,
+                egress: None,
+                adapters: HashMap::new(),
+                routes: ProviderRoutesConfig::default(),
+                model_aliases: HashMap::new(),
+                discovery: None,
+                catalog: None,
+                pricing: HashMap::new(),
+                concurrency: None,
+                pricing_sync: None,
+                prompt_cache: None,
+            };
+            let err = validate_provider_config(&provider, None)
+                .expect_err("unsafe provider name must be rejected");
+            match &err {
+                ConfigValidationError::EmptyProviderName => assert_eq!(name, ""),
+                ConfigValidationError::InvalidProviderNameFormat { provider: reported } => {
+                    assert_eq!(reported, name);
+                }
+                other => panic!("name {name:?}: expected a name error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn auth_style_round_trips_through_toml() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Wrapper {
+            style: AuthStyle,
+        }
+        for (style, kebab) in [
+            (AuthStyle::Bearer, "bearer"),
+            (AuthStyle::XApiKey, "x-api-key"),
+            (AuthStyle::XGoogleApiKey, "x-google-api-key"),
+            (AuthStyle::Both, "both"),
+        ] {
+            let encoded = toml::to_string(&Wrapper { style }).expect("serialises");
+            assert!(
+                encoded.contains(&format!("style = \"{kebab}\"")),
+                "AuthStyle::{style:?} must serialise as {kebab:?}, got: {encoded}"
+            );
+            let decoded: Wrapper = toml::from_str(&encoded).expect("parses back");
+            assert_eq!(decoded.style, style, "round trip must preserve {style:?}");
+        }
+    }
+
+    #[test]
     fn validate_rejects_route_pointing_at_missing_adapter() {
         for kind in ProviderRouteKind::ALL {
             let provider: ProviderFile = toml::from_str(&format!(

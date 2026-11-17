@@ -670,4 +670,21 @@ mod tests {
         assert!(validate_provider_name("has space").is_err());
         assert!(validate_provider_name(&"x".repeat(129)).is_err());
     }
+
+    #[test]
+    fn path_validator_rejects_the_same_unsafe_provider_names_as_config() {
+        // The same table the config-side validator is tested against, so the
+        // URL path and config load accept exactly the same set of names.
+        for name in [
+            "a/b", "a\\b", "a.b", "a b", "a\tb", "a\nb", "A", "", "é", "../x",
+        ] {
+            match validate_provider_name(name) {
+                Err(EngineError::InvalidProviderName(_)) => {}
+                other => {
+                    panic!("name {name:?} must be rejected with InvalidProviderName, got {other:?}")
+                }
+            }
+        }
+        validate_provider_name("a-b_1").expect("canonical slug stays accepted");
+    }
 }
