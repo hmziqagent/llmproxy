@@ -1198,7 +1198,9 @@ async fn layer_refusals_on_a_family_path_use_the_openai_error_shape() {
 #[tokio::test]
 async fn an_unconfigured_family_is_refused_with_its_route_named() {
     // A registry with no family routes: the family kind is unconfigured,
-    // refused as the chat routes refuse an unconfigured route kind.
+    // refused as the chat routes refuse an unconfigured route kind —
+    // `UnsupportedRoute`, rendered 404 like every other route kind the
+    // registry does not resolve.
     let (endpoint, captured) = spawn_upstream().await;
     let mut config = provider_config(&endpoint);
     config.routes.embeddings = None;
@@ -1212,7 +1214,7 @@ async fn an_unconfigured_family_is_refused_with_its_route_named() {
         br#"{"model":"embed-small"}"#,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body: serde_json::Value =
         serde_json::from_slice(&body_of(response).await).expect("json error");
     let message = body["error"]["message"].as_str().unwrap_or_default();
