@@ -4,6 +4,11 @@
 //! an observable that reads a fresh [`Metrics::get_snapshot`] at collection
 //! time, so nothing on the request path gains a lock.
 //!
+//! Scope: the export is the eight scalar counters only — per-model counts
+//! and latency quantiles are available on the Prometheus endpoint only, and
+//! the tests verify against an in-process OTLP/HTTP sink, not a live
+//! OpenTelemetry Collector.
+//!
 //! The OTLP endpoint must be `http://`: this exporter's reqwest 0.13 client
 //! carries no TLS stack (see [`start_otlp_metrics`]).
 

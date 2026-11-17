@@ -80,7 +80,9 @@ All eleven steps landed, each with regression tests:
    `admin-ui` dedicated admin listener (no `[storage]` needed), and on the
    `/usage` surface (dedicated or `admin_on_main_listener`) when
    `[storage]` is configured. Opt-in `[server.metrics.otlp]` pushes the
-   same counters as OTLP/HTTP JSON (tested against a live local collector).
+   eight scalar counters as OTLP/HTTP JSON (per-model counts and latency
+   quantiles are available on the Prometheus endpoint only); verified
+   against an in-process OTLP/HTTP sink in `otel_metrics.rs`.
 8. `/usage/requests` rows carry a derived `state`
    (`in_flight`/`failed`/`completed`) and in-flight rows carry `elapsed_ms`
    measured at query time.
