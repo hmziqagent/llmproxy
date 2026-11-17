@@ -184,6 +184,7 @@ impl Drop for OtlpMetricsGuard {
 mod tests {
     use super::*;
     use axum::{Router, routing::post};
+    use std::collections::BTreeMap;
     use std::time::Instant;
 
     /// The exporter's blocking reqwest 0.13 client is built without a TLS
@@ -212,7 +213,10 @@ mod tests {
     }
 
     /// The observable end-to-end property: a configured exporter pushes the
-    /// existing counters, as OTLP JSON, to the configured endpoint.
+    /// existing counters, as OTLP JSON, to the configured endpoint, and the
+    /// pushed sums carry the live values recorded on `Metrics` (two requests,
+    /// one streamed, one failure) — a zero-valued payload that merely names
+    /// the metrics must fail.
     #[tokio::test]
     async fn counters_arrive_at_the_collector_as_otlp_json() {
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
@@ -247,30 +251,85 @@ mod tests {
         )
         .expect("exporter starts against the local collector");
 
+        // The first export may predate the records, so retry until a payload
+        // carrying the live values arrives or the deadline expires.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed = BTreeMap::<String, u64>::new();
         loop {
-            let bodies = captured.lock().await;
-            if bodies
-                .iter()
-                .any(|body| body.windows(8).any(|w| w == b"resource"))
-                && bodies
-                    .iter()
-                    .any(|body| body.windows(9).any(|w| w == b"llm_proxy"))
-            {
-                let body = String::from_utf8_lossy(bodies.last().unwrap()).into_owned();
-                assert!(
-                    body.contains("llm_proxy_requests_total"),
-                    "the pushed payload names our counter: {}",
-                    &body[..body.len().min(600)]
-                );
+            let bodies = captured.lock().await.clone();
+            if a_payload_carries_the_live_values(&bodies, &mut observed) {
                 return;
             }
-            drop(bodies);
             assert!(
                 Instant::now() < deadline,
-                "no OTLP payload with our counters arrived within 10s"
+                "no OTLP payload carried llm_proxy_requests_total == 2, \
+                 llm_proxy_requests_streamed_total == 1 and \
+                 llm_proxy_requests_failed_total == 1 within 10s; latest \
+                 payload naming the counter: {observed:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Reads the latest captured payload naming `llm_proxy_requests_total`
+    /// into `observed` and reports whether it carries the recorded live
+    /// values: two requests (one streamed) and one failure.
+    fn a_payload_carries_the_live_values(
+        bodies: &[Vec<u8>],
+        observed: &mut BTreeMap<String, u64>,
+    ) -> bool {
+        for body in bodies {
+            let values = otlp_counter_values(body);
+            if values.contains_key("llm_proxy_requests_total") {
+                *observed = values;
+            }
+            if observed.get("llm_proxy_requests_total") == Some(&2)
+                && observed.get("llm_proxy_requests_streamed_total") == Some(&1)
+                && observed.get("llm_proxy_requests_failed_total") == Some(&1)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Parses one OTLP/JSON payload into `metric name -> sum value` by
+    /// walking `resourceMetrics[].scopeMetrics[].metrics[]`. Proto3 JSON
+    /// encodes int64 sums as strings (`asInt`); a numeric `asInt` or an
+    /// `asDouble` encoding is accepted as well.
+    fn otlp_counter_values(payload: &[u8]) -> BTreeMap<String, u64> {
+        let request =
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap_or(serde_json::Value::Null);
+        let metrics = request["resourceMetrics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|resource| resource["scopeMetrics"].as_array())
+            .flatten()
+            .flat_map(|scope| scope["metrics"].as_array())
+            .flatten();
+        let mut values = BTreeMap::new();
+        for metric in metrics {
+            let Some(name) = metric["name"].as_str() else {
+                continue;
+            };
+            let points = metric["sum"]["dataPoints"].as_array().into_iter().flatten();
+            for point in points {
+                let value = point["asInt"]
+                    .as_str()
+                    .and_then(|encoded| encoded.parse::<u64>().ok())
+                    .or_else(|| point["asInt"].as_u64())
+                    .or_else(|| {
+                        point["asDouble"]
+                            .as_str()
+                            .and_then(|encoded| encoded.parse::<u64>().ok())
+                    })
+                    .or_else(|| point["asDouble"].as_u64());
+                if let Some(value) = value {
+                    values.insert(name.to_owned(), value);
+                }
+            }
+        }
+        values
     }
 }
