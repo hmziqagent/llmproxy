@@ -363,21 +363,11 @@ impl EngineBuilder {
     /// Start from a configuration snapshot, an empty provider registry, the
     /// built-in adapters and a shared transport client built from the
     /// snapshot's `[server.upstream_timeouts]` in [`Self::build`].
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: an empty provider registry is always valid.
-    #[expect(
-        clippy::expect_used,
-        reason = "an empty provider registry cannot fail validation; the builder surfaces real config errors from build()"
-    )]
     #[must_use]
     pub fn new(config: AppConfig) -> Self {
-        let providers = ProviderRegistry::from_providers(vec![])
-            .expect("an empty provider registry is always valid");
         Self {
             config: Arc::new(StaticConfigSource::new(Arc::new(config))),
-            providers: Arc::new(providers),
+            providers: Arc::new(ProviderRegistry::empty()),
             adapters: Arc::new(ProviderAdapterRegistry::builtin()),
             shared_client: None,
             egress: HashMap::new(),

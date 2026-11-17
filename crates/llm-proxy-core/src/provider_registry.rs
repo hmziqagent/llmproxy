@@ -279,6 +279,15 @@ impl ProviderRegistry {
         Ok(registry)
     }
 
+    /// An empty registry: no providers, no pools. Infallible.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            providers: HashMap::new(),
+            pools: HashMap::new(),
+        }
+    }
+
     /// Build a registry from an existing map of provider configs (no pools).
     ///
     /// # Errors
@@ -697,6 +706,16 @@ mod tests {
             ProviderRouteResolutionError::UnknownProvider { provider }
                 if provider == "missing"
         ));
+    }
+
+    #[test]
+    fn empty_registry_has_no_providers_or_pools() {
+        let registry = ProviderRegistry::empty();
+
+        assert!(registry.is_empty());
+        assert_eq!(registry.pools().count(), 0);
+        assert!(registry.get("example").is_none());
+        assert!(!registry.contains_route("example"));
     }
 
     #[test]
