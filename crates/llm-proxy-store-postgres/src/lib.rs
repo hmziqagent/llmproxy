@@ -373,6 +373,7 @@ impl PostgresAdmissionBackend {
         let reserved_usd: i64 = row.get(6);
         let holds_member_slot: bool = row.get(7);
         let holds_model_slot: bool = row.get(8);
+        caller_xact_lock(&tx, &caller).await?;
         tx.execute("DELETE FROM admission_leases WHERE id = $1", &[&id])
             .await?;
 
@@ -743,6 +744,25 @@ fn parse_lease_id(lease: &LeaseId) -> Result<Uuid, PostgresStoreError> {
     })
 }
 
+/// Serializes one caller's admission transactions. `admit` touches the
+/// caller's budget rows after the in-flight slots, while `rekey` and the
+/// settlement write touch them before — under concurrent failover and
+/// settlement those orders deadlocked (observed live: Postgres aborted
+/// the settlement, so the refund was deferred past its budget). The
+/// transaction-scoped advisory lock makes every same-caller path take
+/// its row locks in one order; different callers stay concurrent.
+async fn caller_xact_lock(
+    tx: &tokio_postgres::Transaction<'_>,
+    caller: &str,
+) -> Result<(), tokio_postgres::Error> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+        &[&caller],
+    )
+    .await?;
+    Ok(())
+}
+
 #[async_trait]
 impl AdmissionBackend for PostgresAdmissionBackend {
     async fn admit(&self, demand: &ReservationDemand<'_>) -> Result<LeaseId, EngineError> {
@@ -756,6 +776,9 @@ impl AdmissionBackend for PostgresAdmissionBackend {
             .map_err(|error| postgres_store_error(&error))?;
         let tx = conn
             .transaction()
+            .await
+            .map_err(|error| store_error(&error))?;
+        caller_xact_lock(&tx, demand.caller)
             .await
             .map_err(|error| store_error(&error))?;
 
@@ -848,6 +871,9 @@ impl AdmissionBackend for PostgresAdmissionBackend {
             tx.rollback().await.map_err(|error| store_error(&error))?;
             return Ok(());
         }
+        caller_xact_lock(&tx, &caller)
+            .await
+            .map_err(|error| store_error(&error))?;
 
         // Re-price the day reservation inside this transaction (fix 05-7):
         // the whole move rolls back when the grown reservation would exceed
